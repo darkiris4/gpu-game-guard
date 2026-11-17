@@ -46,7 +46,9 @@ class Guard:
                 launches = trigger.scan()
             except Exception as exc:
                 log(f"trigger {trigger.name} failed: {exc!r}")
-                # keep what was known about this trigger so one failed scan does not make its launches look new
+                # keep what was known about this trigger so one failed scan does not make its launches look new,
+                # and adopt whatever it returns next, because a game started during the outage was not seen starting
+                self.pending_adoption.add(trigger.name)
                 found.extend((None, key) for key in self.seen if key[0] == trigger.name)
                 continue
             pairs = [(launch, (trigger.name, launch.key)) for launch in launches]
@@ -142,11 +144,10 @@ class Guard:
             return
         if choice == "stop":
             stopped = self._stop(targets, present)
-            if action == "stop":
-                if stopped:
-                    self._notify("GPU Game Guard", f"Stopped {', '.join(stopped)} for {launch.title or launch.game_id}.")
-                else:
-                    self._notify("GPU Game Guard", f"Could not stop {names} for {launch.title or launch.game_id}.")
+            if not stopped:
+                self._notify("GPU Game Guard", f"Could not stop {names} for {launch.title or launch.game_id}.")
+            elif action == "stop":
+                self._notify("GPU Game Guard", f"Stopped {', '.join(stopped)} for {launch.title or launch.game_id}.")
         self.bypass[launch.game_id] = self.clock() + config.bypass_seconds
         try:
             if trigger is not None:
@@ -249,11 +250,9 @@ class Guard:
         """The configured poll interval limited to a range `time.sleep` accepts and a sensible one."""
         try:
             seconds = float(self.watcher.current().poll_seconds)
-        except OverflowError:
-            return 3600.0
         except Exception:
             return 1.0
-        return min(max(seconds, 0.2), 3600.0) if math.isfinite(seconds) else 1.0
+        return min(max(seconds, 0.2), 60.0) if math.isfinite(seconds) else 1.0
 
     def run(self) -> None:
         while True:

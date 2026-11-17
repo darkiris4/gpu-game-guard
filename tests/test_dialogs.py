@@ -110,7 +110,7 @@ class MessageTests(unittest.TestCase):
             message = dialogs.launch_message(launch("Game"), self.targets, (5120, 16311), markup)
             self.assertIn("GPU Game Guard", message)
             self.assertIn("1.5 GiB of GPU memory", message)
-            self.assertIn("no GPU memory in use right now", message)
+            self.assertIn("no GPU memory measured right now", message)
             self.assertIn("by all programs: 5.0 GiB of 15.9 GiB", message)
             self.assertNotIn("by all programs", dialogs.launch_message(launch("g"), [], None, markup))
             self.assertNotIn("idle", message)
@@ -121,7 +121,7 @@ class MessageTests(unittest.TestCase):
         zero = dialogs.launch_message(launch(), [target("z", "", 0)], None, "plain")
         self.assertIn("GPU memory use unknown", unknown)
         self.assertNotIn("no GPU memory in use", unknown)
-        self.assertIn("no GPU memory in use right now", zero)
+        self.assertIn("no GPU memory measured right now", zero)
         self.assertNotIn("unknown", zero)
 
     def test_restart_message_is_neutral(self):
@@ -182,9 +182,17 @@ class MessageTests(unittest.TestCase):
 
     def test_impact_none_held(self):
         sentence = dialogs.impact_sentence([target(vram=0), target("b", vram=0)], "plain")
-        self.assertEqual(sentence, "They are not holding any GPU memory right now, so the impact on the game should "
-                                   "be small, though they can claim the GPU as soon as they get work.")
-        self.assertIn("It is not holding", dialogs.impact_sentence([target(vram=0)], "plain"))
+        self.assertEqual(sentence, "No GPU memory is measured as held by them right now, so the impact on the game "
+                                   "should be small, though they can claim the GPU as soon as they get work.")
+        self.assertIn("No GPU memory is measured as held by it", dialogs.impact_sentence([target(vram=0)], "plain"))
+
+    def test_a_zero_heavy_threshold_does_not_make_nothing_heavy(self):
+        original = dialogs.HEAVY_VRAM_MIB
+        self.addCleanup(setattr, dialogs, "HEAVY_VRAM_MIB", original)
+        dialogs.HEAVY_VRAM_MIB = 0
+        sentence = dialogs.impact_sentence([target(vram=0)], "plain")
+        self.assertNotIn("stutter", sentence)
+        self.assertIn("stutter", dialogs.impact_sentence([target(vram=5)], "plain"))
 
     def test_impact_never_says_idle_or_bottleneck(self):
         cases = ([target(vram=None)], [target(vram=0)], [target(vram=10)], [target(vram=9000)],
@@ -307,7 +315,7 @@ class KdialogTests(unittest.TestCase):
         well_formed(command[-1])
 
     def test_restart_mapping(self):
-        for code, expected in ((0, True), (1, None), (2, False), (3, None), (255, None), (-9, None), (-15, None)):
+        for code, expected in ((0, True), (1, False), (2, None), (3, None), (134, None), (255, None), (-9, None), (-15, None)):
             with patched(FakeRun(done(code))):
                 self.assertEqual(dialogs.KdialogPrompter().restart([{"name": "a"}]), expected)
 
@@ -318,8 +326,8 @@ class KdialogTests(unittest.TestCase):
         command = run.calls[0]
         self.assertIn("--yesnocancel", command)
         self.assertEqual(argument_of(command, "--yes-label"), "Restart")
-        self.assertEqual(argument_of(command, "--no-label"), "Ask me later")
-        self.assertEqual(argument_of(command, "--cancel-label"), "Leave stopped")
+        self.assertEqual(argument_of(command, "--no-label"), "Leave stopped")
+        self.assertEqual(argument_of(command, "--cancel-label"), "Ask me later")
         self.assertIn("a&amp;b", command[-1])
         well_formed(command[-1])
 

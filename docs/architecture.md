@@ -95,7 +95,7 @@ Validation ranges (inclusive):
 
 | Key | Range |
 | --- | --- |
-| `poll_seconds` | 0.2 to 3600 |
+| `poll_seconds` | 0.2 to 60 |
 | `exit_grace_seconds` | 2 to 3600 |
 | `no_game_timeout_seconds` | 30 to 86400 |
 | `bypass_seconds` | 5 to 3600 |
@@ -106,7 +106,7 @@ A wrong type, a value outside its range or outside the allowed set makes the con
 `config validate` also reports unknown keys (for example `on_lauch`) with a did-you-mean hint and exits
 1, while `load` accepts them and logs a warning to stderr. A game rule without `action` uses `"ask"`;
 it does not inherit `on_launch`. `save` and `util.atomic_write_json` write through a temporary file and
-keep the existing file's permissions (0644 for a new file).
+keep the existing file's permissions (a new file gets 0644 as masked by the umask; a symlinked file is written through).
 
 On-disk shape (JSON, all keys optional on read):
 
@@ -182,7 +182,7 @@ Behaviour:
 
 ```python
 def totals() -> Optional[Tuple[int, int]]            # (used_mib, total_mib) for the whole system; None if unknown
-def vram_by_container() -> Dict[str, int]            # full container id -> MiB held by its processes
+def vram_by_container() -> Optional[Dict[str, int]]   # full container id -> MiB held by its processes; None = unmeasurable
 def container_id_from_cgroup(text: str) -> Optional[str]
 ```
 
@@ -246,9 +246,14 @@ def format_mib(mib) -> str
   anything else tries zenity then kdialog; then the notification backend; then `NullPrompter`.
 - Buttons. Launch dialog: **Stop containers and launch** (`stop`), **Launch anyway** (`anyway`), **Cancel**
   (`cancel`). Restart dialog: **Restart** (True), **Ask me later** (None), **Leave stopped** (False).
-  Closing a window or a failing backend is never a deliberate answer: closing the launch dialog is `anyway`,
-  closing the restart dialog is None.
-- `kdialog`: rich text (HTML subset), three buttons through `--yesnocancel` with custom labels.
+  A backend that fails to start or crashes is never a deliberate answer: `launch` is `anyway` and `restart`
+  is None. zenity cannot tell a closed window from a failure (both exit 1 with empty output), so closing
+  its launch dialog is `anyway` and closing its restart dialog is None. kdialog can (a crash such as a
+  missing display aborts with status 134, never 0, 1 or 2), so its Esc and window-close status 2 is
+  `cancel` at launch and None (ask later) after the game.
+- `kdialog`: rich text (HTML subset), three buttons through `--yesnocancel` with custom labels. Launch:
+  yes `stop`, no `anyway`, cancel `cancel`, any other status `anyway`. Restart: yes True (**Restart**), no False
+  (**Leave stopped**), cancel None (**Ask me later**), any other status None.
 - `zenity`: Pango markup (`<b>`, `<small>`, no `<ul>`, `<li>` or `<br>`; use newlines and bullets), `--question`
   with `--ok-label`, `--cancel-label` and `--extra-button`; the extra button's label is printed on stdout with
   exit status 1, OK is exit 0, a dismissed window is exit 1 with empty output.
@@ -273,10 +278,12 @@ def build(names: Sequence[str]) -> List[Trigger]     # known: "steam"; unknown n
 class SteamTrigger:  name = "steam"; scan(); end(launch); relaunch(launch)
 ```
 
-`SteamTrigger` detects `reaper SteamLaunch AppId=<id>` processes,
+`SteamTrigger` detects `reaper SteamLaunch AppId=<id>` processes owned by the current user (the real uid from
+`/proc/<pid>/status`; other users' launchers are ignored),
 native and Flatpak; `Launch.key` is `(pid, start_time)`; `game_id` is `steam:<app id>`; `title` comes from
-Steam's manifests or non-Steam shortcuts (`game_name`); `end` terminates the whole tree, then force-ends
-stragglers after two seconds; `relaunch` runs `steam steam://rungameid/<id>` or the Flatpak equivalent,
+Steam's manifests or non-Steam shortcuts (`game_name`); `end` snapshots the launcher and its descendants with their start times, terminates the tree, and
+force-ends stragglers after two seconds, re-checking each process's start time before every signal so a reused
+pid is never signalled; `relaunch` runs `steam steam://rungameid/<id>` or the Flatpak equivalent,
 using the 64-bit game id for shortcuts. The payload carries the trigger's `Game` dataclass.
 
 ### cli.py

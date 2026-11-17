@@ -35,7 +35,7 @@ def _new_file_mode(path: Path) -> int:
 def atomic_write_json(path: Path, data: Any) -> None:
     """Write `data` as JSON so a reader never sees a half-written file. The temporary file is flushed to disk
     before it replaces the target, keeps the target's permissions and never outlives a failure."""
-    path = Path(path)
+    path = Path(os.path.realpath(path))  # write through a symlinked file (for example a managed dotfile)
     path.parent.mkdir(parents=True, exist_ok=True)
     mode = _new_file_mode(path)
     fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")

@@ -73,7 +73,7 @@ def impact_sentence(targets: Sequence[Target], markup: str = "plain") -> str:
     held = sum(t.vram_mib or 0 for t in measured)
     amount = _bold(format_mib(held), markup)
     single = len(targets) == 1
-    heavy = held >= HEAVY_VRAM_MIB
+    heavy = held > 0 and held >= HEAVY_VRAM_MIB
     consequence = "so the game could stutter, load slowly or run out of memory."
     if not measured:
         return "GPU memory use could not be measured, so the impact on the game is unknown."
@@ -97,17 +97,17 @@ def impact_sentence(targets: Sequence[Target], markup: str = "plain") -> str:
         return (f"Together they hold {amount} of GPU memory. The impact on the game is probably modest, but they can "
                 "still take GPU time.")
     if single:
-        return ("It is not holding any GPU memory right now, so the impact on the game should be small, though it can "
-                "claim the GPU as soon as it gets work.")
-    return ("They are not holding any GPU memory right now, so the impact on the game should be small, though they "
-            "can claim the GPU as soon as they get work.")
+        return ("No GPU memory is measured as held by it right now, so the impact on the game should be small, though it "
+                "can claim the GPU as soon as it gets work.")
+    return ("No GPU memory is measured as held by them right now, so the impact on the game should be small, though "
+            "they can claim the GPU as soon as they get work.")
 
 
 def _memory_text(target: Target) -> str:
     if target.vram_mib is None:
         return "GPU memory use unknown"
     if target.vram_mib == 0:
-        return "no GPU memory in use right now"
+        return "no GPU memory measured right now"
     return f"{format_mib(target.vram_mib)} of GPU memory"
 
 
@@ -185,7 +185,7 @@ def _send_notification(which: Callable[[str], Optional[str]], title: str, body: 
     if not which("notify-send"):
         return
     try:
-        _run(["notify-send", "--app-name", TITLE, _notification_text(title), _notification_text(body)],
+        _run(["notify-send", "--app-name", TITLE, "--", _notification_text(title), _notification_text(body)],
              INFO_TIMEOUT_SECONDS)
     except _DIALOG_ERRORS as exc:
         log(f"cannot show a notification ({exc})")
@@ -253,12 +253,12 @@ class KdialogPrompter(_Base):
             return None
         text = restart_message(names, "html")
         try:
-            result = _run(["kdialog", "--title", TITLE, "--yes-label", LABEL_RESTART, "--no-label", LABEL_LATER,
-                           "--cancel-label", LABEL_LEAVE, "--yesnocancel", text], None)
+            result = _run(["kdialog", "--title", TITLE, "--yes-label", LABEL_RESTART, "--no-label", LABEL_LEAVE,
+                           "--cancel-label", LABEL_LATER, "--yesnocancel", text], None)
         except _DIALOG_ERRORS as exc:
             log(f"cannot show a dialog ({exc}); keeping the containers marked as stopped")
             return None
-        return {0: True, 2: False}.get(result.returncode)
+        return {0: True, 1: False}.get(result.returncode)  # Esc or a closed window (2) and any failure ask later
 
     def notify(self, title: str, body: str) -> None:
         log(f"{_clean(title)}: {_clean(body)}")
@@ -296,7 +296,7 @@ class NotifyPrompter(_Base):
         """The name of the chosen action; None when the notification was dismissed or expired."""
         command = ["notify-send", "--app-name", TITLE, "--wait", f"--expire-time={NOTIFY_EXPIRE_MS}"]
         command += [f"--action={name}={label}" for name, label in actions]
-        command += [_notification_text(summary), _notification_text(body)]
+        command += ["--", _notification_text(summary), _notification_text(body)]
         result = _run(command, NOTIFY_TIMEOUT_SECONDS + 30)
         chosen = (result.stdout or "").strip()
         return chosen if chosen in dict(actions) else None

@@ -86,7 +86,7 @@ class ValidateTests(unittest.TestCase):
                 self.assertIn(f'"{key}"', problems[0])
 
     def test_ranges_reject_outside_values_and_name_key_range_and_value(self):
-        ranges = {"poll_seconds": (0.2, 3600), "exit_grace_seconds": (2, 3600), "no_game_timeout_seconds": (30, 86400),
+        ranges = {"poll_seconds": (0.2, 60), "exit_grace_seconds": (2, 3600), "no_game_timeout_seconds": (30, 86400),
                   "bypass_seconds": (5, 3600), "dialog_retry_seconds": (30, 86400), "heavy_vram_mib": (0, 10000000)}
         for key, (low, high) in ranges.items():
             self.assertEqual(self.problems(**{key: low}), [], key)

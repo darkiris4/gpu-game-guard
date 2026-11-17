@@ -48,8 +48,9 @@ Add `--purge` after `--uninstall` to also delete the saved state.
     again through `steam://rungameid/`.
   - **Launch anyway** starts the game again and leaves the containers running.
   - **Cancel** does nothing further.
-  Closing the dialog window, or a dialog tool that fails, is never taken as a deliberate answer:
-  closing it counts as **Launch anyway**.
+  A dialog tool that fails to start or crashes (no display, for instance) is never taken as an answer:
+  the game starts anyway. Closing a zenity window counts as **Launch anyway**, because zenity cannot
+  tell a closed window from a failure; Esc or closing a kdialog window counts as **Cancel**.
 - When the game has been closed for about 8 seconds, it asks whether to start the containers it
   stopped, with **Restart**, **Ask me later** and **Leave stopped**. **Leave stopped** forgets them.
   Closing the window, or a failing dialog tool, counts as **Ask me later**: the question is repeated
@@ -63,7 +64,9 @@ Add `--purge` after `--uninstall` to also delete the saved state.
 The dialog names the game (from Steam's manifests or the shortcut's name), lists each container
 with its image and the GPU memory its processes hold, and shows overall GPU memory use when known.
 When a container's GPU memory could not be measured, the dialog says "GPU memory use unknown" for it
-and never calls it idle. The stutter warning is graded and appears as heavy only when the containers
+and never calls it idle; a measured zero reads "no GPU memory measured right now". NVIDIA figures
+count compute processes only, so a graphics-only workload shows no measured memory, and on AMD and
+Intel GPUs a container whose processes cannot be read is reported as unknown, never as zero. The stutter warning is graded and appears as heavy only when the containers
 together hold 4 GiB or more (`heavy_vram_mib`, in MiB). Figures are shown in GiB and MiB.
 
 ## GPU vendors
@@ -141,9 +144,10 @@ started again, with a notification.
 | `ignore` | nothing happens | nothing happens |
 
 The dialog buttons are **Stop containers and launch**, **Launch anyway** and **Cancel** at launch,
-and **Restart**, **Ask me later** and **Leave stopped** after the game. Closing a window, or a
-failing dialog backend, is never a deliberate answer: closing the launch dialog means **Launch
-anyway**, and closing the restart dialog means **Ask me later**.
+and **Restart**, **Ask me later** and **Leave stopped** after the game. A dialog tool that fails is
+never a deliberate answer: at launch the game starts anyway, and after the game the question is
+asked again later. Closing the restart dialog means **Ask me later**. Closing the launch dialog
+means **Launch anyway** with zenity and **Cancel** with kdialog.
 
 ## Per-game rules and policies
 

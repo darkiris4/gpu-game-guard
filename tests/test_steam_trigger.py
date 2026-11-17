@@ -326,3 +326,38 @@ class RealProcessTreeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OwnerAndShortcutTests(unittest.TestCase):
+    def fake_process(self, root, pid, status_uid=None):
+        entry = Path(root) / str(pid)
+        entry.mkdir()
+        (entry / "cmdline").write_bytes(b"/s/ubuntu12_32/reaper\0SteamLaunch\0AppId=730\0--\0game\0")
+        (entry / "stat").write_text(f"{pid} (reaper) " + " ".join(["S", "1"] + ["0"] * 17 + ["99"]) + "\n")
+        if status_uid is not None:
+            (entry / "status").write_text(f"Name:\treaper\nUid:\t{status_uid}\t{status_uid}\t{status_uid}\t{status_uid}\n")
+        return entry
+
+    def test_the_owner_comes_from_the_status_file_before_the_directory_owner(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.fake_process(root, 10, status_uid=4242)
+            self.assertEqual([g.pid for g in steam.scan_games(Path(root), uid=4242)], [10])
+            self.assertEqual(steam.scan_games(Path(root), uid=1), [])
+
+    def test_without_a_status_file_the_directory_owner_decides(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.fake_process(root, 11)
+            self.assertEqual([g.pid for g in steam.scan_games(Path(root), uid=os.getuid())], [11])
+
+    def test_a_shortcut_name_is_taken_from_its_own_entry_only(self):
+        with tempfile.TemporaryDirectory() as root:
+            config = Path(root) / "userdata/1/config"
+            config.mkdir(parents=True)
+
+            def entry(app_id, name):
+                body = b"\x02appid\x00" + app_id.to_bytes(4, "little")
+                return body + (b"\x01AppName\x00" + name + b"\x00" if name is not None else b"") + b"\x08"
+
+            (config / "shortcuts.vdf").write_bytes(b"\x00shortcuts\x00" + entry(3000000001, None) + entry(3000000002, b"Other"))
+            self.assertEqual(steam.game_name(3000000001, [Path(root)]), "Game 3000000001")
+            self.assertEqual(steam.game_name(3000000002, [Path(root)]), "Other")

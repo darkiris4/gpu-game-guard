@@ -187,3 +187,21 @@ class AtomicWriteTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SymlinkedWriteTests(unittest.TestCase):
+    def test_a_symlinked_file_is_written_through_and_stays_a_symlink(self):
+        import tempfile
+        from pathlib import Path
+
+        from gpu_game_guard.util import atomic_write_json
+
+        with tempfile.TemporaryDirectory() as root:
+            target = Path(root) / "managed" / "real.json"
+            target.parent.mkdir()
+            target.write_text("{}")
+            link = Path(root) / "link.json"
+            link.symlink_to(target)
+            atomic_write_json(link, {"a": 1})
+            self.assertTrue(link.is_symlink())
+            self.assertIn('"a": 1', target.read_text())

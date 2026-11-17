@@ -151,7 +151,10 @@ class DockerLikeRuntime:
             ref_id = str(info.get("Id") or "")
             config = info.get("Config")
             image = config.get("Image", "") if isinstance(config, dict) else ""
-            measured = None if vram is None else vram.get(ref_id, 0)
+            if vram is None:
+                measured = None
+            else:  # a source that could not see every process cannot say that a missing container holds none
+                measured = vram.get(ref_id, 0 if getattr(vram, "authoritative", True) else None)
             targets.append(Target("container", self.name, name, str(image), measured, ref_id))
         return sorted(targets, key=lambda target: target.name)
 

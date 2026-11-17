@@ -157,7 +157,8 @@ case_unit_quoting() {
       GPU_GAME_GUARD_SRC="$src" GPU_GAME_GUARD_BIN_DIR="$bindir" \
       "$(command -v bash)" "$repo/install.sh" --no-systemd 2>&1)"; status=$?
   local unit="$home/config/systemd/user/gpu-game-guard.service"
-  local expected="ExecStart=\"$home/my bin %%h \$\$X/gpu-game-guard\" run"
+  # a dollar sign stays as it is: the program path is not subject to variable expansion in systemd
+  local expected="ExecStart=\"$home/my bin %%h \$X/gpu-game-guard\" run"
   if [ "$status" -eq 0 ] && grep -qxF "$expected" "$unit" 2>/dev/null; then
     pass "unit ExecStart is quoted and escaped for spaces, %, \$ and quotes"
   else
@@ -232,8 +233,66 @@ case_rollback() {
   fi
 }
 
+# More failure paths with a stand-in systemctl: enable failing, a first install that fails to start, a config error.
+case_transactions() {
+  if [ ! -f "$src/gpu_game_guard/cli.py" ]; then
+    skip "installer failure paths"
+    return
+  fi
+  local out status home
+  # enable fails: the previous installation is put back
+  home="$work/tx-enable"; mkdir -p "$home/bin" "$home/config/systemd/user"
+  make_path "$work/path-tx1" $tools sleep
+  fake_tool "$work/path-tx1" docker
+  printf '#!/bin/sh\ncase "$*" in *enable*) exit 1 ;; esac\nexit 0\n' > "$work/path-tx1/systemctl"; chmod +x "$work/path-tx1/systemctl"
+  printf '#!/bin/sh\necho previous\n' > "$home/bin/gpu-game-guard"; chmod +x "$home/bin/gpu-game-guard"
+  echo "previous unit" > "$home/config/systemd/user/gpu-game-guard.service"
+  out="$(env -i PATH="$work/path-tx1" HOME="$home" XDG_CONFIG_HOME="$home/config" XDG_STATE_HOME="$home/state" \
+      GPU_GAME_GUARD_SRC="$src" GPU_GAME_GUARD_BIN_DIR="$home/bin" "$(command -v bash)" "$repo/install.sh" 2>&1)"; status=$?
+  if [ "$status" -ne 0 ] && [ "$("$home/bin/gpu-game-guard")" = previous ] \
+     && [ "$(cat "$home/config/systemd/user/gpu-game-guard.service")" = "previous unit" ]; then
+    pass "a failing 'systemctl enable' restores the previous program and unit"
+  else
+    fail "a failing 'systemctl enable' restores the previous program and unit" "status=$status" "$out"
+  fi
+  # a first install whose service does not start leaves nothing behind
+  home="$work/tx-fresh"; mkdir -p "$home"
+  make_path "$work/path-tx2" $tools sleep
+  fake_tool "$work/path-tx2" docker
+  printf '#!/bin/sh\ncase "$*" in *is-active*) exit 3 ;; esac\nexit 0\n' > "$work/path-tx2/systemctl"; chmod +x "$work/path-tx2/systemctl"
+  out="$(env -i PATH="$work/path-tx2" HOME="$home" XDG_CONFIG_HOME="$home/config" XDG_STATE_HOME="$home/state" \
+      GPU_GAME_GUARD_SRC="$src" GPU_GAME_GUARD_BIN_DIR="$home/bin" "$(command -v bash)" "$repo/install.sh" 2>&1)"; status=$?
+  if [ "$status" -ne 0 ] && grep -q 'new files were removed' <<<"$out" && [ ! -e "$home/bin/gpu-game-guard" ] \
+     && [ ! -e "$home/config/systemd/user/gpu-game-guard.service" ]; then
+    pass "a first install whose service does not start removes the new files"
+  else
+    fail "a first install whose service does not start removes the new files" "status=$status" "$out"
+  fi
+  # exit status 78 means an invalid config: the installation stays and the message says why
+  home="$work/tx-config"; mkdir -p "$home"
+  make_path "$work/path-tx3" $tools sleep
+  fake_tool "$work/path-tx3" docker
+  printf '#!/bin/sh\ncase "$*" in *is-active*) exit 3 ;; *ExecMainStatus*) echo 78 ;; esac\nexit 0\n' > "$work/path-tx3/systemctl"; chmod +x "$work/path-tx3/systemctl"
+  out="$(env -i PATH="$work/path-tx3" HOME="$home" XDG_CONFIG_HOME="$home/config" XDG_STATE_HOME="$home/state" \
+      GPU_GAME_GUARD_SRC="$src" GPU_GAME_GUARD_BIN_DIR="$home/bin" "$(command -v bash)" "$repo/install.sh" 2>&1)"; status=$?
+  if [ "$status" -ne 0 ] && grep -q 'config is invalid' <<<"$out" && [ -x "$home/bin/gpu-game-guard" ]; then
+    pass "a service that exits 78 keeps the installation and names the invalid config"
+  else
+    fail "a service that exits 78 keeps the installation and names the invalid config" "status=$status" "$out"
+  fi
+  # a relative bin dir is refused
+  out="$(env -i PATH="$work/path-tx3" HOME="$home" XDG_CONFIG_HOME="$home/config" GPU_GAME_GUARD_SRC="$src" \
+      GPU_GAME_GUARD_BIN_DIR="relative/bin" "$(command -v bash)" "$repo/install.sh" --no-systemd 2>&1)"; status=$?
+  if [ "$status" -ne 0 ] && grep -q 'absolute path' <<<"$out"; then
+    pass "a relative bin dir is refused"
+  else
+    fail "a relative bin dir is refused" "status=$status" "$out"
+  fi
+}
+
 case_missing_runtime
 case_rollback
+case_transactions
 case_missing_python
 case_unit_quoting
 case_help_and_noexec

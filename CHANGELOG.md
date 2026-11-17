@@ -24,7 +24,7 @@ All notable changes to this project are documented here. The format follows
   `after_game`, `ignore_containers`, `runtimes`, `triggers`, `dialog` and per-game rules. Changes are
   picked up while the service runs, detected by modification time, size and inode; the previous settings
   are kept when the file briefly disappears or is invalid. See `docs/configuration.md`.
-- Config validation ranges: `poll_seconds` 0.2 to 3600, `exit_grace_seconds` 2 to 3600,
+- Config validation ranges: `poll_seconds` 0.2 to 60, `exit_grace_seconds` 2 to 3600,
   `no_game_timeout_seconds` 30 to 86400, `bypass_seconds` 5 to 3600, `dialog_retry_seconds` 30 to
   86400, `heavy_vram_mib` 0 to 10000000.
 - `config validate` reports unknown keys (such as `on_lauch`) with a did-you-mean hint and exits 1;
@@ -55,8 +55,9 @@ All notable changes to this project are documented here. The format follows
   guard stopped are started again with a notification.
 - Dialog buttons: the launch dialog offers **Stop containers and launch**, **Launch anyway** and
   **Cancel**; the restart dialog offers **Restart**, **Ask me later** and **Leave stopped**. Closing a
-  window or a failing dialog backend is never a deliberate answer: closing the launch dialog means
-  **Launch anyway**, closing the restart dialog means **Ask me later**.
+  window or a failing dialog backend is never a deliberate answer: a failing tool means **Launch anyway**
+  at launch and **Ask me later** after the game. Closing a zenity launch dialog means **Launch anyway** and
+  closing a kdialog one means **Cancel**; closing the restart dialog means **Ask me later**.
 - GPU memory per container is measured (a number; 0 means none held) or unknown. The dialog says "GPU
   memory use unknown" for the latter and never calls a container idle. Units are GiB and MiB. NVIDIA
   container memory is counted through `nvidia-smi` compute processes only. The `drm-total-vram` fdinfo
@@ -78,6 +79,17 @@ All notable changes to this project are documented here. The format follows
 - The CI zipapp job now passes an output path to `scripts/build-zipapp.sh`, and shellcheck runs at
   warning level.
 - `scripts/test-matrix-docker.sh` no longer reports success when nothing was tested.
+- A launcher's pid and start time are verified before each signal, so a reused pid is never signalled,
+  and launchers owned by other users are ignored.
+- A game that starts while a trigger's scan is failing is adopted when scanning resumes, not ended.
+- A failing state save no longer strands a launch after the containers were stopped; a failed stop is
+  reported to the user and the containers that did not stop are not offered for restart.
+- GPU memory read from `fdinfo` that cannot cover every process is reported as unknown for containers it
+  did not see, never as zero.
+- The installer rolls back to the previous version (or removes the new files) when the files cannot be
+  written, `systemctl` fails or the service does not start, requires an absolute install directory,
+  quotes the unit's `ExecStart`, and leaves an invalid-config start failure (exit status 78) in place.
+- Config and state writes follow a symlinked file instead of replacing it.
 
 ## 0.1.0
 

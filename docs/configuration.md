@@ -29,8 +29,8 @@ Logs go to stderr, which the systemd journal captures. Exit codes: 0 ok; 1 a fai
 invalid config for `check` and `config` commands; 2 usage error; 78 when `run` refuses to start on an
 invalid config (the service does not restart on 78); 130 on Ctrl-C.
 
-Config and state files are written atomically and keep the file's existing permissions (0644 for a
-new file).
+Config and state files are written atomically and keep the file's existing permissions (a new
+file gets 0644 as masked by the umask; a symlinked file is written through).
 
 ## Keys
 
@@ -38,7 +38,7 @@ new file).
 | --- | --- | --- | --- |
 | `on_launch` | string | `"ask"` | What to do when a game launches while GPU containers run: `ask`, `stop` or `ignore`. |
 | `after_game` | string | `"ask"` | What to do once the game has closed: `ask`, `restart` or `leave`. |
-| `poll_seconds` | number | `1.0` | Interval between checks for new launches. Range 0.2 to 3600. |
+| `poll_seconds` | number | `1.0` | Interval between checks for new launches. Range 0.2 to 60. |
 | `exit_grace_seconds` | number | `8.0` | How long the game must be absent before it counts as closed. Steam's launcher processes briefly disappear between stages of a launch and an exit. Range 2 to 3600. |
 | `no_game_timeout_seconds` | number | `180.0` | Containers were stopped but the relaunched game never appeared: after this long, the after-game action runs anyway. Range 30 to 86400. |
 | `bypass_seconds` | number | `120.0` | After the guard relaunches a game, that game is let through for this long so the relaunch is not intercepted again. Range 5 to 3600. |
@@ -53,7 +53,7 @@ new file).
 ### on_launch
 
 - `ask`: end the launch, show the dialog, act on the answer (**Stop containers and launch**,
-  **Launch anyway**, **Cancel**). Closing the dialog window counts as **Launch anyway**. When the
+  **Launch anyway**, **Cancel**). A dialog tool that fails counts as **Launch anyway**; closing a zenity window counts as **Launch anyway** and closing a kdialog window or pressing Esc counts as **Cancel**. When the
   dialog backend cannot ask (no dialog tool found, or the notification backend without action
   support), the launch is not ended at all: the game starts untouched, nothing is stopped, and the
   log says so once per game.
@@ -134,8 +134,8 @@ containers are not detected.
 The running service re-reads the file when its modification time changes. Edit and save; no restart
 is needed for the values the watcher uses on each pass (timings, `on_launch`, `after_game`,
 `games`, `ignore_containers`, `heavy_vram_mib`). Settings that choose the backends built at start-up
-(`runtimes`, `triggers`, `dialog`) are safest applied with
-`systemctl --user restart gpu-game-guard`.
+(`runtimes`, `triggers`, `dialog`) are read only when the service starts; apply a change with
+`systemctl --user restart gpu-game-guard`. `check` shows a note when they differ from the defaults.
 
 Changes are detected by the file's modification time, size and inode. If the file becomes
 unreadable or invalid, or briefly disappears during an editor's save, the service keeps the

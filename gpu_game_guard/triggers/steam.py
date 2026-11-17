@@ -65,6 +65,18 @@ def _stat_fields(entry: Path) -> List[str]:
     return (entry / "stat").read_text(encoding="utf-8", errors="replace").rsplit(")", 1)[1].split()
 
 
+def _owner_uid(entry: Path) -> int:
+    """The real uid of a process. /proc/<pid> is owned by root for a process that is not dumpable, so the `Uid:`
+    line of its status file is read first and the directory owner is only the fallback."""
+    try:
+        for line in (entry / "status").read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("Uid:"):
+                return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return entry.stat().st_uid
+
+
 def scan_games(proc: Path = Path("/proc"), uid: Optional[int] = None) -> List[Game]:
     """Launchers owned by `uid` (default: the current user); other users' processes are never considered."""
     uid = os.getuid() if uid is None else uid
@@ -73,7 +85,7 @@ def scan_games(proc: Path = Path("/proc"), uid: Optional[int] = None) -> List[Ga
         if not entry.name.isdigit():
             continue
         try:
-            if entry.stat().st_uid != uid:
+            if _owner_uid(entry) != uid:
                 continue
             argv = (entry / "cmdline").read_bytes().decode(errors="replace").split("\0")
             launch = parse_launch(argv)
@@ -180,9 +192,12 @@ def game_name(app_id: int, roots: Optional[Sequence[Path]] = None) -> str:
                 data = shortcuts.read_bytes()
             except (OSError, ValueError):
                 continue
-            for entry in re.finditer(rb"\x02appid\x00(.{4})", data, re.S):
+            entries = list(re.finditer(rb"\x02appid\x00(.{4})", data, re.S))
+            for index, entry in enumerate(entries):
                 if int.from_bytes(entry.group(1), "little") == app_id:
-                    name = re.search(rb"AppName\x00([^\x00]*)", data[entry.end():entry.end() + 600])
+                    # an entry's fields end where the next entry's appid begins
+                    end = entries[index + 1].start() if index + 1 < len(entries) else len(data)
+                    name = re.search(rb"AppName\x00([^\x00]*)", data[entry.end():end])
                     if name and name.group(1):
                         return name.group(1).decode("utf-8", errors="replace")
     return f"Game {app_id}"

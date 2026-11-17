@@ -19,7 +19,7 @@ DIALOGS = ("auto", "zenity", "kdialog", "notify", "none")
 
 # key -> (kind, lowest allowed value, highest allowed value)
 _NUMBERS = {
-    "poll_seconds": ("float", 0.2, 3600),
+    "poll_seconds": ("float", 0.2, 60),
     "exit_grace_seconds": ("float", 2, 3600),
     "no_game_timeout_seconds": ("float", 30, 86400),
     "bypass_seconds": ("float", 5, 3600),
@@ -211,7 +211,7 @@ def _read(path: Path, missing_ok: bool = True) -> Config:
     except UnicodeDecodeError as exc:
         raise ConfigError(f"is not valid UTF-8: {exc}", path) from exc
     except OSError as exc:
-        raise ConfigError(f"cannot be read: {exc}", path) from exc
+        raise ConfigError(f"cannot be read: {exc.strerror or exc}", path) from exc
     try:
         data = json.loads(text)
     except (ValueError, RecursionError) as exc:

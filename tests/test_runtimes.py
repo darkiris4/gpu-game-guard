@@ -272,3 +272,25 @@ class BuildTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MissingContainerMemoryTests(unittest.TestCase):
+    def targets(self, vram):
+        record = {"Id": "f" * 64, "Name": "/x", "Config": {"Image": "i"}, "HostConfig": {"DeviceRequests": [
+            {"Driver": "nvidia", "Capabilities": [["gpu"]]}]}}
+
+        def run(args, **kwargs):
+            return "f\n" if args[1] == "ps" else json.dumps([record])
+
+        return runtimes.DockerLikeRuntime("docker", vram=lambda: vram, run=run).running_gpu_targets()
+
+    def test_a_container_missing_from_an_authoritative_reading_holds_none(self):
+        self.assertEqual(self.targets(gpu.Measurement())[0].vram_mib, 0)
+
+    def test_a_container_missing_from_a_partial_reading_is_unknown(self):
+        partial = gpu.Measurement()
+        partial.authoritative = False
+        self.assertIsNone(self.targets(partial)[0].vram_mib)
+
+    def test_nothing_measurable_is_unknown(self):
+        self.assertIsNone(self.targets(None)[0].vram_mib)

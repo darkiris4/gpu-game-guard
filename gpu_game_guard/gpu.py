@@ -128,12 +128,20 @@ def totals(run: Optional[Runner] = None, drm: Path = DRM) -> Optional[Tuple[int,
     return _nvidia_totals(run or run_command) or _sysfs_totals(drm)
 
 
+class Measurement(Dict[str, int]):
+    """Container id -> MiB of GPU memory. `authoritative` is True when a container missing from it is known to
+    hold none (nvidia-smi lists every compute process) and False when the source could not see every
+    process (fdinfo of other users' processes is unreadable), so a missing container is unknown."""
+
+    authoritative = True
+
+
 def _nvidia_by_container(run: Runner, proc: Path) -> Optional[Dict[str, int]]:
     """None when nvidia-smi could not run; otherwise the figures, empty when no compute app is in a container."""
     rows = _nvidia_query(run, "--query-compute-apps=pid,used_memory")
     if rows is None:
         return None
-    used: Dict[str, int] = {}
+    used = Measurement()
     for row in rows:
         try:
             pid, mib = row[0], int(float(row[1]))
@@ -209,7 +217,9 @@ def _fdinfo_by_container(proc: Path) -> Optional[Dict[str, int]]:
             used_kib[container] = used_kib.get(container, 0) + held
     if not measured:
         return None
-    return {container: kib // 1024 for container, kib in used_kib.items()}
+    result = Measurement((container, kib // 1024) for container, kib in used_kib.items())
+    result.authoritative = False
+    return result
 
 
 def vram_by_container(proc: Path = PROC, run: Optional[Runner] = None) -> Optional[Dict[str, int]]:

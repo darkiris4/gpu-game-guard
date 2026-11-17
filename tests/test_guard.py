@@ -492,7 +492,7 @@ class RunTests(GuardCase):
     def test_run_clamps_the_delay_and_survives_a_failing_sleep(self):
         env = self.env()
         env.guard.step = lambda: None
-        for configured, expected in ((10 ** 400, 3600.0), (0.0, 0.2), (math.nan, 1.0), (1e300, 3600.0)):
+        for configured, expected in ((10 ** 400, 1.0), (0.0, 0.2), (math.nan, 1.0), (1e300, 60.0), (3600.0, 60.0)):
             env.config.poll_seconds = configured
             sleeps = []
 
@@ -709,3 +709,28 @@ class CanAskTests(GuardCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OutageAndFailedStopTests(GuardCase):
+    def test_a_game_started_during_a_scan_outage_is_adopted_when_scanning_resumes(self):
+        env = self.env()
+        env.trigger.launches = []
+        env.advance(1)
+        env.trigger.fail_scan = True
+        env.advance(1)
+        env.trigger.launches = [make_launch(10)]  # started while the scan was failing
+        env.trigger.fail_scan = False
+        env.advance(1)
+        self.assertEqual((env.prompter.launch_asked, env.trigger.ended), ([], []))
+        env.trigger.launches = [make_launch(10), make_launch(11, 440)]
+        env.advance(1)
+        self.assertEqual(len(env.prompter.launch_asked), 1, "a launch after recovery is intercepted again")
+
+    def test_a_failed_stop_after_a_dialog_answer_is_reported(self):
+        env = self.env(launch="stop")
+        env.docker.refuse_stop = ["ollama"]
+        env.trigger.launches = [make_launch(10)]
+        env.advance(1)
+        self.assertEqual(env.state.stopped, [])
+        self.assertTrue(any("Could not stop" in body for _title, body in env.prompter.notifications))
+        self.assertEqual(env.trigger.relaunched, [make_launch(10)], "the game still starts")

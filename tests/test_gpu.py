@@ -243,3 +243,18 @@ class VramTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MeasurementTests(unittest.TestCase):
+    def test_nvidia_results_are_authoritative_and_fdinfo_results_are_not(self):
+        with tempfile.TemporaryDirectory() as root:
+            result = gpu.vram_by_container(Path(root), run=lambda *a, **k: "")
+            self.assertEqual(result, {})
+            self.assertTrue(result.authoritative)
+            proc = Path(root)
+            (proc / "10" / "fdinfo").mkdir(parents=True)
+            (proc / "10" / "cgroup").write_text("0::/system.slice/docker-" + "a" * 64 + ".scope\n")
+            (proc / "10" / "fdinfo" / "3").write_text("drm-driver: amdgpu\ndrm-client-id: 1\ndrm-memory-vram: 2048 KiB\n")
+            result = gpu.vram_by_container(proc, run=lambda *a, **k: None)
+            self.assertEqual(result, {"a" * 64: 2})
+            self.assertFalse(result.authoritative)

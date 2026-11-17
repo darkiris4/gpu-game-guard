@@ -154,8 +154,8 @@ def command_config(args) -> int:
         print(f"{path} does not exist; the defaults are in use")
         return EXIT_OK
     try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError) as exc:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError) as exc:
         detail = exc.strerror if isinstance(exc, OSError) and exc.strerror else exc
         print(f"{path}: cannot be read as JSON: {detail}", file=sys.stderr)
         return EXIT_FAILED

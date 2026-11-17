@@ -64,6 +64,10 @@ if [ "$uninstall" = 1 ]; then
 fi
 
 case "$BIN_DIR" in
+  /*) ;;
+  *) die "GPU_GAME_GUARD_BIN_DIR must be an absolute path: systemd needs one in ExecStart" ;;
+esac
+case "$BIN_DIR" in
   *[\"\\]*|*$'\n'*) die "GPU_GAME_GUARD_BIN_DIR must not contain a quote, a backslash or a newline: systemd rejects such a program path" ;;
 esac
 command -v python3 >/dev/null || die "python3 is required"
@@ -96,13 +100,13 @@ bash "$tree/scripts/build-zipapp.sh" "$tmp/$NAME" || die "could not build $NAME"
 head -n 1 "$tmp/$NAME" | grep -q '^#!.*python3' || die "the built file does not look like the program"
 python3 "$tmp/$NAME" --version >/dev/null || die "the built program does not run"
 
-# Quotes a path for an ExecStart line: double-quoted, with the characters systemd treats specially escaped.
+# Quotes a path for an ExecStart line: double-quoted, with the characters systemd treats specially escaped. The
+# program path is not subject to variable expansion, so a dollar sign is left as it is.
 unit_quote() {
   local text="$1"
   text="${text//\\/\\\\}"
   text="${text//\"/\\\"}"
   text="${text//%/%%}"
-  text="${text//\$/\$\$}"
   printf '"%s"' "$text"
 }
 
@@ -114,35 +118,64 @@ had_bin=0 had_unit=0
 if [ -e "$BIN_DIR/$NAME" ]; then cp -p "$BIN_DIR/$NAME" "$backup/bin" && had_bin=1; fi
 if [ -e "$unit" ] || [ -L "$unit" ]; then cp -P "$unit" "$backup/unit" && had_unit=1; fi
 
+# Puts the previous program and unit back, or removes the new ones when nothing was installed before.
+restore() {
+  if [ "$had_bin" = 1 ]; then
+    cp -p "$backup/bin" "$BIN_DIR/.$NAME.old.$$" && mv -f "$BIN_DIR/.$NAME.old.$$" "$BIN_DIR/$NAME"
+  else
+    rm -f "$BIN_DIR/$NAME"
+  fi
+  if [ "$had_unit" = 1 ]; then
+    cp -P "$backup/unit" "$UNIT_DIR/.$NAME.service.old.$$" && mv -f "$UNIT_DIR/.$NAME.service.old.$$" "$unit"
+  else
+    rm -f "$unit"
+  fi
+  if [ "$systemd" = 1 ]; then
+    [ "$had_unit" = 1 ] || systemctl --user disable "$NAME.service" >/dev/null 2>&1 || true
+    systemctl --user daemon-reload || true
+    if [ "$had_bin" = 1 ]; then systemctl --user restart "$NAME.service" || true; fi
+  fi
+}
+
 # Each file is written under a temporary name in its own directory and renamed into place, so a reader
 # never sees a partial file and a symlink at the final name is replaced rather than written through.
-install -m 0755 "$tmp/$NAME" "$BIN_DIR/.$NAME.new.$$"
-mv -f "$BIN_DIR/.$NAME.new.$$" "$BIN_DIR/$NAME"
+trap 'rm -rf "$tmp"; rm -f "$BIN_DIR/.$NAME.new.$$" "$BIN_DIR/.$NAME.old.$$" "$UNIT_DIR/.$NAME.service.new.$$" "$UNIT_DIR/.$NAME.service.old.$$"' EXIT
 exec_line="ExecStart=$(unit_quote "$BIN_DIR/$NAME") run"
-while IFS= read -r line || [ -n "$line" ]; do
-  case "$line" in
-    ExecStart=*) printf '%s\n' "$exec_line" ;;
-    *) printf '%s\n' "$line" ;;
-  esac
-done < "$tree/$NAME.service" > "$UNIT_DIR/.$NAME.service.new.$$"
-mv -f "$UNIT_DIR/.$NAME.service.new.$$" "$unit"
+if ! { install -m 0755 "$tmp/$NAME" "$BIN_DIR/.$NAME.new.$$" && mv -f "$BIN_DIR/.$NAME.new.$$" "$BIN_DIR/$NAME"; }; then
+  restore
+  die "could not install $BIN_DIR/$NAME; the previous installation was left as it was"
+fi
+if ! { while IFS= read -r line || [ -n "$line" ]; do
+         case "$line" in
+           ExecStart=*) printf '%s\n' "$exec_line" ;;
+           *) printf '%s\n' "$line" ;;
+         esac
+       done < "$tree/$NAME.service" > "$UNIT_DIR/.$NAME.service.new.$$" \
+       && mv -f "$UNIT_DIR/.$NAME.service.new.$$" "$unit"; }; then
+  restore
+  die "could not write $unit; the previous installation was restored"
+fi
 
 if [ "$systemd" = 1 ]; then
-  systemctl --user daemon-reload
-  systemctl --user enable "$NAME.service" >/dev/null || die "could not enable $NAME.service: systemctl --user enable failed"
+  systemctl --user daemon-reload || { restore; die "systemctl --user daemon-reload failed; the previous installation was restored"; }
+  systemctl --user enable "$NAME.service" >/dev/null || { restore; die "could not enable $NAME.service; the previous installation was restored"; }
   systemctl --user restart "$NAME.service" || true
-  sleep 1
-  if ! systemctl --user is-active --quiet "$NAME.service"; then
+  running=0
+  for _ in 1 2 3 4 5; do
+    sleep 1
+    if systemctl --user is-active --quiet "$NAME.service"; then running=1; break; fi
+  done
+  if [ "$running" != 1 ]; then
+    status="$(systemctl --user show -p ExecMainStatus --value "$NAME.service" 2>/dev/null || true)"
+    if [ "$status" = 78 ]; then
+      # the program refuses to start on an invalid config; the installation itself is fine
+      die "installed, but the service did not start because the config is invalid: run '$NAME config validate'"
+    fi
+    restore
     if [ "$had_bin" = 1 ]; then
-      mv -f "$backup/bin" "$BIN_DIR/.$NAME.old.$$" && mv -f "$BIN_DIR/.$NAME.old.$$" "$BIN_DIR/$NAME"
-      if [ "$had_unit" = 1 ]; then
-        cp -P "$backup/unit" "$UNIT_DIR/.$NAME.service.old.$$" && mv -f "$UNIT_DIR/.$NAME.service.old.$$" "$unit"
-      fi
-      systemctl --user daemon-reload || true
-      systemctl --user restart "$NAME.service" || true
       die "the new service did not start; the previous version was restored: journalctl --user -u $NAME"
     fi
-    die "the service did not start: journalctl --user -u $NAME"
+    die "the service did not start; the new files were removed: journalctl --user -u $NAME"
   fi
   say "GPU Game Guard installed and running"
 else
