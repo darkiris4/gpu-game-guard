@@ -6,23 +6,30 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 
 # A reference to something the guard stopped, as stored in the state file and handed back to start it again.
-Ref = Dict[str, str]  # {"kind": "container", "runtime": "docker", "name": "ollama"}
+# Required keys: kind ("container", "service", "command" or "process"), runtime (the provider's name) and name.
+# Optional keys a provider may need to start the target again: "scope" (str), "unit" (str), "id" (str),
+# "cmdline" (list of str) and "cwd" (str).
+Ref = Dict[str, Any]  # {"kind": "container", "runtime": "docker", "name": "ollama"}
 
 
 @dataclass(frozen=True)
 class Target:
     """Something that can be stopped before a game and started again after it."""
 
-    kind: str  # "container" for now
-    runtime: str  # "docker" or "podman" for containers
-    name: str  # what the runtime calls it
+    kind: str  # "container", "service", "command" or "process"
+    runtime: str  # the provider's name: "docker", "podman", "service", "command" or "process"
+    name: str  # what the provider calls it (for configured targets, their label or unit)
     image: str = ""
     vram_mib: Optional[int] = None  # GPU memory its processes hold; 0 when measured and none is held; None when it could not be measured
     ref_id: str = ""  # the runtime's full id, used to match processes to it; never stored
+    extra: Optional[Dict[str, Any]] = None  # provider data copied into the ref (see Ref), for example a process's cmdline
 
     @property
     def ref(self) -> Ref:
-        return {"kind": self.kind, "runtime": self.runtime, "name": self.name}
+        ref: Ref = {"kind": self.kind, "runtime": self.runtime, "name": self.name}
+        if self.extra:
+            ref.update(self.extra)
+        return ref
 
 
 @dataclass(frozen=True)
@@ -83,3 +90,7 @@ class Prompter(Protocol):
 
     def notify(self, title: str, body: str) -> None:
         """Show a passive notification; never raises."""
+
+    def consume_remember(self) -> Optional[str]:
+        """Optional. After `launch`, the per-game action the user asked to remember ("stop" or "ignore") or None;
+        reading it clears it. Backends without a remember control return None."""
