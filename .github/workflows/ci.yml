@@ -5,13 +5,73 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m unittest discover -s tests -t . -v
+
+  distro:
+    name: ${{ matrix.image }} system python
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["debian:12", "ubuntu:22.04", "ubuntu:24.04"]
+    steps:
+      - name: Install python3
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends python3 ca-certificates
+      - uses: actions/checkout@v4
+      - run: python3 --version
+      - run: python3 -m unittest discover -s tests -t . -v
+
+  shell:
+    name: Shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check
+        run: |
+          set -e
+          for f in install.sh scripts/*.sh; do
+            echo "bash -n $f"
+            bash -n "$f"
+          done
+      - name: shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          shellcheck install.sh scripts/*.sh
+      - name: Installer tests
+        run: bash tests/test_installer.sh
+
+  zipapp:
+    name: Zipapp build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m unittest -v
-      - run: bash -n install.sh
+      - name: Build
+        run: bash scripts/build-zipapp.sh
+      - name: Check the executable
+        run: |
+          set -e
+          test -x ./gpu-game-guard
+          ./gpu-game-guard --version

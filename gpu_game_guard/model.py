@@ -52,6 +52,9 @@ class Trigger(Protocol):
 class Runtime(Protocol):
     name: str
 
+    def installed(self) -> bool:
+        """True when this runtime's command exists on PATH, whether or not its daemon is running."""
+
     def available(self) -> bool:
         """True when this runtime's command exists and answers."""
 

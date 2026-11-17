@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Installs GPU Game Guard for the current user: the script goes to ~/.local/bin and a systemd user
-# service watches for Steam game launches.
+# Installs GPU Game Guard for the current user: a single executable goes to ~/.local/bin and a systemd
+# user service runs it.
 #
 #   install.sh                 install or update, then start the service
 #   install.sh --uninstall     stop the service and remove the files (add --purge to drop the saved state)
@@ -48,10 +48,11 @@ if [ "$uninstall" = 1 ]; then
 fi
 
 command -v python3 >/dev/null || die "python3 is required"
-command -v docker >/dev/null || die "docker is required"
-command -v kdialog >/dev/null || die "kdialog is required for the dialogs (KDE Plasma; package: kdialog)"
+command -v docker >/dev/null || command -v podman >/dev/null || die "a container runtime is required (docker or podman)"
+command -v zenity >/dev/null || command -v kdialog >/dev/null \
+  || say "warning: neither zenity nor kdialog found; without a dialog the guard lets games launch without asking"
 command -v steam >/dev/null || command -v flatpak >/dev/null || say "warning: neither steam nor flatpak found; the relaunch needs one of them"
-command -v nvidia-smi >/dev/null || say "warning: nvidia-smi not found; the dialog will not show GPU memory figures"
+command -v nvidia-smi >/dev/null || say "warning: nvidia-smi not found; GPU memory figures come from the kernel's DRM interface where available"
 if [ "$systemd" = 1 ]; then
   command -v systemctl >/dev/null || die "systemd is required (use --no-systemd to only copy the files)"
 fi
@@ -59,32 +60,32 @@ fi
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 if [ -n "$SRC" ]; then
-  cp "$SRC/gpu_game_guard.py" "$tmp/$NAME"
+  [ -d "$SRC/gpu_game_guard" ] || die "GPU_GAME_GUARD_SRC is not a checkout: $SRC"
+  tree="$SRC"
 else
-  command -v curl >/dev/null || die "curl is required to download the script"
-  curl -fsSL "https://raw.githubusercontent.com/$REPO/$REF/gpu_game_guard.py" -o "$tmp/$NAME" \
-    || die "could not download gpu_game_guard.py from $REPO ($REF)"
+  command -v curl >/dev/null || die "curl is required to download the source"
+  command -v tar >/dev/null || die "tar is required to unpack the source"
+  mkdir "$tmp/src"
+  curl -fsSL "https://github.com/$REPO/archive/$REF.tar.gz" | tar -xz -C "$tmp/src" --strip-components=1 \
+    || die "could not download and unpack $REPO ($REF)"
+  tree="$tmp/src"
 fi
-head -n 1 "$tmp/$NAME" | grep -q '^#!.*python3' || die "the downloaded file does not look like the script"
-python3 -m py_compile "$tmp/$NAME" || die "the downloaded script does not compile"
+[ -f "$tree/scripts/build-zipapp.sh" ] || die "the source has no scripts/build-zipapp.sh"
+[ -f "$tree/$NAME.service" ] || die "the source has no $NAME.service"
+
+bash "$tree/scripts/build-zipapp.sh" "$tmp/$NAME" || die "could not build $NAME"
+head -n 1 "$tmp/$NAME" | grep -q '^#!.*python3' || die "the built file does not look like the program"
+"$tmp/$NAME" --version >/dev/null || die "the built program does not run"
 
 install -d "$BIN_DIR" "$UNIT_DIR"
 install -m 0755 "$tmp/$NAME" "$BIN_DIR/$NAME"
 rm -f "$UNIT_DIR/$NAME.service"  # replace a symlink instead of writing through it
-cat > "$UNIT_DIR/$NAME.service" <<UNIT
-[Unit]
-Description=Ask before a Steam game starts while GPU containers are running
-After=graphical-session.target
-PartOf=graphical-session.target
-
-[Service]
-ExecStart=$BIN_DIR/$NAME
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=graphical-session.target
-UNIT
+while IFS= read -r line || [ -n "$line" ]; do
+  case "$line" in
+    ExecStart=*) printf '%s\n' "ExecStart=$BIN_DIR/$NAME run" ;;
+    *) printf '%s\n' "$line" ;;
+  esac
+done < "$tree/$NAME.service" > "$UNIT_DIR/$NAME.service"
 
 if [ "$systemd" = 1 ]; then
   systemctl --user daemon-reload
@@ -96,6 +97,7 @@ if [ "$systemd" = 1 ]; then
 else
   say "GPU Game Guard files installed (systemd untouched)"
 fi
-say "  script:  $BIN_DIR/$NAME"
+say "  program: $BIN_DIR/$NAME"
 say "  service: $UNIT_DIR/$NAME.service"
+say "  config:  $NAME config init   (optional; defaults apply without a file)"
 say "  logs:    journalctl --user -u $NAME -f"

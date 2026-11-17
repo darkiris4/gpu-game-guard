@@ -1,10 +1,10 @@
 [Unit]
-Description=Ask before a Steam game starts while GPU containers are running
+Description=Ask before a game starts while GPU containers are running
 After=graphical-session.target
 PartOf=graphical-session.target
 
 [Service]
-ExecStart=%h/.local/bin/gpu-game-guard
+ExecStart=%h/.local/bin/gpu-game-guard run
 Restart=on-failure
 RestartSec=5
 
