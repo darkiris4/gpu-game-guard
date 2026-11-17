@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import math
+import time
 from pathlib import Path
 from typing import Any, Iterable, List, Optional
 
@@ -22,6 +24,25 @@ def _normalise(item: Any) -> Optional[Ref]:
     return None
 
 
+_CLOCK_SKEW_SECONDS = 60.0  # how far ahead of the wall clock a stored timestamp may be
+
+
+def _stopped_list(value: Any) -> List[Ref]:
+    if not isinstance(value, list):
+        return []
+    refs = [_normalise(item) for item in value]
+    return [ref for ref in refs if ref is not None]
+
+
+def _stopped_at(value: Any, wall_time: float) -> float:
+    """A stored timestamp when it is a finite number that is not in the future, otherwise the wall time."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return wall_time
+    if (isinstance(value, float) and not math.isfinite(value)) or value > wall_time + _CLOCK_SKEW_SECONDS:
+        return wall_time
+    return float(value) if value > -1e18 else wall_time
+
+
 class State:
     def __init__(self, path: Optional[Path] = None):
         self.path = Path(path) if path is not None else xdg_state_home() / "gpu-game-guard" / "state.json"
@@ -30,11 +51,12 @@ class State:
         self.game_seen = False
         try:
             data = json.loads(self.path.read_text())
-            refs = [_normalise(item) for item in data["stopped"]]
-            self.stopped = [ref for ref in refs if ref is not None]
-            self.stopped_at = float(data["stopped_at"])
-            self.game_seen = bool(data["game_seen"])
-        except (OSError, ValueError, KeyError, TypeError):
+            stopped = _stopped_list(data.get("stopped"))
+            if stopped:
+                self.stopped = stopped
+                self.stopped_at = _stopped_at(data.get("stopped_at"), time.time())
+                self.game_seen = data.get("game_seen") is True
+        except (OSError, ValueError, AttributeError, RecursionError):
             self.stopped, self.stopped_at, self.game_seen = [], 0.0, False
 
     def add(self, refs: Iterable[Ref], wall_time: float) -> None:

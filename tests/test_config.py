@@ -63,7 +63,7 @@ class ValidateTests(unittest.TestCase):
 
     def test_empty_and_partial_are_valid(self):
         self.assertEqual(cfg.validate({}), [])
-        self.assertEqual(self.problems(poll_seconds=2, heavy_vram_mib=0, bypass_seconds=0), [])
+        self.assertEqual(self.problems(poll_seconds=2, heavy_vram_mib=0, bypass_seconds=5), [])
 
     def test_top_level_must_be_an_object(self):
         self.assertIn("object", cfg.validate([])[0])
@@ -85,9 +85,38 @@ class ValidateTests(unittest.TestCase):
                 self.assertEqual(len(problems), 1, (key, bad))
                 self.assertIn(f'"{key}"', problems[0])
 
-    def test_poll_seconds_must_be_positive(self):
-        (problem,) = self.problems(poll_seconds=0)
-        self.assertIn("more than zero", problem)
+    def test_ranges_reject_outside_values_and_name_key_range_and_value(self):
+        ranges = {"poll_seconds": (0.2, 3600), "exit_grace_seconds": (2, 3600), "no_game_timeout_seconds": (30, 86400),
+                  "bypass_seconds": (5, 3600), "dialog_retry_seconds": (30, 86400), "heavy_vram_mib": (0, 10000000)}
+        for key, (low, high) in ranges.items():
+            self.assertEqual(self.problems(**{key: low}), [], key)
+            self.assertEqual(self.problems(**{key: high}), [], key)
+            for bad in (low - 0.1 if low else -1, high + 1, 10 ** 400, -(10 ** 400)):
+                (problem,) = self.problems(**{key: bad})
+                self.assertIn(f'"{key}"', problem)
+                self.assertIn(f"from {low} to {high}", problem)
+        (problem,) = self.problems(bypass_seconds=0)
+        self.assertIn("got 0", problem)
+
+    def test_zero_values_that_caused_loops_are_rejected(self):
+        for key in ("bypass_seconds", "no_game_timeout_seconds", "poll_seconds", "exit_grace_seconds",
+                    "dialog_retry_seconds"):
+            self.assertEqual(len(self.problems(**{key: 0})), 1, key)
+
+    def test_huge_integers_do_not_raise(self):
+        self.assertEqual(len(self.problems(poll_seconds=10 ** 400)), 1)
+        self.assertEqual(len(self.problems(heavy_vram_mib=10 ** 400)), 1)
+
+    def test_validate_reports_unknown_keys_with_a_suggestion(self):
+        (problem,) = self.problems(on_lauch="stop")
+        self.assertEqual(problem, "unknown key 'on_lauch'; did you mean 'on_launch'?")
+        (problem,) = self.problems(zzzzzz=1)
+        self.assertEqual(problem, "unknown key 'zzzzzz'")
+
+    def test_validate_reports_unknown_keys_in_a_game_rule(self):
+        (problem,) = self.problems(games={"steam:1": {"actoin": "stop"}})
+        self.assertIn("steam:1", problem)
+        self.assertIn("unknown key 'actoin'; did you mean 'action'?", problem)
 
     def test_heavy_vram_must_be_whole(self):
         self.assertTrue(self.problems(heavy_vram_mib=1.5))
@@ -123,10 +152,23 @@ class FromJsonTests(unittest.TestCase):
 
     def test_unknown_keys_are_ignored_with_a_warning(self):
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        with contextlib.redirect_stderr(out):
             c = Config.from_json({"colour": "red", "on_launch": "stop"})
         self.assertEqual(c.on_launch, "stop")
         self.assertIn("colour", out.getvalue())
+
+    def test_unknown_keys_in_a_game_rule_are_ignored_with_one_warning(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            c = Config.from_json({"colour": "red", "games": {"steam:1": {"action": "stop", "extra": 1}}})
+        self.assertEqual(c.games["steam:1"].action, "stop")
+        self.assertEqual(len(err.getvalue().splitlines()), 1)
+        self.assertIn("steam:1.extra", err.getvalue())
+
+    def test_error_carries_reason_and_path(self):
+        self.assertEqual(str(ConfigError("bad")), "bad")
+        error = ConfigError("bad", Path("/x/c.json"))
+        self.assertEqual((error.reason, error.path, str(error)), ("bad", Path("/x/c.json"), "/x/c.json: bad"))
 
     def test_ints_become_floats_and_missing_rule_fields_default(self):
         c = Config.from_json({"poll_seconds": 2, "games": {"steam:5": {"action": "stop"}}})
@@ -168,6 +210,34 @@ class FileTests(unittest.TestCase):
             cfg.load(self.path)
         self.assertIn("dialog", str(ctx.exception))
 
+    def test_errors_carry_the_path_without_repeating_it_in_the_reason(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text("{nope")
+        with self.assertRaises(ConfigError) as ctx:
+            cfg.load(self.path)
+        self.assertEqual(ctx.exception.path, self.path)
+        self.assertNotIn(str(self.path), ctx.exception.reason)
+        self.assertTrue(str(ctx.exception).startswith(f"{self.path}: "))
+        self.path.write_text('{"dialog": "cli"}')
+        with self.assertRaises(ConfigError) as ctx:
+            cfg.load(self.path)
+        self.assertEqual(ctx.exception.path, self.path)
+        self.assertNotIn(str(self.path), ctx.exception.reason)
+
+    def test_huge_integer_is_a_config_error(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text('{"poll_seconds": ' + "9" * 400 + "}")
+        with self.assertRaises(ConfigError) as ctx:
+            cfg.load(self.path)
+        self.assertIn("poll_seconds", str(ctx.exception))
+
+    def test_invalid_utf8_is_a_config_error(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_bytes(b'{"dialog": "\xff\xfe"}')
+        with self.assertRaises(ConfigError) as ctx:
+            cfg.load(self.path)
+        self.assertIn("UTF-8", ctx.exception.reason)
+
     def test_default_path_is_used(self):
         with tempfile.TemporaryDirectory() as root, mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": root}):
             cfg.save(Config(after_game="leave"))
@@ -186,21 +256,84 @@ class WatcherTests(unittest.TestCase):
 
     def logged(self, watcher):
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        with contextlib.redirect_stderr(out):
             result = watcher.current()
         return result, out.getvalue()
 
     def test_missing_file_gives_defaults(self):
         self.assertEqual(ConfigWatcher(self.path).current(), Config())
 
-    def test_rereads_only_when_the_mtime_changes(self):
+    def test_rereads_when_the_mtime_changes(self):
         self.write('{"on_launch": "stop"}', 1000)
         watcher = ConfigWatcher(self.path)
         self.assertEqual(watcher.current().on_launch, "stop")
-        self.write('{"on_launch": "ignore"}', 1000)  # same mtime: not noticed
         self.assertEqual(watcher.current().on_launch, "stop")
-        os.utime(self.path, (2000, 2000))
+        self.write('{"on_launch": "stop"}', 2000)
+        self.write('{"on_launch": "ignore"}', 2000)
         self.assertEqual(watcher.current().on_launch, "ignore")
+
+    def test_a_same_mtime_rewrite_with_another_size_is_noticed(self):
+        self.write('{"on_launch": "stop"}', 1000)
+        watcher = ConfigWatcher(self.path)
+        watcher.current()
+        self.write('{"on_launch": "ignore"}', 1000)
+        self.assertEqual(watcher.current().on_launch, "ignore")
+
+    def test_a_replaced_file_with_the_same_mtime_and_size_is_noticed(self):
+        self.write('{"on_launch": "stop"}', 1000)
+        watcher = ConfigWatcher(self.path)
+        watcher.current()
+        replacement = self.path.with_name("new.json")
+        replacement.write_text('{"on_launch": "ask" }')
+        os.utime(replacement, (1000, 1000))
+        self.assertEqual(len('{"on_launch": "ask" }'), len('{"on_launch": "stop"}'))
+        os.replace(replacement, self.path)
+        self.assertEqual(watcher.current().on_launch, "ask")
+
+    def test_a_briefly_missing_file_keeps_the_previous_settings(self):
+        self.write('{"on_launch": "stop"}', 1000)
+        watcher = ConfigWatcher(self.path)
+        watcher.current()
+        self.path.unlink()
+        c, out = self.logged(watcher)
+        self.assertEqual(c.on_launch, "stop")
+        self.assertIn("missing", out)
+        self.assertEqual(self.logged(watcher), (c, ""))
+        self.write('{"on_launch": "ignore"}', 1000)
+        self.assertEqual(watcher.current().on_launch, "ignore")
+
+    def test_a_file_that_never_existed_gives_defaults(self):
+        watcher = ConfigWatcher(self.path)
+        self.assertEqual(watcher.current(), Config())
+        self.assertEqual(watcher.current(), Config())
+
+    def test_a_file_that_vanishes_between_stat_and_read_keeps_the_previous_settings(self):
+        self.write('{"on_launch": "stop"}', 1000)
+        watcher = ConfigWatcher(self.path)
+        watcher.current()
+        self.write('{"on_launch": "ignore"}', 2000)
+        with mock.patch.object(Path, "read_text", side_effect=FileNotFoundError):
+            self.assertEqual(watcher.current().on_launch, "stop")
+        self.assertEqual(watcher.current().on_launch, "ignore")
+
+    def test_invalid_utf8_keeps_the_previous_config_and_logs(self):
+        self.write('{"on_launch": "stop"}', 1000)
+        watcher = ConfigWatcher(self.path)
+        watcher.current()
+        self.path.write_bytes(b'{"on_launch": "\xff"}')
+        os.utime(self.path, (2000, 2000))
+        c, out = self.logged(watcher)
+        self.assertEqual(c.on_launch, "stop")
+        self.assertIn("UTF-8", out)
+
+    def test_a_huge_integer_keeps_the_previous_config(self):
+        self.write('{"on_launch": "stop"}', 1000)
+        watcher = ConfigWatcher(self.path)
+        watcher.current()
+        self.write('{"poll_seconds": ' + "9" * 400 + "}", 2000)
+        c, out = self.logged(watcher)
+        self.assertEqual(c.on_launch, "stop")
+        self.assertIn("poll_seconds", out)
 
     def test_file_appearing_later_is_picked_up(self):
         watcher = ConfigWatcher(self.path)

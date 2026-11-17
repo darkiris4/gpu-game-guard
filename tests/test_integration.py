@@ -1,4 +1,6 @@
 """The real guard, config watcher and state working together; only the outside world is faked."""
+from __future__ import annotations
+
 import json
 import os
 import tempfile

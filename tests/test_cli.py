@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import io
 import json
 import tempfile
@@ -35,6 +37,36 @@ class ConfigCommandTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("already exists", err)
         self.assertEqual(json.loads(self.path.read_text()), {"on_launch": "stop"})
+
+    def test_init_in_an_unwritable_place_fails_cleanly(self):
+        blocker = Path(self.tmp.name) / "file"
+        blocker.write_text("x")
+        path = blocker / "sub" / "config.json"
+        code, out, err = run("--config", str(path), "config", "init")
+        self.assertEqual(code, 1)
+        self.assertIn("cannot write", err)
+        self.assertNotIn("Traceback", err)
+        self.assertEqual(out, "")
+
+    def test_config_is_accepted_after_the_subcommand(self):
+        self.path.write_text('{"on_launch": "stop"}')
+        code, out, _ = run("config", "show", "--config", str(self.path))
+        self.assertEqual((code, json.loads(out)["on_launch"]), (0, "stop"))
+        code, out, _ = run("config", "path", "--config", str(self.path))
+        self.assertEqual((code, out.strip()), (0, str(self.path)))
+        code, out, _ = run("--config", str(self.path), "config", "path")
+        self.assertEqual(out.strip(), str(self.path))
+
+    def test_config_defaults_when_not_given(self):
+        with mock.patch.object(cli.configmod, "config_path", return_value=self.path):
+            code, out, _ = run("config", "path")
+        self.assertEqual((code, out.strip()), (0, str(self.path)))
+
+    def test_an_unexpected_os_error_is_a_one_line_failure(self):
+        with mock.patch.object(cli, "command_config", side_effect=PermissionError(13, "Permission denied")):
+            code, _, err = run("--config", str(self.path), "config", "show")
+        self.assertEqual(code, 1)
+        self.assertEqual(len(err.strip().splitlines()), 1)
 
     def test_show_prints_the_effective_config(self):
         self.path.write_text('{"on_launch": "stop", "games": {"steam:730": {"name": "CS", "action": "ignore"}}}')
@@ -79,6 +111,7 @@ class CheckCommandTests(unittest.TestCase):
         trigger.launches = list(launches)
         prompter = mock.Mock()
         prompter.name = "kdialog"
+        prompter.can_ask = True
         with mock.patch.object(cli.runtimes, "build", return_value=[runtime]), \
                 mock.patch.object(cli.triggers, "build", return_value=[trigger]), \
                 mock.patch.object(cli.dialogs, "choose", return_value=prompter), \
@@ -120,13 +153,36 @@ class CheckCommandTests(unittest.TestCase):
     def test_says_when_games_would_start_without_asking(self):
         prompter = mock.Mock()
         prompter.name = "none"
+        prompter.can_ask = False
         with mock.patch.object(cli.runtimes, "build", return_value=[]), \
                 mock.patch.object(cli.triggers, "build", return_value=[]), \
                 mock.patch.object(cli.dialogs, "choose", return_value=prompter), \
                 mock.patch.object(cli.gpu, "totals", return_value=None):
             _, out, _ = run("--config", "/nonexistent/config.json", "check")
-        self.assertIn("without asking", out)
+        self.assertIn("cannot ask: games start without being stopped or restarted", out)
+        self.assertNotIn("without asking", out)
         self.assertIn("GPU memory overall: unknown", out)
+
+    def test_a_backend_that_can_ask_has_no_warning(self):
+        _, out, _ = self.check()
+        self.assertNotIn("cannot ask", out)
+
+    def test_no_trailing_spaces_before_entries(self):
+        _, out, _ = self.check(launches=[make_launch(1, 730)])
+        for line in out.splitlines():
+            self.assertEqual(line, line.rstrip(), repr(line))
+        self.assertIn("launches running now:\n", out)
+        self.assertIn("GPU containers running now:\n", out)
+        _, out, _ = self.check(running=())
+        self.assertIn("launches running now: none\n", out)
+        self.assertIn("GPU containers running now: none\n", out)
+
+    def test_notes_that_startup_only_settings_need_a_restart(self):
+        _, out, _ = self.check('{"runtimes": ["podman"], "dialog": "zenity"}')
+        self.assertIn("runtimes, dialog differ from the defaults", out)
+        self.assertIn("restart", out)
+        _, out, _ = self.check("{}")
+        self.assertNotIn("restart", out)
 
 
 class RunCommandTests(unittest.TestCase):
@@ -136,10 +192,30 @@ class RunCommandTests(unittest.TestCase):
             path.write_text('{"on_launch": "maybe"}')
             with mock.patch.object(cli, "log") as log:
                 code, _, _ = run("--config", str(path), "run")
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 78)
         message = log.call_args[0][0]
+        self.assertTrue(message.startswith("cannot start: "))
         self.assertEqual(message.count(str(path)), 1, "the path is shown once")
         self.assertIn("on_launch", message)
+
+    def test_run_accepts_config_after_the_subcommand(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text("[]")
+            with mock.patch.object(cli, "log"):
+                code, _, _ = run("run", "--config", str(path))
+        self.assertEqual(code, 78)
+
+    def test_interrupt_exits_130(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(cli.runtimes, "build", return_value=[]), \
+                mock.patch.object(cli.triggers, "build", return_value=[]), \
+                mock.patch.object(cli.dialogs, "choose", return_value=mock.Mock(name="x")), \
+                mock.patch.object(cli, "State"), \
+                mock.patch.object(cli, "Guard") as guard:
+            guard.return_value.run.side_effect = KeyboardInterrupt
+            code, _, _ = run("--config", str(Path(tmp) / "config.json"))
+        self.assertEqual(code, 130)
 
     def test_skips_runtimes_that_are_not_installed_and_starts_the_guard(self):
         present, absent = FakeRuntime("docker"), FakeRuntime("podman")

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import stat
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -28,7 +31,8 @@ class StateTests(unittest.TestCase):
     def test_missing_or_corrupt_file_is_empty(self):
         self.assertEqual(State(self.path).stopped, [])
         self.path.parent.mkdir(parents=True)
-        for text in ("{nope", "[]", '{"stopped": 5, "stopped_at": 1, "game_seen": false}', '{"stopped": ["a"]}'):
+        for text in ("{nope", "[]", '{"stopped": 5, "stopped_at": 1, "game_seen": false}', '{"stopped": "ollama"}',
+                     '{"stopped": {"name": "a"}}'):
             self.path.write_text(text)
             s = State(self.path)
             self.assertEqual((s.stopped, s.stopped_at, s.game_seen), ([], 0.0, False), text)
@@ -98,6 +102,87 @@ class StateTests(unittest.TestCase):
             s.save()
         write.assert_called_once()
         self.assertEqual(write.call_args[0][0], self.path)
+
+    def load(self, **fields):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        data = {"stopped": [ref("a")], "stopped_at": 1.0, "game_seen": False}
+        data.update(fields)
+        self.path.write_text(json.dumps(data))
+        return State(self.path)
+
+    def test_stopped_must_be_a_list(self):
+        self.assertEqual(self.load(stopped="ollama").stopped, [])
+        self.assertEqual(self.load(stopped=None).stopped, [])
+
+    def test_game_seen_must_be_a_bool(self):
+        for bad in ("false", "true", 1, None, []):
+            self.assertFalse(self.load(game_seen=bad).game_seen, bad)
+        self.assertTrue(self.load(game_seen=True).game_seen)
+
+    def test_stopped_at_must_be_a_finite_number_not_in_the_future(self):
+        before = time.time()
+        for bad in (float("nan"), float("inf"), before + 3600, "5", None, True, [1]):
+            text = json.dumps({"stopped": [ref("a")], "stopped_at": bad, "game_seen": False}).replace("Infinity", "1e999")
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(text)
+            at = State(self.path).stopped_at
+            self.assertTrue(before <= at <= time.time(), bad)
+        self.assertEqual(self.load(stopped_at=before - 5).stopped_at, before - 5)
+        soon = time.time() + 30
+        self.assertEqual(self.load(stopped_at=soon).stopped_at, soon)
+
+    def test_huge_integer_timestamp_is_replaced(self):
+        at = self.load(stopped_at=10 ** 400).stopped_at
+        self.assertTrue(math.isfinite(at))
+        self.assertLessEqual(at, time.time())
+
+
+class AtomicWriteTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        self.path = self.dir / "out.json"
+
+    def test_a_failed_write_leaves_no_temporary_file(self):
+        with mock.patch("gpu_game_guard.util.json.dump", side_effect=RuntimeError("disk")):
+            with self.assertRaises(RuntimeError):
+                util.atomic_write_json(self.path, {"a": 1})
+        self.assertEqual(list(self.dir.iterdir()), [])
+
+    def test_a_failed_replace_leaves_no_temporary_file(self):
+        with mock.patch("gpu_game_guard.util.os.replace", side_effect=OSError("busy")):
+            with self.assertRaises(OSError):
+                util.atomic_write_json(self.path, {"a": 1})
+        self.assertEqual(list(self.dir.iterdir()), [])
+
+    def test_a_new_file_gets_the_default_mode_under_the_umask(self):
+        old = os.umask(0o022)
+        try:
+            util.atomic_write_json(self.path, {"a": 1})
+        finally:
+            os.umask(old)
+        self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o644)
+
+    def test_an_existing_file_keeps_its_mode(self):
+        self.path.write_text("{}")
+        os.chmod(self.path, 0o664)
+        util.atomic_write_json(self.path, {"a": 1})
+        self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o664)
+        self.assertEqual(json.loads(self.path.read_text()), {"a": 1})
+
+    def test_the_file_is_synced_before_it_replaces_the_target(self):
+        with mock.patch("gpu_game_guard.util.os.fsync") as fsync:
+            util.atomic_write_json(self.path, {"a": 1})
+        self.assertGreaterEqual(fsync.call_count, 1)
+
+    def test_log_writes_to_stderr(self):
+        import contextlib
+        import io
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            util.log("hello")
+        self.assertEqual((out.getvalue(), err.getvalue()), ("", "hello\n"))
 
 
 if __name__ == "__main__":

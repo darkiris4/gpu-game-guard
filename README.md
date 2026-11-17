@@ -41,13 +41,19 @@ Add `--purge` after `--uninstall` to also delete the saved state.
 - Watches for Steam's per-game launcher process (`reaper SteamLaunch AppId=<id>`), for native and
   Flatpak Steam, including non-Steam shortcuts. It polls once a second.
 - If no container with GPU access is running, it does nothing and shows nothing.
-- Otherwise it ends the launch before the game window exists and shows a dialog with three choices:
+- Otherwise it ends the launch, usually before the game window appears (it polls once a second, so a
+  game that shows its window within the first second can be past that stage), and shows a dialog
+  with three choices:
   - **Stop containers and launch** stops them (in parallel), remembers which, and starts the game
     again through `steam://rungameid/`.
   - **Launch anyway** starts the game again and leaves the containers running.
   - **Cancel** does nothing further.
+  Closing the dialog window, or a dialog tool that fails, is never taken as a deliberate answer:
+  closing it counts as **Launch anyway**.
 - When the game has been closed for about 8 seconds, it asks whether to start the containers it
-  stopped. Answering **Leave stopped** forgets them.
+  stopped, with **Restart**, **Ask me later** and **Leave stopped**. **Leave stopped** forgets them.
+  Closing the window, or a failing dialog tool, counts as **Ask me later**: the question is repeated
+  later and the containers stay recorded.
 - The list of stopped containers is kept in `~/.local/state/gpu-game-guard/state.json` until you
   answer, so the question survives a crash or a reboot. A container stopped with `docker stop`
   stays stopped across reboots even with `restart: unless-stopped`.
@@ -56,23 +62,27 @@ Add `--purge` after `--uninstall` to also delete the saved state.
 
 The dialog names the game (from Steam's manifests or the shortcut's name), lists each container
 with its image and the GPU memory its processes hold, and shows overall GPU memory use when known.
-Its warning is graded: an idle container is reported as such, and the stutter warning appears only
-when the containers together hold 4 GB or more (`heavy_vram_mib`).
+When a container's GPU memory could not be measured, the dialog says "GPU memory use unknown" for it
+and never calls it idle. The stutter warning is graded and appears as heavy only when the containers
+together hold 4 GiB or more (`heavy_vram_mib`, in MiB). Figures are shown in GiB and MiB.
 
 ## GPU vendors
 
 GPU memory is read without vendor tooling beyond what the kernel provides:
 
-- **NVIDIA** through `nvidia-smi`.
+- **NVIDIA** through `nvidia-smi`. A container's memory is counted from `nvidia-smi` compute
+  processes only; graphics-only workloads are not counted.
 - **AMD and Intel** through kernel interfaces: totals from `/sys/class/drm/card*/device/mem_info_vram_*`
   and per-process figures from the DRM fdinfo files in `/proc/<pid>/fdinfo`.
 
-When no figures are available, the dialog simply omits them; whether a container counts does not
-depend on them.
+Per container, GPU memory is either measured (a number, where 0 means none is held) or unknown
+(it could not be measured). The dialog shows "GPU memory use unknown" in the second case. Whether
+a container counts does not depend on these figures.
 
-**Tested where:** developed and run on Pop!_OS with KDE Plasma on X11, an NVIDIA GPU and native
-Steam. The AMD, Intel and Podman code paths are covered by unit tests with fixtures, but have not
-been run on real hardware.
+**Tested where:** developed on Pop!_OS with KDE on X11 with an NVIDIA GPU and Docker. Everything
+else (AMD, Intel, Podman, other dialog tools, other desktops) is covered by unit tests with fixtures
+and has not been run on real hardware. CI runs the tests on the system Python of Debian 12, Ubuntu
+22.04 and Ubuntu 24.04 and on Python 3.9 to 3.13.
 
 ## Which containers count
 
@@ -80,17 +90,23 @@ A running container counts as a GPU container when its configuration gives it GP
 
 - a `gpu` device request (`--gpus ...`, or `deploy.resources.reservations.devices` in Compose), or
   a CDI device request for a GPU;
-- the `nvidia` runtime;
-- a mapped device such as `/dev/nvidia*`, `/dev/kfd` or a node under `/dev/dri/`, or a CDI device
-  name containing `gpu` (for example `nvidia.com/gpu=all` or `amd.com/gpu=all` with Podman);
+- the `nvidia` runtime, unless the container sets `NVIDIA_VISIBLE_DEVICES` to `void` or `none`;
+- a mapped device: `/dev/nvidia*`, `/dev/kfd`, the `/dev/dri` directory device or anything under it,
+  or a CDI device name containing `gpu` (for example `nvidia.com/gpu=all` or `amd.com/gpu=all` with
+  Podman);
 - a `cdi.k8s.io/` annotation that names a GPU.
 
 Nothing is listed by name, so new containers are picked up automatically. To exempt some, see
 `ignore_containers` below.
 
-It judges configuration, not activity: an idle Ollama with no model loaded still counts. A
-container that reaches the GPU another way (for example a privileged container that mounts nothing
-but uses the GPU through the host) is not detected.
+It judges configuration, not activity: an idle Ollama with no model loaded still counts. Privileged
+containers are not detected, nor is any container that reaches the GPU another way without one of
+the settings above.
+
+Containers that map `/dev/dri` only for video decoding (Plex, Jellyfin, Frigate) are detected too.
+Add them to `ignore_containers` to leave them alone. Ignored containers are never stopped; a
+container the guard already recorded as stopped is still started again later, even if an ignore
+pattern was added since.
 
 ## Docker and Podman
 
@@ -109,11 +125,25 @@ the runtime that owns them, which the state file remembers.
 
 The default `auto` picks in that order. The `dialog` setting forces one.
 
-**With no dialog, the game starts.** If no backend can ask a question, or a dialog tool fails to
-run, the guard lets the launch through untouched rather than leaving the game dead, and the
-containers keep running. The after-game question then cannot be asked either; the stopped
-containers stay recorded and it is retried later. A notification-only backend can inform but not
-ask, so it behaves the same way.
+**With no way to ask, the launch is not touched.** If no dialog tool is found, or the notification
+backend does not support actions, the guard cannot ask. It then does not end the launch at all: the
+game starts untouched, nothing is stopped on its own for action `ask`, and the log says so once per
+game. An explicit `stop` (per game or global) still stops the containers and starts the game, with a
+notification. With `after_game` set to `ask` and no way to ask, the containers the guard stopped are
+started again, with a notification.
+
+### How a launch is handled
+
+| Action for the game | Dialog available | No way to ask |
+| --- | --- | --- |
+| `ask` (default) | launch ended, dialog shown, answer applied | game starts untouched, nothing stopped, logged once per game |
+| `stop` | launch ended, containers stopped, game started, notification | same as with a dialog |
+| `ignore` | nothing happens | nothing happens |
+
+The dialog buttons are **Stop containers and launch**, **Launch anyway** and **Cancel** at launch,
+and **Restart**, **Ask me later** and **Leave stopped** after the game. Closing a window, or a
+failing dialog backend, is never a deliberate answer: closing the launch dialog means **Launch
+anyway**, and closing the restart dialog means **Ask me later**.
 
 ## Per-game rules and policies
 
@@ -124,7 +154,8 @@ it for single games:
   `ignore` (never interrupt).
 - `after_game`: `ask`, `restart` (start them again and say so) or `leave` (forget them, leave them
   stopped).
-- `games`: per-game rules keyed by game id (`steam:730`) that override `on_launch`.
+- `games`: per-game rules keyed by game id (`steam:730`) that override `on_launch`. A rule with no
+  `action` uses `ask`; it does not inherit `on_launch`.
 - `ignore_containers`: glob patterns of container names that are never touched.
 
 Example, never interrupting one game and ignoring a backup container:
@@ -145,7 +176,7 @@ Every key, default, how to find a game id and more examples are in
 gpu-game-guard check                # diagnose the setup
 gpu-game-guard config path          # where the config file is
 gpu-game-guard config show          # the effective configuration as JSON
-gpu-game-guard config validate      # report problems in the file
+gpu-game-guard config validate      # report problems in the file, including unknown keys
 gpu-game-guard config init          # write the defaults to the config path (never overwrites)
 gpu-game-guard --version
 ```
@@ -153,7 +184,13 @@ gpu-game-guard --version
 `check` prints the version, the config path and whether the file is valid, the dialog backend
 chosen, the runtimes found, the triggers, the launches visible right now, the GPU containers
 detected right now (name, image, GPU memory) and the GPU totals. It is the first thing to run when
-something does not behave. `gpu-game-guard run`, the default, is what the service runs.
+something does not behave. `gpu-game-guard run`, the default, is what the service runs. `--config PATH`
+works before or after the subcommand. Logs go to stderr, which the journal captures; `config show`
+prints only JSON on stdout.
+
+Exit codes: 0 ok; 1 a failed check or an invalid config (`check`, `config` commands); 2 usage error;
+78 when `run` refuses to start on an invalid config (the service does not restart on 78); 130 on
+Ctrl-C.
 
 ## Configuration file
 
@@ -175,7 +212,8 @@ sudo apt install python3 zenity            # or kdialog on KDE
 ```
 
 Also needed, and normally already present on a desktop: Linux with systemd and a graphical session,
-and Steam (native or Flatpak). Without any dialog tool the guard still runs, but cannot ask.
+and Steam (native or Flatpak). Without any dialog tool the guard still runs, but cannot ask; launches
+are then left untouched unless a `stop` action applies (see "How a launch is handled").
 
 ## Install and uninstall
 
@@ -197,10 +235,14 @@ file is left in place.
   started from Battle.net) is not a separate Steam launch; the guard asks when the launcher itself
   starts.
 - It checks when a launch begins. A GPU container you start during a game is not stopped.
+- Launches are polled once a second, so a game that starts and shows its window within the first
+  second can be past the window stage when the launch is ended.
 - Ending a launch in its first second can interrupt the setup of a brand-new Proton prefix, which
   only matters the first time a game runs. Steam's "Verify integrity of game files" repairs it.
 - It judges container configuration, not activity, and cannot see GPU use by programs outside
-  containers.
+  containers. Privileged containers are not detected.
+- NVIDIA container memory comes from `nvidia-smi` compute processes only; graphics-only workloads
+  are not counted.
 - Wayland and desktops other than KDE are not tested.
 
 ## Troubleshooting
@@ -216,13 +258,20 @@ the log after you start a game means no GPU container was running at that moment
 container is covered by a rule or an ignore pattern.
 
 - **No dialog appears and the game just starts.** `check` shows the dialog backend chosen. If it
-  says none, install `zenity` or `kdialog`, or set `dialog` explicitly.
+  says none, or the notification backend without action support, the guard cannot ask and leaves
+  the launch untouched. Install `zenity` or `kdialog`, or set `dialog` explicitly.
 - **A container is not listed.** `check` shows what is detected right now; a container counts only
   when its configuration requests the GPU, and not when `ignore_containers` matches it.
-- **The dialog shows no GPU memory.** The vendor interface is not available to the service; `check`
-  shows the totals it can read.
-- **A config edit did nothing.** Run `gpu-game-guard config validate`. An invalid file is
-  ignored and the previous settings stay in force. After changing `runtimes`, `triggers` or
+- **The dialog says "GPU memory use unknown".** The figure could not be measured: the vendor
+  interface is not available to the service, or the container's workload is not a compute process
+  (NVIDIA). `check` shows the totals it can read.
+- **A media server (Plex, Jellyfin, Frigate) is listed.** It maps `/dev/dri` for video decoding and
+  is detected. Add it to `ignore_containers`.
+- **A config edit did nothing.** Run `gpu-game-guard config validate`. It reports problems and
+  unknown keys (a typo such as `on_lauch` gets a did-you-mean hint) and exits 1. An invalid file is
+  ignored by the running service and the previous settings stay in force; `gpu-game-guard run`
+  refuses to start on one (exit 78). A file with only unknown keys still loads and logs a warning
+  to stderr. After changing `runtimes`, `triggers` or
   `dialog`, restart the service: `systemctl --user restart gpu-game-guard`.
 
 ## Development

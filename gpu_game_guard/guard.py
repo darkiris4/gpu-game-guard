@@ -2,6 +2,7 @@
 start what was stopped once the game has closed."""
 from __future__ import annotations
 
+import math
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -27,9 +28,16 @@ class Guard:
         self.seen: Set[LaunchKey] = set()  # launches already looked at; those running at startup are left alone
         self.ended: Set[LaunchKey] = set()  # launches the guard ended; their processes may linger for a moment
         self.bypass: Dict[str, float] = {}  # game id -> time until which a launch is let through
+        self.baseline: Set[LaunchKey] = set()  # launches present when targets were last stopped
+        self.unasked: Set[str] = set()  # game ids already logged as impossible to ask about
+        self.pending_adoption: Set[str] = {t.name for t in self.triggers}  # triggers not yet scanned successfully
         self.last_active = self.clock()
         self.retry_at = 0.0
-        self.seen = {key for _launch, key in self._scan()}
+        self._scan()  # adopts the launches that are already running
+
+    @property
+    def _can_ask(self) -> bool:
+        return getattr(self.prompter, "can_ask", True) is not False
 
     def _scan(self) -> List[Tuple[Launch, LaunchKey]]:
         found = []
@@ -41,7 +49,12 @@ class Guard:
                 # keep what was known about this trigger so one failed scan does not make its launches look new
                 found.extend((None, key) for key in self.seen if key[0] == trigger.name)
                 continue
-            found.extend((launch, (trigger.name, launch.key)) for launch in launches)
+            pairs = [(launch, (trigger.name, launch.key)) for launch in launches]
+            if trigger.name in self.pending_adoption:
+                # the first successful scan of a trigger: whatever it returns was running before the guard looked
+                self.pending_adoption.discard(trigger.name)
+                self.seen.update(key for _launch, key in pairs)
+            found.extend(pairs)
         return found
 
     def _targets(self, config: Config) -> List[Target]:
@@ -60,29 +73,41 @@ class Guard:
         current = {key for _launch, key in scanned}
         self.seen &= current
         self.ended &= current
-        active = False
+        active: List[LaunchKey] = []
         for launch, key in scanned:
             if key in self.ended:
                 continue
             if launch is None:
-                active = True
+                active.append(key)
                 continue
             if key not in self.seen:
                 self.seen.add(key)
                 if self._should_intercept(launch, config, now):
                     targets = self._targets(config)
-                    if targets:
+                    if targets and self._askable(launch, config):
                         self.ended.add(key)
-                        self._intercept(launch, targets, config)
+                        self._intercept(launch, targets, config, current)
                         continue
-            active = True
+            active.append(key)
         if active:
             self.last_active = now
-            if self.state.stopped and not self.state.game_seen:
+            if self.state.stopped and not self.state.game_seen and any(key not in self.baseline for key in active):
                 self.state.game_seen = True
-                self.state.save()
+                try:
+                    self.state.save()
+                except Exception as exc:
+                    log(f"could not save the state: {exc!r}")
             return
         self._maybe_restart(now, config)
+
+    def _askable(self, launch: Launch, config: Config) -> bool:
+        """False, with one log line per game, when the launch calls for a question that cannot be shown."""
+        if config.action_for(launch.game_id) != "ask" or self._can_ask:
+            return True
+        if launch.game_id not in self.unasked:
+            self.unasked.add(launch.game_id)
+            log(f"cannot ask about {launch.game_id} ({launch.title}): no dialog is available; letting it start")
+        return False
 
     def _should_intercept(self, launch: Launch, config: Config, now: float) -> bool:
         if config.action_for(launch.game_id) == "ignore":
@@ -92,7 +117,7 @@ class Guard:
     def _trigger(self, name: str) -> Optional[Trigger]:
         return next((t for t in self.triggers if t.name == name), None)
 
-    def _intercept(self, launch: Launch, targets: List[Target], config: Config) -> None:
+    def _intercept(self, launch: Launch, targets: List[Target], config: Config, present: Set[LaunchKey]) -> None:
         names = ", ".join(t.name for t in targets)
         action = config.action_for(launch.game_id)
         log(f"launch of {launch.game_id} ({launch.title}) with GPU workloads running: {names}")
@@ -116,21 +141,47 @@ class Guard:
         if choice == "cancel":
             return
         if choice == "stop":
-            self._stop(targets)
+            stopped = self._stop(targets, present)
             if action == "stop":
-                self._notify("GPU Game Guard", f"Stopped {names} for {launch.title or launch.game_id}.")
+                if stopped:
+                    self._notify("GPU Game Guard", f"Stopped {', '.join(stopped)} for {launch.title or launch.game_id}.")
+                else:
+                    self._notify("GPU Game Guard", f"Could not stop {names} for {launch.title or launch.game_id}.")
         self.bypass[launch.game_id] = self.clock() + config.bypass_seconds
         try:
             if trigger is not None:
                 trigger.relaunch(launch)
         except Exception as exc:
             log(f"could not relaunch {launch.game_id}: {exc!r}")
+            self._notify("GPU Game Guard", f"Could not start {launch.title or launch.game_id} again.")
 
-    def _stop(self, targets: List[Target]) -> None:
+    def _stop(self, targets: List[Target], present: Set[LaunchKey]) -> List[str]:
+        """Stop the targets and record those that are no longer running; returns their names."""
         refs = [t.ref for t in targets]
         self._each_runtime(refs, "stop")
-        self.state.add(refs, self.wall())
-        self.state.save()
+        still = self._running_keys()
+        stopped = [ref for ref in refs if (ref["kind"], ref["runtime"], ref["name"]) not in still]
+        survivors = [ref["name"] for ref in refs if ref not in stopped]
+        if survivors:
+            log(f"still running after the stop: {', '.join(survivors)}")
+        if not stopped:
+            return []
+        self.baseline |= present
+        self.state.add(stopped, self.wall())
+        try:
+            self.state.save()
+        except Exception as exc:  # the stop already happened; the restart offer works from memory
+            log(f"could not save the state: {exc!r}")
+        return [ref["name"] for ref in stopped]
+
+    def _running_keys(self) -> Set[Tuple[str, str, str]]:
+        keys = set()
+        for runtime in self.runtimes:
+            try:
+                keys.update((t.kind, t.runtime, t.name) for t in runtime.running_gpu_targets())
+            except Exception as exc:
+                log(f"runtime {runtime.name} failed: {exc!r}")
+        return keys
 
     def _start(self, refs: List[Ref]) -> None:
         self._each_runtime(refs, "start")
@@ -164,9 +215,12 @@ class Guard:
             return
         refs = [dict(ref) for ref in self.state.stopped]
         names = ", ".join(ref["name"] for ref in refs)
-        if config.after_game == "leave":
+        after_game = config.after_game
+        if after_game == "ask" and not self._can_ask:
+            after_game = "restart"
+        if after_game == "leave":
             log(f"leaving stopped: {names}")
-        elif config.after_game == "restart":
+        elif after_game == "restart":
             log(f"restarting {names}")
             self._start(refs)
             self._notify("GPU Game Guard", f"Started {names} again.")
@@ -184,15 +238,31 @@ class Guard:
                 self._start(refs)
             else:
                 log("leaving containers stopped")
-        self.state.clear()
+        try:
+            self.state.clear()
+        except Exception as exc:  # the state clears itself in memory before it touches the disk
+            log(f"could not clear the state file: {exc!r}")
+        self.baseline.clear()
         self.last_active = self.clock()
+
+    def _poll_delay(self) -> float:
+        """The configured poll interval limited to a range `time.sleep` accepts and a sensible one."""
+        try:
+            seconds = float(self.watcher.current().poll_seconds)
+        except OverflowError:
+            return 3600.0
+        except Exception:
+            return 1.0
+        return min(max(seconds, 0.2), 3600.0) if math.isfinite(seconds) else 1.0
 
     def run(self) -> None:
         while True:
-            delay = 1.0
             try:
-                delay = self.watcher.current().poll_seconds
                 self.step()
             except Exception as exc:  # keep watching; a failed pass must not end the service
                 log(f"error: {exc!r}")
-            time.sleep(delay)
+            try:
+                time.sleep(self._poll_delay())
+            except Exception as exc:
+                log(f"error: {exc!r}")
+                time.sleep(1.0)

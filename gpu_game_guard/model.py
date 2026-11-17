@@ -17,7 +17,7 @@ class Target:
     runtime: str  # "docker" or "podman" for containers
     name: str  # what the runtime calls it
     image: str = ""
-    vram_mib: Optional[int] = None  # GPU memory its processes hold; None when unknown
+    vram_mib: Optional[int] = None  # GPU memory its processes hold; 0 when measured and none is held; None when it could not be measured
     ref_id: str = ""  # the runtime's full id, used to match processes to it; never stored
 
     @property
@@ -70,6 +70,7 @@ class Runtime(Protocol):
 
 class Prompter(Protocol):
     name: str
+    can_ask: bool  # False when the backend cannot present a choice; the guard then never ends a launch
 
     def available(self) -> bool:
         """True when this dialog backend can be used on this system."""

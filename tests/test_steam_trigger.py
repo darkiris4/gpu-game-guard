@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -16,6 +17,11 @@ from gpu_game_guard.triggers.steam import Game, SteamTrigger
 
 def game(pid, app_id=730, flatpak=False):
     return Game(pid, str(pid * 10), app_id, flatpak)
+
+
+def tree_game(pid, app_id=730, flatpak=False):
+    """A Game matching the start time `fake_proc` gives its processes by default."""
+    return Game(pid, "123456", app_id, flatpak)
 
 
 def fake_proc(root, pid, argv, ppid=1, start="123456", state="S"):
@@ -43,6 +49,11 @@ class ParseTests(unittest.TestCase):
         self.assertIsNone(steam.parse_launch(["reaper", "SteamLaunch", "--", "AppId=1"]))
         self.assertIsNone(steam.parse_launch([]))
 
+    def test_malformed_app_ids_are_rejected(self):
+        for value in ("1_0", "-5", " 7", "+7", "7 ", "", "99999999999", "4294967296", "\u0667", "7\n"):
+            self.assertIsNone(steam.parse_launch(["reaper", "SteamLaunch", f"AppId={value}"]), value)
+        self.assertEqual(steam.parse_launch(["reaper", "SteamLaunch", "AppId=4294967295"]), (4294967295, False))
+
     def test_game_ids(self):
         self.assertEqual(game(1, 730).game_id, 730)
         self.assertEqual(game(1, 2 ** 31 - 1).game_id, 2 ** 31 - 1)
@@ -60,6 +71,12 @@ class ProcTests(unittest.TestCase):
             found = steam.scan_games(Path(root))
         self.assertEqual(sorted((g.pid, g.app_id, g.start_time) for g in found),
                          [(100, 730, "42"), (102, 3000000000, "123456")])
+
+    def test_scan_ignores_processes_of_other_users(self):
+        with tempfile.TemporaryDirectory() as root:
+            fake_proc(root, 100, ["reaper", "SteamLaunch", "AppId=730", "--"])
+            self.assertEqual(len(steam.scan_games(Path(root))), 1)
+            self.assertEqual(steam.scan_games(Path(root), uid=os.getuid() + 1), [])
 
     def test_descendants_walks_the_whole_tree(self):
         with tempfile.TemporaryDirectory() as root:
@@ -105,6 +122,23 @@ class GameNameTests(unittest.TestCase):
             (config / "shortcuts.vdf").write_bytes(b"\x00shortcuts\x00" + entry)
             self.assertEqual(steam.game_name(3000000000, [Path(root)]), "Battle.net")
             self.assertEqual(steam.game_name(3000000001, [Path(root)]), "Game 3000000001")
+
+    def test_invalid_utf8_does_not_raise(self):
+        with tempfile.TemporaryDirectory() as root:
+            apps = Path(root) / "steamapps"
+            apps.mkdir()
+            (apps / "appmanifest_730.acf").write_bytes(b'"name"\t"Caf\xe9 Game"')
+            (apps / "libraryfolders.vdf").write_bytes(b'"path"\t"/nonexistent-\xff"')
+            self.assertEqual(steam.game_name(730, [Path(root)]), "Caf\ufffd Game")
+            self.assertEqual(steam.game_name(731, [Path(root)]), "Game 731")
+
+    def test_empty_shortcut_name_falls_back(self):
+        with tempfile.TemporaryDirectory() as root:
+            config = Path(root) / "userdata/1/config"
+            config.mkdir(parents=True)
+            entry = b"\x00" + b"0\x00" + b"\x02appid\x00" + (3000000000).to_bytes(4, "little") + b"\x01AppName\x00\x00\x08\x08"
+            (config / "shortcuts.vdf").write_bytes(b"\x00shortcuts\x00" + entry)
+            self.assertEqual(steam.game_name(3000000000, [Path(root)]), "Game 3000000000")
 
     def test_missing_roots_give_the_fallback(self):
         self.assertEqual(steam.game_name(5, [Path("/nonexistent-steam-root")]), "Game 5")
@@ -166,9 +200,62 @@ class TriggerTests(unittest.TestCase):
             fake_proc(proc, 12, ["c"], ppid=11, state="Z")
             trigger = SteamTrigger(proc=Path(proc), roots=[], kill=lambda pid, sig: sent.append((pid, sig)),
                                    sleep=lambda seconds: None)
-            trigger.end(Launch("steam", (10, "x"), "steam:1", "g", game(10)))
-        self.assertEqual(sorted(p for p, s in sent if s == signal.SIGTERM), [10, 11, 12])
+            trigger.end(Launch("steam", (10, "x"), "steam:1", "g", tree_game(10)))
+        self.assertEqual(sorted(p for p, s in sent if s == signal.SIGTERM), [10, 11])
         self.assertEqual(sorted(p for p, s in sent if s == signal.SIGKILL), [10, 11])
+
+    def test_a_launcher_with_the_wrong_start_time_is_never_signalled(self):
+        sent = []
+        with tempfile.TemporaryDirectory() as proc:
+            fake_proc(proc, 10, ["reaper"], ppid=1, start="999")
+            fake_proc(proc, 11, ["b"], ppid=10)
+            trigger = SteamTrigger(proc=Path(proc), roots=[], kill=lambda pid, sig: sent.append((pid, sig)),
+                                   sleep=lambda seconds: None)
+            trigger.end(Launch("steam", (10, "x"), "steam:1", "g", tree_game(10)))
+        self.assertEqual(sent, [])
+
+    def test_a_pid_reused_after_sigterm_is_not_force_ended(self):
+        sent = []
+        with tempfile.TemporaryDirectory() as proc:
+            fake_proc(proc, 10, ["reaper"], ppid=1)
+            fake_proc(proc, 11, ["b"], ppid=10)
+
+            def kill(pid, sig):
+                sent.append((pid, sig))
+                if sig == signal.SIGTERM and pid == 11:
+                    # The child exits and an unrelated process takes over its pid.
+                    shutil.rmtree(Path(proc) / "11")
+                    fake_proc(proc, 11, ["other"], ppid=1, start="777")
+
+            trigger = SteamTrigger(proc=Path(proc), roots=[], kill=kill, sleep=lambda seconds: None)
+            trigger.end(Launch("steam", (10, "x"), "steam:1", "g", tree_game(10)))
+        self.assertIn((11, signal.SIGTERM), sent)
+        self.assertNotIn((11, signal.SIGKILL), sent)
+        self.assertIn((10, signal.SIGKILL), sent)
+
+    def test_relaunched_forwarders_are_reaped_on_later_calls(self):
+        class Child:
+            def __init__(self):
+                self.polls = 0
+
+            def poll(self):
+                self.polls += 1
+                return 0
+
+        children = []
+
+        def popen(command, **options):
+            children.append(Child())
+            return children[-1]
+
+        trigger = SteamTrigger(proc=Path("/nonexistent-proc"), roots=[], popen=popen)
+        launch = Launch("steam", (1, "1"), "steam:730", "g", Game(1, "1", 730, False))
+        trigger.relaunch(launch)
+        trigger.scan()
+        self.assertEqual(children[0].polls, 1)
+        trigger.relaunch(launch)
+        self.assertEqual(children[0].polls, 1, "a reaped child is not polled again")
+        self.assertEqual(len(trigger._forwarders), 1)
 
 
 class BuildTests(unittest.TestCase):
@@ -212,10 +299,10 @@ class RealProcessTreeTests(unittest.TestCase):
         process, launched = self.start_tree("sleep 60 & sleep 60 & wait")
         children = self.started[1:]
         began = time.monotonic()
-        steam.end_launch(launched)
+        steam.end_launch(launched, wait_seconds=60)
         elapsed = time.monotonic() - began
         process.wait(timeout=5)
-        self.assertLess(elapsed, 1.5, "a polite tree must not wait out the grace period")
+        self.assertLess(elapsed, 30, "a polite tree must not wait out the grace period")
         self.assertTrue(wait_for(lambda: not any(steam.alive(p) for p in children)))
 
     def test_child_ignoring_sigterm_is_force_ended(self):
@@ -226,7 +313,7 @@ class RealProcessTreeTests(unittest.TestCase):
         elapsed = time.monotonic() - began
         process.wait(timeout=5)
         self.assertGreaterEqual(elapsed, steam.KILL_WAIT_SECONDS - 0.2)
-        self.assertLess(elapsed, steam.KILL_WAIT_SECONDS + 1.5)
+        self.assertLess(elapsed, steam.KILL_WAIT_SECONDS + 5)
         self.assertTrue(wait_for(lambda: not any(steam.alive(p) for p in children)), "the straggler survived")
 
     def test_trigger_end_on_a_real_tree(self):

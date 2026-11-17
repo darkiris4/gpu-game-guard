@@ -16,7 +16,7 @@ def fake_smi(**outputs):
     """A runner answering nvidia-smi by the query flag it was given; a missing key behaves like a failure."""
     calls = []
 
-    def run(args, timeout=None):
+    def run(args, timeout=None, keep_output=False):
         calls.append(list(args))
         assert args[0] == "nvidia-smi" and args[-1] == "--format=csv,noheader,nounits"
         return outputs.get(args[1].split("=")[1].split(",")[0])
@@ -63,6 +63,34 @@ class RunCommandTests(unittest.TestCase):
             self.assertEqual(gpu.run_command(["sh", "-c", "exit 0"]), "")
             gpu.run_command(["sh", "-c", "exit 4"])
             self.assertEqual(log.call_count, 2, "sh failed, sh recovered then failed again: two lines")
+
+    def test_subcommand_failures_are_tracked_separately(self):
+        with mock.patch("gpu_game_guard.util.log") as log:
+            gpu.run_command(["ls", "/no/such/path-xyz"])
+            gpu.run_command(["ls", "/"])  # the same command with another second argument succeeding
+            gpu.run_command(["ls", "/no/such/path-xyz"])
+            self.assertEqual(log.call_count, 1)
+
+    def test_failure_keys_are_bounded(self):
+        with mock.patch("gpu_game_guard.util.log"):
+            for number in range(gpu._MAX_FAILURE_KEYS * 3):
+                gpu._report_failure(f"cmd{number} sub", "failed")
+        self.assertLessEqual(len(gpu._last_failure), gpu._MAX_FAILURE_KEYS)
+
+    def test_keep_output_on_failure(self):
+        script = "echo partial; echo broken >&2; exit 1"
+        with mock.patch("gpu_game_guard.util.log") as log:
+            self.assertIsNone(gpu.run_command(["sh", "-c", script]))
+            self.assertEqual(gpu.run_command(["sh", "-c", script], keep_output=True), "partial\n")
+            self.assertIsNone(gpu.run_command(["sh", "-c", "echo broken >&2; exit 1"], keep_output=True))
+        self.assertEqual(log.call_count, 1, "the same failure is logged once")
+
+    def test_embedded_nul_and_undecodable_output(self):
+        with mock.patch("gpu_game_guard.util.log") as log:
+            self.assertIsNone(gpu.run_command(["echo", "a\x00b"]))
+            out = gpu.run_command(["sh", "-c", "printf '\\377ok'"])
+        self.assertEqual(log.call_count, 1)
+        self.assertTrue(out.endswith("ok"))
 
     def test_missing_binary(self):
         with mock.patch("gpu_game_guard.util.log") as log:
@@ -115,6 +143,10 @@ class TotalsTests(unittest.TestCase):
         run = fake_smi(**{"memory.used": "[N/A], [N/A]\n"})
         self.assertIsNone(gpu.totals(run, self.drm))
 
+    def test_bad_rows_are_skipped_whole(self):
+        run = fake_smi(**{"memory.used": "100, [N/A]\ninf, 8\n7, inf\nnan, 5\n500, 1000\n"})
+        self.assertEqual(gpu.totals(run, self.drm), (500, 1000))
+
     def test_nothing_known(self):
         self.assertIsNone(gpu.totals(fake_smi(), self.drm / "missing"))
 
@@ -145,6 +177,15 @@ class VramTests(unittest.TestCase):
         run = fake_smi(pid="100, 1000\n101, 524\n102, 300\n103, 77\n999, 5\nabc, [N/A]\n104, [N/A]\n")
         self.assertEqual(gpu.vram_by_container(self.proc, run), {CONTAINER: 1524, OTHER: 300})
 
+    def test_nvidia_without_compute_apps_is_measured_and_skips_fdinfo(self):
+        self.process(200, DOCKER_CGROUP, ["drm-driver:\tamdgpu\ndrm-client-id:\t1\ndrm-memory-vram:\t5 MiB\n"])
+        self.assertEqual(gpu.vram_by_container(self.proc, fake_smi(pid="")), {})
+
+    def test_nvidia_infinite_memory_row_is_skipped(self):
+        self.process(100, DOCKER_CGROUP)
+        run = fake_smi(pid="100, inf\n100, 10\n")
+        self.assertEqual(gpu.vram_by_container(self.proc, run), {CONTAINER: 10})
+
     def test_fdinfo_amd(self):
         client = "pos:\t0\ndrm-driver:\tamdgpu\ndrm-client-id:\t{id}\ndrm-memory-vram:\t{kib} KiB\ndrm-memory-gtt:\t999 KiB\n"
         self.process(200, DOCKER_CGROUP, [
@@ -155,6 +196,23 @@ class VramTests(unittest.TestCase):
         ])
         self.process(201, DOCKER_CGROUP, [client.format(id=7, kib=1024 * 50)])  # same id, other process
         self.assertEqual(gpu.vram_by_container(self.proc, fake_smi()), {CONTAINER: 512 + 100 + 50})
+
+    def test_fdinfo_clients_are_keyed_by_device(self):
+        client = "drm-driver:\tamdgpu\ndrm-pdev:\t{pdev}\ndrm-client-id:\t7\ndrm-memory-vram:\t{mib} MiB\n"
+        self.process(210, DOCKER_CGROUP, [
+            client.format(pdev="0000:03:00.0", mib=100),
+            client.format(pdev="0000:03:00.0", mib=100),  # the same client again
+            client.format(pdev="0000:04:00.0", mib=40),  # same id on another device
+        ])
+        self.assertEqual(gpu.vram_by_container(self.proc, fake_smi()), {CONTAINER: 140})
+
+    def test_fdinfo_intel_local_memory(self):
+        self.process(310, DOCKER_CGROUP, ["drm-driver:\ti915\ndrm-client-id:\t3\ndrm-total-local0:\t256 MiB\n"])
+        self.assertEqual(gpu.vram_by_container(self.proc, fake_smi()), {CONTAINER: 256})
+
+    def test_fdinfo_without_drm_files_is_not_measured(self):
+        self.process(320, DOCKER_CGROUP, ["pos:\t0\nflags:\t02\n"])
+        self.assertIsNone(gpu.vram_by_container(self.proc, fake_smi()))
 
     def test_fdinfo_intel_mib_units(self):
         self.process(300, f"0::/user.slice/libpod-{OTHER}.scope/container\n", [
@@ -175,11 +233,12 @@ class VramTests(unittest.TestCase):
         self.assertEqual(gpu.vram_by_container(self.proc, fake_smi()), {})
 
     def test_missing_proc_root(self):
-        self.assertEqual(gpu.vram_by_container(self.proc / "nope", fake_smi()), {})
+        self.assertIsNone(gpu.vram_by_container(self.proc / "nope", fake_smi()))
 
     def test_everything_missing_never_raises(self):
         with mock.patch("gpu_game_guard.util.log"):
-            self.assertEqual(gpu.vram_by_container(self.proc), {})
+            result = gpu.vram_by_container(self.proc / "nope")
+        self.assertTrue(result is None or isinstance(result, dict))
 
 
 if __name__ == "__main__":

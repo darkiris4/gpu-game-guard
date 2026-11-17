@@ -6,7 +6,8 @@
 #   scripts/test-matrix-docker.sh              all versions
 #   scripts/test-matrix-docker.sh 3.9 3.12     only the listed versions
 #
-# Exit status: 0 when every image that could be pulled passed, 1 when any failed.
+# Exit status: 0 when at least one image was tested and every tested image passed; 1 when any failed or
+# when every image was skipped (nothing was tested).
 set -uo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -35,4 +36,8 @@ for version in "${versions[@]}"; do
 done
 
 echo "passed: $passed, failed: $failed, skipped: $skipped"
+if [ "$passed" -eq 0 ] && [ "$failed" -eq 0 ]; then
+  echo "nothing was tested: every image was skipped" >&2
+  exit 1
+fi
 [ "$failed" -eq 0 ]

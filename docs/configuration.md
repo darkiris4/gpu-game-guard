@@ -10,18 +10,27 @@ $XDG_CONFIG_HOME/gpu-game-guard/config.json        (usually ~/.config/gpu-game-g
 ```
 
 `gpu-game-guard config path` prints the exact path in use, and `--config PATH` selects another file
-for one invocation. A missing file means all defaults.
+for one invocation; it works before or after the subcommand. A missing file means all defaults.
 
 | Command | Effect |
 | --- | --- |
 | `gpu-game-guard config path` | print the path |
 | `gpu-game-guard config init` | write the defaults to the path; refuses to overwrite an existing file |
-| `gpu-game-guard config show` | print the effective configuration as JSON |
-| `gpu-game-guard config validate` | report problems; exit status 1 when the file is invalid |
+| `gpu-game-guard config show` | print the effective configuration as JSON (only JSON on stdout) |
+| `gpu-game-guard config validate` | report problems and unknown keys; exit status 1 when any are found |
 | `gpu-game-guard check` | diagnose the whole setup, including whether the config file is valid |
 
-Unknown keys are ignored with a warning in the log. A wrong type or a value outside the allowed set
-makes the file invalid.
+`config validate` reports unknown keys (typos such as `on_lauch`) with a did-you-mean hint and exits
+1. Loading a file with unknown keys still works: they are ignored and a warning is logged to
+stderr. A wrong type, a value outside the allowed set or a number outside its range makes the file
+invalid.
+
+Logs go to stderr, which the systemd journal captures. Exit codes: 0 ok; 1 a failed check or an
+invalid config for `check` and `config` commands; 2 usage error; 78 when `run` refuses to start on an
+invalid config (the service does not restart on 78); 130 on Ctrl-C.
+
+Config and state files are written atomically and keep the file's existing permissions (0644 for a
+new file).
 
 ## Keys
 
@@ -29,12 +38,12 @@ makes the file invalid.
 | --- | --- | --- | --- |
 | `on_launch` | string | `"ask"` | What to do when a game launches while GPU containers run: `ask`, `stop` or `ignore`. |
 | `after_game` | string | `"ask"` | What to do once the game has closed: `ask`, `restart` or `leave`. |
-| `poll_seconds` | number | `1.0` | Interval between checks for new launches. |
-| `exit_grace_seconds` | number | `8.0` | How long the game must be absent before it counts as closed. Steam's launcher processes briefly disappear between stages of a launch and an exit. |
-| `no_game_timeout_seconds` | number | `180.0` | Containers were stopped but the relaunched game never appeared: after this long, the after-game action runs anyway. |
-| `bypass_seconds` | number | `120.0` | After the guard relaunches a game, that game is let through for this long so the relaunch is not intercepted again. |
-| `dialog_retry_seconds` | number | `300.0` | When the restart question could not be shown, wait this long before asking again. |
-| `heavy_vram_mib` | integer | `4096` | GPU memory (MiB) held by the containers together at which the dialog's warning changes from tentative to heavy. |
+| `poll_seconds` | number | `1.0` | Interval between checks for new launches. Range 0.2 to 3600. |
+| `exit_grace_seconds` | number | `8.0` | How long the game must be absent before it counts as closed. Steam's launcher processes briefly disappear between stages of a launch and an exit. Range 2 to 3600. |
+| `no_game_timeout_seconds` | number | `180.0` | Containers were stopped but the relaunched game never appeared: after this long, the after-game action runs anyway. Range 30 to 86400. |
+| `bypass_seconds` | number | `120.0` | After the guard relaunches a game, that game is let through for this long so the relaunch is not intercepted again. Range 5 to 3600. |
+| `dialog_retry_seconds` | number | `300.0` | When the restart question could not be shown, wait this long before asking again. Range 30 to 86400. |
+| `heavy_vram_mib` | integer | `4096` | GPU memory (MiB) held by the containers together at which the dialog's warning changes from tentative to heavy. Range 0 to 10000000. |
 | `ignore_containers` | list of strings | `[]` | Glob patterns on container names. Matching containers are never counted, stopped or restarted. |
 | `runtimes` | list of strings | `["docker", "podman"]` | Container runtimes to use, in order of preference. A runtime whose command is missing is skipped. |
 | `triggers` | list of strings | `["steam"]` | Launch detectors to enable. Only `steam` exists. |
@@ -44,16 +53,21 @@ makes the file invalid.
 ### on_launch
 
 - `ask`: end the launch, show the dialog, act on the answer (**Stop containers and launch**,
-  **Launch anyway**, **Cancel**).
+  **Launch anyway**, **Cancel**). Closing the dialog window counts as **Launch anyway**. When the
+  dialog backend cannot ask (no dialog tool found, or the notification backend without action
+  support), the launch is not ended at all: the game starts untouched, nothing is stopped, and the
+  log says so once per game.
 - `stop`: end the launch, stop the GPU containers without asking, start the game again, and show a
-  notification naming what was stopped.
+  notification naming what was stopped. This works with or without a dialog tool.
 - `ignore`: do nothing at all. The launch is not interrupted and no dialog appears.
 
 ### after_game
 
-- `ask`: show a dialog offering to start the containers that were stopped. **Leave stopped** forgets
-  them. If no dialog can be shown, the question is retried after `dialog_retry_seconds` and the
-  list of stopped containers is kept.
+- `ask`: show a dialog offering to start the containers that were stopped, with **Restart**,
+  **Ask me later** and **Leave stopped**. **Leave stopped** forgets them. **Ask me later**, closing
+  the window, or a dialog backend that fails retries after `dialog_retry_seconds` with the list of
+  stopped containers kept. When no way to ask exists (no dialog tool, or the notification backend
+  without action support), the containers the guard stopped are started again with a notification.
 - `restart`: start them without asking, and show a notification.
 - `leave`: forget them without asking. They stay stopped.
 
@@ -76,11 +90,11 @@ crash or a reboot.
 | `name` | string | `""` | A label for people reading the file. Informational only; dialogs take the game's name from Steam. |
 | `action` | string | `"ask"` | `ask`, `stop` or `ignore`, with the same meanings as `on_launch`. |
 
-A game with a rule uses the rule's `action`. A game without one uses `on_launch`. Rules only
+A game with a rule uses the rule's `action`. A game without a rule uses `on_launch`. Rules only
 change what happens at launch; `after_game` applies to every game.
 
-Because a rule's default action is `ask`, a rule written as `{"name": "Some Game"}` makes that game
-ask even when `on_launch` is `stop` or `ignore`.
+A rule with no `action` uses `ask`; it does not inherit `on_launch`. A rule written as
+`{"name": "Some Game"}` therefore makes that game ask even when `on_launch` is `stop` or `ignore`.
 
 ### Finding a game id
 
@@ -105,8 +119,15 @@ Each entry is a shell-style glob (`fnmatch`) matched against the container name:
 | `db-?` | `db-1`, `db-a` |
 
 Ignored containers are not counted when deciding whether to intercept a launch, are not shown in the
-dialog, and are never stopped or restarted. A launch where every GPU container is ignored is not
-intercepted.
+dialog, and are never stopped. A launch where every GPU container is ignored is not intercepted.
+Containers already recorded in the state file as stopped by the guard are still started again later,
+even if an ignore pattern matching them was added since.
+
+Containers that map `/dev/dri` only for video decoding (Plex, Jellyfin, Frigate) are detected as GPU
+containers; list them here to leave them alone. Detection covers `/dev/nvidia*`, `/dev/kfd`, the
+`/dev/dri` directory device and anything under it, a `gpu` device capability, CDI GPU names, and the
+`nvidia` runtime unless the container sets `NVIDIA_VISIBLE_DEVICES` to `void` or `none`. Privileged
+containers are not detected.
 
 ## How changes are picked up
 
@@ -116,8 +137,10 @@ is needed for the values the watcher uses on each pass (timings, `on_launch`, `a
 (`runtimes`, `triggers`, `dialog`) are safest applied with
 `systemctl --user restart gpu-game-guard`.
 
-If the file becomes unreadable or invalid, the service keeps the last good configuration and logs
-the problem once. Run `gpu-game-guard config validate` after editing to see what is wrong.
+Changes are detected by the file's modification time, size and inode. If the file becomes
+unreadable or invalid, or briefly disappears during an editor's save, the service keeps the
+previous settings and logs the problem once. `gpu-game-guard run` itself refuses to start on an
+invalid config (exit 78). Run `gpu-game-guard config validate` after editing to see what is wrong.
 
 ## Examples
 
@@ -167,8 +190,10 @@ Use `kdialog` even where the desktop is not detected as KDE:
 }
 ```
 
-Use `none` to never show a dialog. With no dialog, games start untouched and nothing is asked;
-combine it with per-game `stop` rules for fully unattended behaviour.
+Use `none` to never show a dialog. With no dialog the guard cannot ask: for action `ask` the game
+starts untouched and nothing is stopped, and with `after_game` `ask` the containers it stopped are
+started again. Explicit `stop` actions (per game or `on_launch`) still stop containers and start the
+game with a notification, so combine `none` with `stop` rules for fully unattended behaviour.
 
 ### Everything together
 

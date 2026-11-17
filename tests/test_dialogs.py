@@ -45,15 +45,32 @@ def which_of(*present):
     return lambda cmd: f"/usr/bin/{cmd}" if cmd in present else None
 
 
+BAD = "a\x00b\x01c\x08d\x0be\x0cf\x0eg\x1fh\x7fi\ud800j&<>"
+CONTROLS = "".join(chr(c) for c in list(range(0, 9)) + [11, 12] + list(range(14, 32)) + [127])
+
+
+def argument_of(command, flag):
+    return command[command.index(flag) + 1]
+
+
+def assert_clean(case, text):
+    case.assertNotIn("\x00", text)
+    text.encode("utf-8")  # raises on a lone surrogate
+    for char in CONTROLS:
+        case.assertNotIn(char, text)
+
+
 class FormatTests(unittest.TestCase):
-    def test_format_mib(self):
-        self.assertEqual(dialogs.format_mib(512), "512 MB")
-        self.assertEqual(dialogs.format_mib(1536), "1.5 GB")
+    def test_format_mib_uses_binary_units(self):
+        self.assertEqual(dialogs.format_mib(512), "512 MiB")
+        self.assertEqual(dialogs.format_mib(1023), "1023 MiB")
+        self.assertEqual(dialogs.format_mib(1536), "1.5 GiB")
+        self.assertEqual(dialogs.format_mib(16311), "15.9 GiB")
 
 
 class MessageTests(unittest.TestCase):
     def setUp(self):
-        self.targets = [target("a&b<c>", "img&<x>", 1536), target("whisper", "w", None)]
+        self.targets = [target("a&b<c>", "img&<x>", 1536), target("whisper", "w", 0)]
 
     def test_escaping_in_every_markup(self):
         for markup in ("html", "pango"):
@@ -70,15 +87,49 @@ class MessageTests(unittest.TestCase):
         self.assertIn("Half-Life <2>", plain)
         self.assertNotIn("<b>", plain)
 
+    def test_control_characters_and_surrogates_are_replaced(self):
+        hostile = [target(BAD, BAD, 100)]
+        for markup in ("html", "pango", "plain"):
+            message = dialogs.launch_message(launch(BAD), hostile, None, markup)
+            assert_clean(self, message)
+            restart = dialogs.restart_message([BAD], markup)
+            assert_clean(self, restart)
+            if markup != "plain":
+                well_formed(message)
+                well_formed(restart)
+        self.assertIn("a b c d e f g h i j", dialogs.launch_message(launch(BAD), hostile, None, "plain"))
+
+    def test_every_control_character_alone(self):
+        for char in CONTROLS + "\ud800\udfff":
+            for markup in ("html", "pango"):
+                well_formed(dialogs.launch_message(launch(f"x{char}y"), [target(f"n{char}", f"i{char}", 1)], None,
+                                                   markup))
+
     def test_content(self):
         for markup in ("html", "pango", "plain"):
             message = dialogs.launch_message(launch("Game"), self.targets, (5120, 16311), markup)
             self.assertIn("GPU Game Guard", message)
-            self.assertIn("1.5 GB of GPU memory", message)
+            self.assertIn("1.5 GiB of GPU memory", message)
             self.assertIn("no GPU memory in use right now", message)
-            self.assertIn("by all programs: 5.0 GB of 15.9 GB", message)
+            self.assertIn("by all programs: 5.0 GiB of 15.9 GiB", message)
             self.assertNotIn("by all programs", dialogs.launch_message(launch("g"), [], None, markup))
-            self.assertNotIn("severely bottlenecked", message)
+            self.assertNotIn("idle", message)
+            self.assertNotIn("GB", message.replace("GiB", ""))
+
+    def test_unmeasured_and_zero_are_reported_differently(self):
+        unknown = dialogs.launch_message(launch(), [target("u", "", None)], None, "plain")
+        zero = dialogs.launch_message(launch(), [target("z", "", 0)], None, "plain")
+        self.assertIn("GPU memory use unknown", unknown)
+        self.assertNotIn("no GPU memory in use", unknown)
+        self.assertIn("no GPU memory in use right now", zero)
+        self.assertNotIn("unknown", zero)
+
+    def test_restart_message_is_neutral(self):
+        for markup in ("html", "pango", "plain"):
+            message = dialogs.restart_message(["a"], markup)
+            self.assertIn("GPU Game Guard", message)
+            self.assertIn("stopped these containers earlier. Restart them?", message)
+            self.assertNotIn("closed", message)
 
     def test_pango_has_no_list_markup_and_uses_bullets(self):
         message = dialogs.launch_message(launch(), self.targets, None, "pango")
@@ -93,17 +144,60 @@ class MessageTests(unittest.TestCase):
         self.assertIn("<ul>", message)
         self.assertEqual(message.count("<li>"), 2)
 
-    def test_impact_grades(self):
-        idle = dialogs.impact_sentence([target(vram=None), target(vram=0)], "plain")
-        some = dialogs.impact_sentence([target(vram=1100)], "plain")
-        heavy = dialogs.impact_sentence([target(vram=3000), target(vram=1500)], "html")
-        self.assertIn("idle", idle)
-        self.assertIn("modest", some)
-        self.assertIn("<b>4.4 GB</b>", heavy)
+    def test_impact_none_measured(self):
+        for targets in ([target(vram=None)], [target(vram=None), target("b", vram=None)]):
+            sentence = dialogs.impact_sentence(targets, "plain")
+            self.assertEqual(sentence, "GPU memory use could not be measured, so the impact on the game is unknown.")
+
+    def test_impact_some_unmeasured(self):
+        modest = dialogs.impact_sentence([target(vram=1100), target("b", vram=None)], "plain")
+        self.assertIn("at least 1.1 GiB held by the ones that could be measured; the rest could not be measured.",
+                      modest)
+        self.assertNotIn("run out of memory", modest)
+        heavy = dialogs.impact_sentence([target(vram=5000), target("b", vram=None)], "html")
+        self.assertIn("at least <b>4.9 GiB</b> held by the ones that could be measured", heavy)
         self.assertIn("run out of memory", heavy)
-        self.assertNotIn("<b>", dialogs.impact_sentence([target(vram=5000)], "plain"))
-        for sentence in (idle, some, heavy):
+        none_held = dialogs.impact_sentence([target(vram=0), target("b", vram=None)], "plain")
+        self.assertIn("the rest could not be measured", none_held)
+        self.assertNotIn("not holding", none_held)
+        self.assertNotIn("should be small", none_held)
+
+    def test_impact_heavy(self):
+        several = dialogs.impact_sentence([target(vram=3000), target("b", vram=1500)], "html")
+        self.assertIn("Together they hold <b>4.4 GiB</b> of GPU memory and compete for GPU time", several)
+        self.assertIn("could stutter, load slowly or run out of memory", several)
+        single = dialogs.impact_sentence([target(vram=5000)], "plain")
+        self.assertIn("It holds 4.9 GiB of GPU memory and competes for GPU time", single)
+        self.assertNotIn("Together", single)
+        self.assertNotIn("<b>", single)
+
+    def test_impact_modest(self):
+        several = dialogs.impact_sentence([target(vram=1000), target("b", vram=100)], "plain")
+        self.assertIn("Together they hold 1.1 GiB of GPU memory", several)
+        self.assertIn("modest", several)
+        single = dialogs.impact_sentence([target(vram=1100)], "plain")
+        self.assertIn("It holds 1.1 GiB", single)
+        self.assertIn("modest", single)
+        self.assertNotIn("Together", single)
+
+    def test_impact_none_held(self):
+        sentence = dialogs.impact_sentence([target(vram=0), target("b", vram=0)], "plain")
+        self.assertEqual(sentence, "They are not holding any GPU memory right now, so the impact on the game should "
+                                   "be small, though they can claim the GPU as soon as they get work.")
+        self.assertIn("It is not holding", dialogs.impact_sentence([target(vram=0)], "plain"))
+
+    def test_impact_never_says_idle_or_bottleneck(self):
+        cases = ([target(vram=None)], [target(vram=0)], [target(vram=10)], [target(vram=9000)],
+                 [target(vram=9000), target("b", vram=None)], [target(vram=0), target("b", vram=None)])
+        for targets in cases:
+            sentence = dialogs.impact_sentence(targets, "plain")
+            self.assertNotIn("idle", sentence)
             self.assertNotIn("bottleneck", sentence)
+
+    def test_empty_targets_have_no_impact(self):
+        self.assertEqual(dialogs.impact_sentence([], "plain"), "")
+        for markup in ("html", "pango", "plain"):
+            dialogs.launch_message(launch(), [], None, markup)
 
     def test_heavy_threshold_is_overridable(self):
         with mock.patch.object(dialogs, "HEAVY_VRAM_MIB", 1000):
@@ -118,47 +212,85 @@ class ZenityTests(unittest.TestCase):
         with patched(run):
             return dialogs.ZenityPrompter().launch(launch(), [target("a&b<c>")], None), run
 
-    def test_exit_code_mapping(self):
+    def test_launch_exit_code_mapping(self):
         self.assertEqual(self.ask(done(0))[0], "stop")
+        self.assertEqual(self.ask(done(1, "Cancel\n"))[0], "cancel")
+        self.assertEqual(self.ask(done(1, ""))[0], "anyway")
         self.assertEqual(self.ask(done(1, "Launch anyway\n"))[0], "anyway")
-        self.assertEqual(self.ask(done(1, ""))[0], "cancel")
-        self.assertEqual(self.ask(done(1, "something else\n"))[0], "cancel")
-        self.assertEqual(self.ask(done(5))[0], "cancel")
-        self.assertEqual(self.ask(done(-15))[0], "cancel")
+        self.assertEqual(self.ask(done(1, "something else\n"))[0], "anyway")
+        for code in (5, 255, -1, -15):
+            self.assertEqual(self.ask(done(code))[0], "anyway")
+            self.assertEqual(self.ask(done(code, "Cancel\n"))[0], "anyway")
+        self.assertEqual(self.ask(done(1, None))[0], "anyway")
 
-    def test_command_line(self):
+    def test_restart_exit_code_mapping(self):
+        cases = ((done(0), True), (done(1, "Leave stopped\n"), False), (done(1, ""), None),
+                 (done(1, "x\n"), None), (done(1, None), None), (done(5), None), (done(255), None),
+                 (done(-15), None), (done(5, "Leave stopped\n"), None))
+        for result, expected in cases:
+            with patched(FakeRun(result)):
+                self.assertEqual(dialogs.ZenityPrompter().restart([{"name": "a&b"}]), expected)
+
+    def test_launch_command_line(self):
         command = self.ask(done(0))[1].calls[0]
         self.assertEqual(command[:2], ["zenity", "--question"])
         for flag, value in (("--title", "GPU Game Guard"), ("--ok-label", "Stop containers and launch"),
-                            ("--cancel-label", "Cancel"), ("--extra-button", "Launch anyway")):
-            self.assertEqual(command[command.index(flag) + 1], value)
-        text = command[command.index("--text") + 1]
+                            ("--cancel-label", "Launch anyway"), ("--extra-button", "Cancel")):
+            self.assertEqual(argument_of(command, flag), value)
+        text = argument_of(command, "--text")
         well_formed(text)
         self.assertIn("a&amp;b&lt;c&gt;", text)
 
-    def test_restart(self):
-        for result, expected in ((done(0), True), (done(1), False), (done(1, ""), False), (done(5), None)):
-            run = FakeRun(result)
-            with patched(run):
-                self.assertEqual(dialogs.ZenityPrompter().restart([{"name": "a&b"}]), expected)
+    def test_restart_command_line(self):
+        run = FakeRun(done(0))
+        with patched(run):
+            dialogs.ZenityPrompter().restart([{"name": "a&b"}])
         command = run.calls[0]
-        self.assertEqual(command[command.index("--ok-label") + 1], "Restart")
-        self.assertEqual(command[command.index("--cancel-label") + 1], "Leave stopped")
-        well_formed(command[command.index("--text") + 1])
+        self.assertEqual(argument_of(command, "--ok-label"), "Restart")
+        self.assertEqual(argument_of(command, "--cancel-label"), "Ask me later")
+        self.assertEqual(argument_of(command, "--extra-button"), "Leave stopped")
+        text = argument_of(command, "--text")
+        well_formed(text)
+        self.assertIn("stopped these containers earlier", text)
+
+    def test_hostile_text_never_reaches_the_command_line(self):
+        run = FakeRun(done(0))
+        with patched(run):
+            p = dialogs.ZenityPrompter()
+            p.launch(launch(BAD), [target(BAD, BAD, 1)], None)
+            p.restart([{"name": BAD}])
+        for command in run.calls:
+            for argument in command:
+                assert_clean(self, argument)
+            well_formed(argument_of(command, "--text"))
+
+    def test_empty_restart_shows_nothing(self):
+        run = FakeRun(done(0))
+        with patched(run):
+            self.assertIsNone(dialogs.ZenityPrompter().restart([]))
+            self.assertIsNone(dialogs.ZenityPrompter().restart([{"name": ""}, {}]))
+        self.assertEqual(run.calls, [])
 
     def test_blocking_questions_have_no_timeout(self):
         self.assertEqual(self.ask(done(0))[1].timeouts, [None])
 
-    def test_oserror_fails_safe(self):
-        with patched(FakeRun(error=FileNotFoundError("zenity"))):
-            p = dialogs.ZenityPrompter()
-            self.assertEqual(p.launch(launch(), [target()], None), "anyway")
-            self.assertIsNone(p.restart([{"name": "a"}]))
+    def test_failures_fail_safe(self):
+        errors = (FileNotFoundError("zenity"), OSError("gone"), ValueError("embedded null byte"),
+                  subprocess.TimeoutExpired("zenity", 1), subprocess.SubprocessError("x"))
+        for error in errors:
+            with patched(FakeRun(error=error)):
+                p = dialogs.ZenityPrompter()
+                self.assertEqual(p.launch(launch(), [target()], None), "anyway")
+                self.assertIsNone(p.restart([{"name": "a"}]))
+
+    def test_can_ask(self):
+        self.assertTrue(dialogs.ZenityPrompter().can_ask)
 
 
 class KdialogTests(unittest.TestCase):
     def test_launch_mapping(self):
-        for code, expected in ((0, "stop"), (1, "anyway"), (2, "cancel"), (-9, "cancel")):
+        for code, expected in ((0, "stop"), (1, "anyway"), (2, "cancel"), (3, "anyway"), (255, "anyway"),
+                               (-9, "anyway"), (-15, "anyway")):
             with patched(FakeRun(done(code))):
                 self.assertEqual(dialogs.KdialogPrompter().launch(launch(), [target()], None), expected)
 
@@ -168,28 +300,68 @@ class KdialogTests(unittest.TestCase):
             dialogs.KdialogPrompter().launch(launch(), [target("a&b<c>")], None)
         command = run.calls[0]
         self.assertIn("--yesnocancel", command)
-        self.assertEqual(command[command.index("--yes-label") + 1], "Stop containers and launch")
-        self.assertEqual(command[command.index("--no-label") + 1], "Launch anyway")
-        self.assertEqual(command[command.index("--cancel-label") + 1], "Cancel")
+        self.assertEqual(argument_of(command, "--yes-label"), "Stop containers and launch")
+        self.assertEqual(argument_of(command, "--no-label"), "Launch anyway")
+        self.assertEqual(argument_of(command, "--cancel-label"), "Cancel")
         self.assertIn("a&amp;b&lt;c&gt;", command[-1])
         well_formed(command[-1])
 
     def test_restart_mapping(self):
-        for code, expected in ((0, True), (1, False), (2, None)):
+        for code, expected in ((0, True), (1, None), (2, False), (3, None), (255, None), (-9, None), (-15, None)):
             with patched(FakeRun(done(code))):
                 self.assertEqual(dialogs.KdialogPrompter().restart([{"name": "a"}]), expected)
 
-    def test_oserror_fails_safe(self):
-        with patched(FakeRun(error=OSError("gone"))):
-            p = dialogs.KdialogPrompter()
-            self.assertEqual(p.launch(launch(), [target()], None), "anyway")
-            self.assertIsNone(p.restart([{"name": "a"}]))
-
-    def test_notify_uses_passivepopup(self):
+    def test_restart_command(self):
         run = FakeRun()
         with patched(run):
-            dialogs.KdialogPrompter().notify("t", "b")
+            dialogs.KdialogPrompter().restart([{"name": "a&b"}])
+        command = run.calls[0]
+        self.assertIn("--yesnocancel", command)
+        self.assertEqual(argument_of(command, "--yes-label"), "Restart")
+        self.assertEqual(argument_of(command, "--no-label"), "Ask me later")
+        self.assertEqual(argument_of(command, "--cancel-label"), "Leave stopped")
+        self.assertIn("a&amp;b", command[-1])
+        well_formed(command[-1])
+
+    def test_hostile_text_never_reaches_the_command_line(self):
+        run = FakeRun()
+        with patched(run):
+            p = dialogs.KdialogPrompter()
+            p.launch(launch(BAD), [target(BAD, BAD, 1)], None)
+            p.restart([{"name": BAD}])
+            p.notify(BAD, BAD)
+        self.assertEqual(len(run.calls), 3)
+        for command in run.calls:
+            for argument in command:
+                assert_clean(self, argument)
+        well_formed(run.calls[0][-1])
+        well_formed(run.calls[1][-1])
+        well_formed(argument_of(run.calls[2], "--passivepopup"))
+
+    def test_empty_restart_shows_nothing(self):
+        run = FakeRun()
+        with patched(run):
+            self.assertIsNone(dialogs.KdialogPrompter().restart([]))
+        self.assertEqual(run.calls, [])
+
+    def test_failures_fail_safe(self):
+        errors = (OSError("gone"), ValueError("embedded null byte"), subprocess.TimeoutExpired("kdialog", 1))
+        for error in errors:
+            with patched(FakeRun(error=error)):
+                p = dialogs.KdialogPrompter()
+                self.assertEqual(p.launch(launch(), [target()], None), "anyway")
+                self.assertIsNone(p.restart([{"name": "a"}]))
+                p.notify("t", "b")
+
+    def test_notify_uses_passivepopup_with_escaped_body(self):
+        run = FakeRun()
+        with patched(run):
+            dialogs.KdialogPrompter().notify("t", "a&b <c>")
         self.assertIn("--passivepopup", run.calls[0])
+        self.assertEqual(argument_of(run.calls[0], "--passivepopup"), "a&amp;b &lt;c&gt;")
+
+    def test_can_ask(self):
+        self.assertTrue(dialogs.KdialogPrompter().can_ask)
 
 
 class NotifyTests(unittest.TestCase):
@@ -205,29 +377,86 @@ class NotifyTests(unittest.TestCase):
     def test_without_actions_it_only_informs(self):
         p, run = self.prompter("Usage: notify-send [OPTION...]")
         with patched(run):
+            self.assertFalse(p.can_ask)
             self.assertEqual(p.launch(launch(), [target()], None), "anyway")
             self.assertIsNone(p.restart([{"name": "a"}]))
         self.assertFalse(any("--wait" in c for c in run.calls))
 
+    def test_can_ask_follows_action_support_and_is_cached(self):
+        p, run = self.prompter("  -A, --action=[NAME=]Text...")
+        with patched(run):
+            self.assertTrue(p.can_ask)
+            self.assertTrue(p.can_ask)
+        self.assertEqual(sum("--help" in c for c in run.calls), 1)
+        with patched(FakeRun(error=OSError("gone"))):
+            self.assertFalse(dialogs.NotifyPrompter(which_of("notify-send")).can_ask)
+
     def test_with_actions_the_choice_is_returned(self):
-        for answer, expected in (("stop\n", "stop"), ("anyway\n", "anyway"), ("cancel\n", "cancel"), ("", "anyway")):
+        for answer, expected in (("stop\n", "stop"), ("anyway\n", "anyway"), ("cancel\n", "cancel"), ("", "anyway"),
+                                 ("bogus\n", "anyway")):
             p, run = self.prompter("  -A, --action=[NAME=]Text...", answer)
             with patched(run):
                 self.assertEqual(p.launch(launch(), [target()], None), expected)
             ask = run.calls[-1]
             self.assertIn("--wait", ask)
             self.assertIn("--action=stop=Stop containers and launch", ask)
-        for answer, expected in (("restart\n", True), ("leave\n", False), ("", None)):
+        for answer, expected in (("restart\n", True), ("leave\n", False), ("", None), ("bogus\n", None)):
             p, run = self.prompter("--action", answer)
             with patched(run):
                 self.assertEqual(p.restart([{"name": "a"}]), expected)
 
-    def test_oserror_fails_safe(self):
-        with patched(FakeRun(error=OSError("gone"))):
-            p = dialogs.NotifyPrompter(which_of("notify-send"))
+    def test_restart_offers_the_neutral_wording(self):
+        p, run = self.prompter("--action", "restart\n")
+        with patched(run):
+            p.restart([{"name": "a"}])
+        self.assertIn("stopped these containers earlier. Restart them?", run.calls[-1][-1])
+
+    def test_notification_text_is_escaped_and_clean(self):
+        p, run = self.prompter("--action", "stop\n")
+        with patched(run):
+            p.launch(launch(BAD), [target(BAD, BAD, 1)], None)
+            p.restart([{"name": BAD}])
+            p.notify(BAD, BAD)
+        self.assertEqual(len(run.calls), 4)
+        for command in run.calls[1:]:
+            for argument in command:
+                assert_clean(self, argument)
+            well_formed(command[-1])
+            well_formed(command[-2])
+            self.assertIn("&amp;&lt;&gt;", command[-1])
+
+    def test_launch_body_names_with_markup_characters_are_escaped(self):
+        p, run = self.prompter("--action", "stop\n")
+        with patched(run):
+            p.launch(launch(), [target("a&b<c>")], None)
+        body = run.calls[-1][-1]
+        well_formed(body)
+        self.assertIn("a&amp;b&lt;c&gt;", body)
+        self.assertIn("Half-Life &lt;2&gt;", body)
+
+    def test_empty_restart_shows_nothing(self):
+        p, run = self.prompter("--action", "restart\n")
+        with patched(run):
+            self.assertIsNone(p.restart([]))
+        self.assertFalse(any("--wait" in c for c in run.calls))
+
+    def test_failures_fail_safe(self):
+        for error in (OSError("gone"), ValueError("embedded null byte"), subprocess.TimeoutExpired("notify-send", 1)):
+            with patched(FakeRun(error=error)):
+                p = dialogs.NotifyPrompter(which_of("notify-send"))
+                self.assertEqual(p.launch(launch(), [target()], None), "anyway")
+                self.assertIsNone(p.restart([{"name": "a"}]))
+                p.notify("t", "b")
+
+    def test_failure_after_support_check_fails_safe(self):
+        def run(command, **kwargs):
+            if "--help" in command:
+                return done(0, "--action")
+            raise subprocess.TimeoutExpired("notify-send", 1)
+        p = dialogs.NotifyPrompter(which_of("notify-send"))
+        with patched(run):
             self.assertEqual(p.launch(launch(), [target()], None), "anyway")
             self.assertIsNone(p.restart([{"name": "a"}]))
-            p.notify("t", "b")
 
     def test_support_check_is_cached(self):
         p, run = self.prompter("--action")
@@ -237,15 +466,39 @@ class NotifyTests(unittest.TestCase):
         self.assertEqual(sum("--help" in c for c in run.calls), 1)
 
 
+class BaseNotifyTests(unittest.TestCase):
+    def test_zenity_notification_is_escaped_and_clean(self):
+        run = FakeRun()
+        with patched(run):
+            dialogs.ZenityPrompter(which_of("notify-send")).notify(BAD, BAD)
+        command = run.calls[0]
+        self.assertEqual(command[0], "notify-send")
+        for argument in command:
+            assert_clean(self, argument)
+        well_formed(command[-1])
+        well_formed(command[-2])
+        self.assertEqual(command[-1], "a b c d e f g h i j&amp;&lt;&gt;")
+
+    def test_without_notify_send_only_logs(self):
+        run = FakeRun()
+        with patched(run), mock.patch("gpu_game_guard.dialogs.log") as log:
+            dialogs.ZenityPrompter(which_of()).notify("t", "b")
+        self.assertEqual(run.calls, [])
+        log.assert_called()
+
+
 class NullTests(unittest.TestCase):
     def test_behaviour(self):
         p = dialogs.NullPrompter()
         self.assertTrue(p.available())
+        self.assertFalse(p.can_ask)
         self.assertEqual(p.launch(launch(), [target()], None), "anyway")
         self.assertIsNone(p.restart([{"name": "a"}]))
         with mock.patch("gpu_game_guard.dialogs.log") as log:
-            p.notify("t", "b")
+            p.notify("t\x00", "b\ud800")
         log.assert_called()
+        for argument in log.call_args[0]:
+            assert_clean(self, argument)
 
 
 class ChooseTests(unittest.TestCase):

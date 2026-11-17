@@ -29,7 +29,7 @@ make_path() {
   done
 }
 fake_tool() { printf '#!/bin/sh\nexit 0\n' > "$1/$2"; chmod +x "$1/$2"; }
-tools="python3 mktemp rm install cat head grep sed dirname cp find mkdir chmod tar curl env bash sh"
+tools="sleep touch python3 mktemp rm mv install cat head grep sed dirname cp find mkdir chmod tar curl env bash sh"
 
 run_installer() {  # run_installer PATH_DIR HOME_DIR args...
   local path_dir="$1" home="$2"; shift 2
@@ -99,7 +99,7 @@ case_install_cycle() {
   [ -x "$home/bin/gpu-game-guard" ] && pass "program installed and executable" || fail "program installed and executable"
   "$home/bin/gpu-game-guard" --version >/dev/null 2>&1 && pass "installed program runs --version" || fail "installed program runs --version"
   local unit="$home/config/systemd/user/gpu-game-guard.service"
-  grep -qxF "ExecStart=$home/bin/gpu-game-guard run" "$unit" 2>/dev/null \
+  grep -qxF "ExecStart=\"$home/bin/gpu-game-guard\" run" "$unit" 2>/dev/null \
     && pass "unit runs '<bin>/gpu-game-guard run'" || fail "unit runs '<bin>/gpu-game-guard run'" "$(cat "$unit" 2>/dev/null)"
 
   # Re-install over a unit that is a symlink to a file that must stay untouched.
@@ -133,10 +133,110 @@ case_install_cycle() {
   fi
   out="$(run_installer "$work/path-docker" "$home" --uninstall --purge 2>&1)"; status=$?
   [ "$status" -eq 0 ] && [ ! -e "$home/state/gpu-game-guard" ] && pass "uninstall --purge drops the state" || fail "uninstall --purge drops the state" "$out"
+  mkdir -p "$home/config/gpu-game-guard"; echo '{}' > "$home/config/gpu-game-guard/config.json"
+  out="$(run_installer "$work/path-docker" "$home" --uninstall --purge 2>&1)"
+  if [ -e "$home/config/gpu-game-guard/config.json" ] && grep -q "kept $home/config/gpu-game-guard/config.json" <<<"$out"; then
+    pass "uninstall --purge keeps and reports config.json"
+  else
+    fail "uninstall --purge keeps and reports config.json" "$out"
+  fi
+}
+
+# A bin dir holding a space, a percent sign and a dollar sign must come out as one valid, escaped ExecStart.
+case_unit_quoting() {
+  if [ ! -f "$src/gpu_game_guard/cli.py" ]; then
+    skip "unit ExecStart is quoted and escaped"
+    return
+  fi
+  local home="$work/quoting"; mkdir -p "$home"
+  make_path "$work/path-quote" $tools
+  fake_tool "$work/path-quote" docker
+  local bindir="$home/my bin %h \$X"
+  local out status
+  out="$(env -i PATH="$work/path-quote" HOME="$home" XDG_CONFIG_HOME="$home/config" XDG_STATE_HOME="$home/state" \
+      GPU_GAME_GUARD_SRC="$src" GPU_GAME_GUARD_BIN_DIR="$bindir" \
+      "$(command -v bash)" "$repo/install.sh" --no-systemd 2>&1)"; status=$?
+  local unit="$home/config/systemd/user/gpu-game-guard.service"
+  local expected="ExecStart=\"$home/my bin %%h \$\$X/gpu-game-guard\" run"
+  if [ "$status" -eq 0 ] && grep -qxF "$expected" "$unit" 2>/dev/null; then
+    pass "unit ExecStart is quoted and escaped for spaces, %, \$ and quotes"
+  else
+    fail "unit ExecStart is quoted and escaped for spaces, %, \$ and quotes" "status=$status" "want: $expected" "$(grep ExecStart "$unit" 2>/dev/null)" "$out"
+  fi
+  # systemd rejects quotes and backslashes in a program path, so the installer refuses them up front.
+  out="$(env -i PATH="$work/path-quote" HOME="$home" XDG_CONFIG_HOME="$home/config" GPU_GAME_GUARD_SRC="$src" \
+      GPU_GAME_GUARD_BIN_DIR="$home/bad\"dir" "$(command -v bash)" "$repo/install.sh" --no-systemd 2>&1)"; status=$?
+  if [ "$status" -ne 0 ] && grep -q 'must not contain' <<<"$out" && [ ! -e "$home/bad\"dir" ]; then
+    pass "a bin dir with a quote is refused before anything is written"
+  else
+    fail "a bin dir with a quote is refused before anything is written" "status=$status" "$out"
+  fi
+  grep -q '^RestartPreventExitStatus=78$' "$unit" 2>/dev/null && pass "generated unit prevents restarts on exit status 78" \
+    || fail "generated unit prevents restarts on exit status 78"
+  if command -v systemd-analyze >/dev/null; then
+    # Verified on a copy inside the temporary directory; the real systemd directories are not involved.
+    local copy="$work/verify"; mkdir -p "$copy"; cp "$unit" "$copy/gpu-game-guard.service"
+    local verdict; verdict="$(systemd-analyze --user verify "$copy/gpu-game-guard.service" 2>&1)"
+    if grep -qiE 'special characters|invalid|fatal|bad unit' <<<"$verdict"; then
+      fail "systemd-analyze accepts the generated unit" "$verdict"
+    else
+      pass "systemd-analyze accepts the generated unit"
+    fi
+  else
+    skip "systemd-analyze verify (systemd-analyze not installed)"
+  fi
+}
+
+case_help_and_noexec() {
+  local out status
+  out="$(bash -s -- --help < "$repo/install.sh" 2>&1)"; status=$?
+  [ "$status" -eq 0 ] && grep -q 'install.sh --uninstall' <<<"$out" \
+    && pass "install.sh --help works when read from stdin" || fail "install.sh --help works when read from stdin" "status=$status" "$out"
+  out="$(bash "$repo/scripts/build-zipapp.sh" --help 2>&1)"; status=$?
+  if [ "$status" -eq 0 ] && grep -q 'OUTPUT_PATH' <<<"$out" && ! grep -q 'set -euo' <<<"$out"; then
+    pass "build-zipapp.sh --help prints only the usage"
+  else
+    fail "build-zipapp.sh --help prints only the usage" "status=$status" "$out"
+  fi
+  [ -f "$src/gpu_game_guard/cli.py" ] || return 0
+  local a="$work/repro/a" b="$work/repro/b"
+  if bash "$repo/scripts/build-zipapp.sh" "$a" && sleep 2 && bash "$repo/scripts/build-zipapp.sh" "$b" && cmp -s "$a" "$b"; then
+    pass "two builds of the same tree are byte-identical"
+  else
+    fail "two builds of the same tree are byte-identical"
+  fi
+}
+
+# With a stand-in systemctl whose service never becomes active, the previous program and unit come back.
+case_rollback() {
+  if [ ! -f "$src/gpu_game_guard/cli.py" ]; then
+    skip "a service that fails to start restores the previous program"
+    return
+  fi
+  local home="$work/rollback"; mkdir -p "$home/bin" "$home/config/systemd/user"
+  make_path "$work/path-rb" $tools sleep
+  fake_tool "$work/path-rb" docker
+  printf '#!/bin/sh\ncase "$*" in *is-active*) exit 3 ;; esac\nexit 0\n' > "$work/path-rb/systemctl"; chmod +x "$work/path-rb/systemctl"
+  printf '#!/bin/sh\necho previous\n' > "$home/bin/gpu-game-guard"; chmod +x "$home/bin/gpu-game-guard"
+  echo "previous unit" > "$home/config/systemd/user/gpu-game-guard.service"
+  local out status
+  out="$(env -i PATH="$work/path-rb" HOME="$home" XDG_CONFIG_HOME="$home/config" XDG_STATE_HOME="$home/state" \
+      GPU_GAME_GUARD_SRC="$src" GPU_GAME_GUARD_BIN_DIR="$home/bin" "$(command -v bash)" "$repo/install.sh" 2>&1)"; status=$?
+  if [ "$status" -ne 0 ] && grep -q 'previous version was restored' <<<"$out" \
+     && [ "$("$home/bin/gpu-game-guard")" = previous ] \
+     && [ "$(cat "$home/config/systemd/user/gpu-game-guard.service")" = "previous unit" ] \
+     && [ -z "$(find "$home/bin" "$home/config/systemd/user" -name '.*' -type f)" ]; then
+    pass "a service that fails to start restores the previous program and unit"
+  else
+    fail "a service that fails to start restores the previous program and unit" "status=$status" "$out"
+  fi
 }
 
 case_missing_runtime
+case_rollback
 case_missing_python
+case_unit_quoting
+case_help_and_noexec
 case_bad_option
 case_build_script
 case_install_cycle

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import contextlib
 import io
+import math
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from gpu_game_guard.config import GameRule
 from gpu_game_guard.guard import Guard
@@ -18,14 +20,14 @@ def ref(name, runtime="docker"):
 
 
 class Env:
-    def __init__(self, running=("ollama",), launch="stop", restart=True, config=None, podman=None):
+    def __init__(self, running=("ollama",), launch="stop", restart=True, config=None, podman=None, can_ask=True):
         self.tmp = tempfile.TemporaryDirectory()
         self.now = 1000.0
         self.trigger = FakeTrigger()
         self.docker = FakeRuntime("docker", running)
         self.podman = FakeRuntime("podman", podman or ())
         self.runtimes = [self.docker] + ([self.podman] if podman is not None else [])
-        self.prompter = FakePrompter(launch, restart)
+        self.prompter = FakePrompter(launch, restart, can_ask)
         self.watcher = FakeWatcher(config)
         self.state = State(Path(self.tmp.name) / "state.json")
         self.guard = self.make_guard()
@@ -41,7 +43,7 @@ class Env:
     def advance(self, seconds):
         self.now += seconds
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        with contextlib.redirect_stderr(out):
             self.guard.step()
         return out.getvalue()
 
@@ -467,7 +469,6 @@ class RuntimeTests(GuardCase):
 
 class RunTests(GuardCase):
     def test_run_survives_errors_and_sleeps_the_poll_interval(self):
-        from unittest import mock
         env = self.env()
         env.config.poll_seconds = 0.25
         calls = []
@@ -482,11 +483,228 @@ class RunTests(GuardCase):
         env.guard.step = step
         sleeps = []
         with mock.patch("gpu_game_guard.guard.time.sleep", side_effect=sleeps.append):
-            with contextlib.redirect_stdout(io.StringIO()):
+            with contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(KeyboardInterrupt):
                     env.guard.run()
         self.assertEqual(len(calls), 3)
         self.assertEqual(sleeps, [0.25, 0.25])
+
+    def test_run_clamps_the_delay_and_survives_a_failing_sleep(self):
+        env = self.env()
+        env.guard.step = lambda: None
+        for configured, expected in ((10 ** 400, 3600.0), (0.0, 0.2), (math.nan, 1.0), (1e300, 3600.0)):
+            env.config.poll_seconds = configured
+            sleeps = []
+
+            def sleep(seconds):
+                sleeps.append(seconds)
+                if len(sleeps) == 1:
+                    raise OverflowError("too large")
+                raise KeyboardInterrupt
+
+            with mock.patch("gpu_game_guard.guard.time.sleep", side_effect=sleep):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(KeyboardInterrupt):
+                        env.guard.run()
+            self.assertEqual(sleeps, [expected, 1.0], configured)
+
+
+class StateFailureTests(GuardCase):
+    def test_a_failing_save_still_relaunches_and_keeps_the_state_in_memory(self):
+        env = self.env()
+        launch = make_launch(10)
+        env.trigger.launches = [launch]
+        with mock.patch.object(State, "save", side_effect=OSError("read-only")):
+            out = env.advance(1)
+        self.assertIn("could not save the state", out)
+        self.assertEqual(env.docker.stopped, ["ollama"])
+        self.assertEqual(env.state.stopped, [ref("ollama")])
+        self.assertEqual(env.trigger.relaunched, [launch])
+        self.assertTrue(env.guard.bypass)
+
+    def test_a_failing_save_with_the_stop_action_still_notifies(self):
+        env = self.env()
+        env.config.on_launch = "stop"
+        env.trigger.launches = [make_launch(10)]
+        with mock.patch.object(State, "save", side_effect=OSError("full")):
+            env.advance(1)
+        self.assertEqual(len(env.trigger.relaunched), 1)
+        self.assertEqual(len(env.prompter.notifications), 1)
+
+    def test_a_failing_clear_after_the_restart_is_logged_and_forgotten(self):
+        env = self.env(running=())
+        env.state.add([ref("a")], env.now - 3600)
+        with mock.patch.object(State, "save", side_effect=OSError("read-only")):
+            out = env.advance(1)
+        self.assertIn("could not clear", out)
+        self.assertEqual(env.docker.started, ["a"])
+        self.assertEqual(env.state.stopped, [])
+        env.advance(1)
+        self.assertEqual(env.prompter.restart_asked, [["a"]], "the restart is not offered again")
+
+    def test_a_failing_save_of_game_seen_is_logged(self):
+        env = self.env()
+        env.trigger.launches = [make_launch(10)]
+        env.advance(1)
+        env.trigger.launches = [make_launch(11)]
+        with mock.patch.object(State, "save", side_effect=OSError("full")):
+            out = env.advance(1)
+        self.assertIn("could not save", out)
+        self.assertTrue(env.state.game_seen)
+
+
+class AdoptionTests(GuardCase):
+    def test_a_first_scan_that_fails_at_construction_still_adopts_running_games(self):
+        env = self.env()
+        env.trigger.launches = [make_launch(10)]
+        env.trigger.fail_scan = True
+        env.guard = env.make_guard()
+        env.advance(1)
+        env.trigger.fail_scan = False
+        env.advance(1)
+        self.assertEqual((env.prompter.launch_asked, env.trigger.ended), ([], []))
+        env.trigger.launches = [make_launch(10), make_launch(11, 440)]
+        env.advance(1)
+        self.assertEqual(env.prompter.launch_asked, [["ollama"]])
+
+    def test_each_trigger_is_adopted_separately(self):
+        env = self.env()
+        other = FakeTrigger("other")
+        other.launches = [make_launch(20, 5, trigger="other")]
+        other.fail_scan = True
+        env.guard = Guard(env.watcher, [env.trigger, other], env.runtimes, env.prompter, env.state,
+                          clock=lambda: env.now, wall=lambda: env.now)
+        other.fail_scan = False
+        env.advance(1)
+        self.assertEqual(env.prompter.launch_asked, [])
+
+
+class GameSeenTests(GuardCase):
+    def test_another_running_launch_does_not_count_as_the_relaunched_game(self):
+        env = self.env()
+        env.trigger.launches = [make_launch(5, 999)]
+        env.guard = env.make_guard()  # an adopted launch is already running
+        env.trigger.launches = [make_launch(5, 999), make_launch(10)]
+        env.advance(1)
+        self.assertEqual(env.state.stopped, [ref("ollama")])
+        self.assertFalse(env.state.game_seen)
+        env.trigger.launches = [make_launch(5, 999)]
+        env.advance(1)
+        self.assertFalse(env.state.game_seen)
+        env.trigger.launches = [make_launch(5, 999), make_launch(11)]
+        env.advance(1)
+        self.assertTrue(env.state.game_seen)
+
+    def test_an_ignored_launch_present_at_the_stop_does_not_count(self):
+        env = self.env()
+        env.config.games["steam:440"] = GameRule("TF2", "ignore")
+        env.trigger.launches = [make_launch(6, 440)]
+        env.advance(1)
+        env.trigger.launches = [make_launch(6, 440), make_launch(10)]
+        env.advance(1)
+        self.assertFalse(env.state.game_seen)
+
+
+class StopVerificationTests(GuardCase):
+    def test_only_containers_that_stopped_are_recorded(self):
+        env = self.env(running=("a", "b"))
+        env.docker.refuse_stop = ["b"]
+        env.trigger.launches = [make_launch(10)]
+        out = env.advance(1)
+        self.assertEqual(env.state.stopped, [ref("a")])
+        self.assertIn("still running", out)
+        self.assertEqual(len(env.trigger.relaunched), 1)
+
+    def test_nothing_recorded_when_nothing_stopped(self):
+        env = self.env(running=("a",))
+        env.docker.refuse_stop = ["a"]
+        env.config.on_launch = "stop"
+        env.trigger.launches = [make_launch(10)]
+        env.advance(1)
+        self.assertEqual(env.state.stopped, [])
+        self.assertFalse(env.state.path.exists())
+        self.assertIn("Could not stop", env.prompter.notifications[0][1])
+
+
+class HandlerTests(GuardCase):
+    def test_end_raising_still_asks_and_relaunches(self):
+        env = self.env()
+        env.trigger.end = lambda launch: 1 / 0
+        env.trigger.launches = [make_launch(10)]
+        out = env.advance(1)
+        self.assertIn("could not end", out)
+        self.assertEqual(env.docker.stopped, ["ollama"])
+        self.assertEqual(len(env.trigger.relaunched), 1)
+
+    def test_relaunch_raising_notifies_the_user(self):
+        env = self.env()
+        env.trigger.relaunch = lambda launch: 1 / 0
+        env.trigger.launches = [make_launch(10, title="Portal")]
+        out = env.advance(1)
+        self.assertIn("could not relaunch", out)
+        self.assertEqual(len(env.prompter.notifications), 1)
+        self.assertEqual(env.prompter.notifications[0][1], "Could not start Portal again.")
+
+    def test_start_raising_is_logged_and_the_state_cleared(self):
+        env = self.env(running=())
+        env.docker.start = lambda refs: 1 / 0
+        env.state.add([ref("a")], env.now - 3600)
+        out = env.advance(1)
+        self.assertIn("start through docker failed", out)
+        self.assertEqual(env.state.stopped, [])
+
+    def test_notify_raising_is_logged_and_does_not_stop_the_flow(self):
+        env = self.env()
+        env.config.on_launch = "stop"
+        env.prompter.notify = lambda title, body: 1 / 0
+        env.trigger.launches = [make_launch(10)]
+        out = env.advance(1)
+        self.assertIn("notification failed", out)
+        self.assertEqual(len(env.trigger.relaunched), 1)
+        self.assertEqual(env.state.stopped, [ref("ollama")])
+
+
+class CanAskTests(GuardCase):
+    def test_ask_without_a_dialog_leaves_the_launch_alone_and_logs_once(self):
+        env = self.env(can_ask=False)
+        env.trigger.launches = [make_launch(10)]
+        out = env.advance(1)
+        self.assertIn("cannot ask", out)
+        self.assertEqual((env.trigger.ended, env.trigger.relaunched, env.prompter.launch_asked), ([], [], []))
+        self.assertEqual((env.docker.stopped, env.state.stopped), ([], []))
+        env.trigger.launches = [make_launch(10), make_launch(11)]
+        self.assertNotIn("cannot ask", env.advance(1))
+        env.trigger.launches = [make_launch(10), make_launch(11), make_launch(12, 440)]
+        self.assertIn("steam:440", env.advance(1))
+
+    def test_the_stop_action_works_without_a_dialog(self):
+        env = self.env(can_ask=False)
+        env.config.on_launch = "stop"
+        env.trigger.launches = [make_launch(10)]
+        env.advance(1)
+        self.assertEqual(env.docker.stopped, ["ollama"])
+        self.assertEqual(len(env.trigger.relaunched), 1)
+
+    def test_a_per_game_stop_rule_works_without_a_dialog(self):
+        env = self.env(can_ask=False)
+        env.config.games["steam:730"] = GameRule("CS", "stop")
+        env.trigger.launches = [make_launch(10)]
+        env.advance(1)
+        self.assertEqual(env.docker.stopped, ["ollama"])
+
+    def test_after_game_ask_without_a_dialog_restarts(self):
+        env = self.env(can_ask=False)
+        env.config.on_launch = "stop"
+        env.trigger.launches = [make_launch(10)]
+        env.advance(1)
+        env.trigger.launches = [make_launch(11)]
+        env.advance(1)
+        env.trigger.launches = []
+        env.advance(env.config.exit_grace_seconds + 1)
+        self.assertEqual(env.prompter.restart_asked, [])
+        self.assertEqual(env.docker.started, ["ollama"])
+        self.assertEqual(env.state.stopped, [])
+        self.assertEqual(len(env.prompter.notifications), 2)
 
 
 if __name__ == "__main__":
