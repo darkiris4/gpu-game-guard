@@ -1,18 +1,29 @@
 """Configuration: the on-disk JSON file, its validation and a watcher that picks up edits."""
 from __future__ import annotations
 
+import contextlib
 import copy
+import dataclasses
 import difflib
 import fnmatch
+import glob
 import json
 import math
 import os
 import re
+import shutil
+import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from .util import atomic_write_json, log, xdg_config_home
+
+try:
+    import fcntl
+except ImportError:  # not available on every platform
+    fcntl = None  # type: ignore[assignment]
 
 GAME_ACTIONS = ("ask", "stop", "ignore")
 ON_LAUNCH = ("ask", "stop", "ignore")  # what to do when a launch meets GPU workloads
@@ -48,6 +59,11 @@ _KIND_TARGET_KEYS = {
     "process": ("match", "restart"),
 }
 _TIMEOUT_RANGE = (1, 600)
+_UNIT_NAME = re.compile(r"[A-Za-z0-9:_.@\-]+\.service")
+MATCH_LENGTH = (3, 15)  # the kernel truncates a process name to 15 characters
+MATCH_MIN_LITERALS = 3  # characters of a process pattern that are not glob characters
+_LOCK_WAIT_SECONDS = 5.0
+_BROKEN_KEPT = 5  # copies of unusable config files that are kept
 DEFAULT_RUNTIMES = ("docker", "podman", "service", "command", "process")
 
 
@@ -67,6 +83,7 @@ class ConfigError(ValueError):
 class GameRule:
     name: str = ""  # display name, informational
     action: str = "ask"  # one of GAME_ACTIONS
+    extra: Dict[str, Any] = field(default_factory=dict)  # keys this version does not know, written back unchanged
 
 
 @dataclass
@@ -86,9 +103,11 @@ class TargetSpec:
     timeout_seconds: float = 60.0  # command: limit for each of the argv lists
     match: str = ""  # process: fnmatch glob on the process's comm name
     restart: bool = True  # process: start the same command line again after the game
+    extra: Dict[str, Any] = field(default_factory=dict)  # keys this version does not know, written back unchanged
 
     def to_json(self) -> dict:
-        data: Dict[str, Any] = {"id": self.id, "kind": self.kind, "label": self.label or self.id, "enabled": self.enabled}
+        data: Dict[str, Any] = copy.deepcopy(self.extra)
+        data.update({"id": self.id, "kind": self.kind, "label": self.label or self.id, "enabled": self.enabled})
         if self.kind == "service":
             data.update(unit=self.unit, scope=self.scope)
         elif self.kind == "command":
@@ -112,6 +131,8 @@ class TargetSpec:
             spec.timeout_seconds = float(data.get("timeout_seconds", 60))
         else:
             spec.match, spec.restart = data["match"], data.get("restart", True)
+        allowed = _COMMON_TARGET_KEYS + _KIND_TARGET_KEYS[spec.kind]
+        spec.extra = {k: copy.deepcopy(v) for k, v in data.items() if k not in allowed}
         return spec
 
 
@@ -135,6 +156,7 @@ class Config:
     remember_choices: bool = True  # whether the dialog offers to remember a choice for a game
     protect: List[str] = field(default_factory=list)  # fnmatch globs on a process or unit name, never stopped
     targets: List[TargetSpec] = field(default_factory=list)  # configured host targets
+    extra: Dict[str, Any] = field(default_factory=dict)  # top-level keys this version does not know, written back unchanged
 
     def action_for(self, game_id: str) -> str:
         """The per-game rule when one exists, otherwise `on_launch`."""
@@ -175,11 +197,13 @@ class Config:
             raise ValueError(f"action must be one of {', '.join(GAME_ACTIONS)}; got {action!r}")
         updated = copy.deepcopy(self)
         previous = updated.games.get(game_id)
-        updated.games[game_id] = GameRule(name=name or (previous.name if previous else ""), action=action)
+        updated.games[game_id] = GameRule(name=name or (previous.name if previous else ""), action=action,
+                                          extra=copy.deepcopy(previous.extra) if previous else {})
         return updated
 
     def to_json(self) -> dict:
-        return {
+        data: Dict[str, Any] = copy.deepcopy(self.extra)
+        data.update({
             "enabled": self.enabled,
             "auto_containers": self.auto_containers,
             "remember_choices": self.remember_choices,
@@ -197,8 +221,10 @@ class Config:
             "runtimes": list(self.runtimes),
             "triggers": list(self.triggers),
             "dialog": self.dialog,
-            "games": {gid: {"name": rule.name, "action": rule.action} for gid, rule in self.games.items()},
-        }
+            "games": {gid: {**copy.deepcopy(rule.extra), "name": rule.name, "action": rule.action}
+                      for gid, rule in self.games.items()},
+        })
+        return data
 
     @classmethod
     def from_json(cls, data: dict) -> "Config":
@@ -212,7 +238,7 @@ class Config:
             allowed = _COMMON_TARGET_KEYS + _KIND_TARGET_KEYS[entry["kind"]]
             unknown.extend(f"targets[{index}].{k}" for k in entry if k not in allowed)
         if unknown:
-            log(f"config: ignoring unknown keys: {', '.join(unknown)}")
+            log(f"config: keeping keys this version does not know, unchanged: {', '.join(unknown)}")
         config = cls()
         for key, (kind, _low, _high) in _NUMBERS.items():
             if key in data:
@@ -227,8 +253,10 @@ class Config:
             if key in data:
                 setattr(config, key, data[key])
         for gid, rule in data.get("games", {}).items():
-            config.games[gid] = GameRule(name=rule.get("name", ""), action=rule.get("action", "ask"))
+            config.games[gid] = GameRule(name=rule.get("name", ""), action=rule.get("action", "ask"),
+                                         extra={k: copy.deepcopy(v) for k, v in rule.items() if k not in _RULE_KEYS})
         config.targets = [TargetSpec.from_json(entry) for entry in data.get("targets", [])]
+        config.extra = {k: copy.deepcopy(v) for k, v in data.items() if k not in _KNOWN_KEYS}
         return config
 
 
@@ -323,6 +351,7 @@ def _target_problems(targets: Any, strict: bool) -> List[str]:
         return [f'"targets" must be a list of objects, got {_shown(targets)}']
     problems: List[str] = []
     seen: Dict[str, int] = {}
+    labels: Dict[str, int] = {}
     for index, entry in enumerate(targets):
         if not isinstance(entry, dict):
             problems.append(f'"targets"[{index}] must be an object, got {_shown(entry)}')
@@ -341,14 +370,27 @@ def _target_problems(targets: Any, strict: bool) -> List[str]:
             kind = None
         if "label" in entry and not isinstance(entry["label"], str):
             problems.append(f'{where}: "label" must be a string, got {_shown(entry["label"])}')
+        elif isinstance(target_id, str) and target_id:
+            shown_label = (entry.get("label") or target_id).strip().lower()
+            if shown_label in labels:
+                problems.append(f'{where}: the label {(entry.get("label") or target_id)!r} is already used by '
+                                f'"targets"[{labels[shown_label]}]; labels must differ (ignoring case) so the dialogs '
+                                "can tell the targets apart")
+            else:
+                labels[shown_label] = index
         if "enabled" in entry and not isinstance(entry["enabled"], bool):
             problems.append(f'{where}: "enabled" must be true or false, got {_shown(entry["enabled"])}')
         if kind == "service":
             unit = entry.get("unit")
             if not isinstance(unit, str) or not unit:
                 problems.append(f'{where}: "unit" is required for a service and must be a string, got {_shown(unit)}')
-            elif not unit.endswith(".service") or any(c.isspace() or c == "/" for c in unit):
-                problems.append(f'{where}: "unit" must end in ".service" and contain no spaces or "/", got {_shown(unit)}')
+            elif unit.startswith("-"):
+                problems.append(f'{where}: "unit" must not start with "-" (it would be read as an option), got {_shown(unit)}')
+            elif any(c in unit for c in "*?[]"):
+                problems.append(f'{where}: "unit" is a unit name, not a glob; it must not contain any of *?[], got {_shown(unit)}')
+            elif not _UNIT_NAME.fullmatch(unit):
+                problems.append(f'{where}: "unit" must be a unit name ending in ".service" made of letters, digits and '
+                                f'":_.@-" only (no spaces or "/"), got {_shown(unit)}')
             if "scope" in entry and entry["scope"] not in SERVICE_SCOPES:
                 problems.append(f'{where}: "scope" must be one of {", ".join(SERVICE_SCOPES)}; got {_shown(entry["scope"])}')
         elif kind == "command":
@@ -368,6 +410,12 @@ def _target_problems(targets: Any, strict: bool) -> List[str]:
                 problems.append(f'{where}: "match" is required for a process and must be a string, got {_shown(match)}')
             elif "/" in match:
                 problems.append(f'{where}: "match" is a glob on the process name and must not contain "/", got {_shown(match)}')
+            elif not MATCH_LENGTH[0] <= len(match) <= MATCH_LENGTH[1]:
+                problems.append(f'{where}: "match" must be {MATCH_LENGTH[0]} to {MATCH_LENGTH[1]} characters because the '
+                                f"kernel truncates process names to {MATCH_LENGTH[1]}, got {len(match)}: {_shown(match)}")
+            elif sum(1 for c in match if c not in "*?[]") < MATCH_MIN_LITERALS:
+                problems.append(f'{where}: "match" needs at least {MATCH_MIN_LITERALS} characters that are not glob '
+                                f"characters (*?[]), or it would match unrelated processes, got {_shown(match)}")
             if "restart" in entry and not isinstance(entry["restart"], bool):
                 problems.append(f'{where}: "restart" must be true or false, got {_shown(entry["restart"])}')
         if strict:
@@ -409,8 +457,155 @@ def load(path: Optional[Path] = None) -> Config:
     return _read(Path(path) if path is not None else config_path())
 
 
+def file_stamp(path: Path) -> Optional[Tuple[int, int, int]]:
+    """(modification time in ns, size, inode) of the file at `path`, or None when it cannot be examined."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size, st.st_ino)
+
+
+def _parses_as_config(path: Path) -> Optional[dict]:
+    """The decoded content of the file at `path` when it is a config this version accepts, else None."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return None
+    return data if not _problems(data, strict=False) else None
+
+
+def _copy_file(source: Path, destination: Path) -> None:
+    """Copy `source` over `destination` so a reader of `destination` never sees a partial file."""
+    fd, tmp_name = tempfile.mkstemp(dir=str(destination.parent), prefix=f".{destination.name}.", suffix=".tmp")
+    os.close(fd)
+    try:
+        shutil.copyfile(source, tmp_name)
+        shutil.copymode(source, tmp_name)
+        os.replace(tmp_name, destination)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _keep_backup(path: Path, new_data: dict) -> None:
+    """Before `path` is replaced: copy it to `<path>.bak` when it is a valid config that differs from
+    `new_data`, or to `<path>.broken-<time>` when it cannot be used, keeping the newest few of those. A failed
+    copy is logged and never stops the save."""
+    if not os.path.lexists(path):
+        return
+    try:
+        old = _parses_as_config(path)
+        if old is not None:
+            if old != new_data:
+                _copy_file(path, path.with_name(path.name + ".bak"))
+            return
+        _copy_file(path, path.with_name(f"{path.name}.broken-{time.strftime('%Y%m%d-%H%M%S')}"))
+        stale = sorted(path.parent.glob(glob.escape(path.name) + ".broken-*"))
+        for old_copy in stale[:-_BROKEN_KEPT]:
+            old_copy.unlink()
+    except OSError as exc:
+        log(f"config: could not back up {path}: {exc.strerror or exc}")
+
+
 def save(config: Config, path: Optional[Path] = None) -> None:
-    atomic_write_json(Path(path) if path is not None else config_path(), config.to_json())
+    """Write `config` atomically. The file it replaces is first kept as `<path>.bak` (one rolling backup) or,
+    when it was unusable, as `<path>.broken-<time>`."""
+    path = Path(path) if path is not None else config_path()
+    data = config.to_json()
+    _keep_backup(path, data)
+    atomic_write_json(path, data)
+
+
+@contextlib.contextmanager
+def _locked(path: Path) -> Iterator[None]:
+    """Hold an exclusive lock on `<path>.lock` (mode 0600, next to the config). Without fcntl, or when the lock
+    cannot be had within a few seconds, the body runs anyway after a logged warning."""
+    fd = None
+    if fcntl is None:
+        log("config: file locking is not available; updating without it")
+    else:
+        lock_path = path.with_name(path.name + ".lock")
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+            deadline = time.monotonic() + _LOCK_WAIT_SECONDS
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.02)
+        except OSError as exc:
+            log(f"config: could not lock {lock_path}: {exc.strerror or exc}; updating without the lock")
+            if fd is not None:
+                os.close(fd)
+                fd = None
+    try:
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)  # closing the descriptor releases the lock
+
+
+def update_file(mutate: Callable[[Config], Config], path: Optional[Path] = None) -> Config:
+    """Read the file as it is now, apply `mutate` to it and save the result, all under an exclusive lock, so a
+    concurrent change to another part of the file is not lost. A missing file means the defaults. A file that
+    cannot be read or is invalid raises ConfigError and is left untouched, as does a result that is invalid."""
+    path = Path(path) if path is not None else config_path()
+    with _locked(path):
+        updated = mutate(_read(path))
+        problems = _problems(updated.to_json(), strict=False)
+        if problems:
+            raise ConfigError("; ".join(problems), path)
+        save(updated, path)
+    return updated
+
+
+_MISSING = object()
+
+
+def _merge_map(base: Dict[str, Any], ours: Dict[str, Any], theirs: Dict[str, Any]) -> Dict[str, Any]:
+    """Three-way merge of two mappings by key. An entry that `ours` added or changed wins; one `ours` removed
+    stays removed unless `theirs` changed it; entries only `theirs` added or changed are kept."""
+    merged: Dict[str, Any] = {}
+    for key in list(ours) + [k for k in theirs if k not in ours]:
+        b, o, t = base.get(key, _MISSING), ours.get(key, _MISSING), theirs.get(key, _MISSING)
+        if o is not _MISSING and (b is _MISSING or o != b):
+            value = o
+        elif o is not _MISSING:  # ours left it as it was
+            value = t
+        else:  # ours removed it, or never had it
+            value = t if t is not _MISSING and (b is _MISSING or t != b) else _MISSING
+        if value is not _MISSING:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def merge3(base: Config, ours: Config, theirs: Config) -> Config:
+    """Combine two edits of `base`. Each top-level field takes `ours` when it differs from `base`, otherwise
+    `theirs`. `games`, `targets` (by id) and `extra` merge entry by entry; see `_merge_map`."""
+    merged = Config()
+    for item in dataclasses.fields(Config):
+        name = item.name
+        if name in ("games", "targets", "extra"):
+            continue
+        source = ours if getattr(ours, name) != getattr(base, name) else theirs
+        setattr(merged, name, copy.deepcopy(getattr(source, name)))
+    merged.games = _merge_map(base.games, ours.games, theirs.games)
+    merged.extra = _merge_map(base.extra, ours.extra, theirs.extra)
+    if ours.targets == base.targets:
+        merged.targets = copy.deepcopy(theirs.targets)
+    else:
+        by_id = _merge_map({t.id: t for t in base.targets}, {t.id: t for t in ours.targets},
+                           {t.id: t for t in theirs.targets})
+        merged.targets = list(by_id.values())
+    return merged
 
 
 class ConfigWatcher:
@@ -426,19 +621,13 @@ class ConfigWatcher:
         self._last_error = ""
         self.error = ""  # the problem with the file now on disk; empty when it is valid or absent
 
-    def _stat_stamp(self) -> Optional[Tuple[int, int, int]]:
-        try:
-            st = os.stat(self.path)
-        except OSError:
-            return None
-        return (st.st_mtime_ns, st.st_size, st.st_ino)
-
     def current(self) -> Config:
-        stamp = self._stat_stamp()
+        stamp = file_stamp(self.path)
         if stamp == self._stamp:
             return self._config
         self._stamp = stamp
         if stamp is None:
+            self.error, self._last_error = "", ""  # no file, so no problem with the file
             if self._existed:
                 log("config: the file is missing; keeping the previous settings until it returns")
             else:

@@ -3,21 +3,26 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
 
-from .advanced_common import NUMBER_RANGES, ScrolledTab, divider, quiet, setting_row
+from .advanced_common import NUMBER_RANGES, ScrolledTab, divider, quiet, set_switch, setting_row
 from .qt import QtCore, QtWidgets
 from .theme import Card, ToggleSwitch
 
 # key -> (title, explanation without the range, decimals)
 TIMINGS: Tuple[Tuple[str, str, str, int], ...] = (
-    ("poll_seconds", "Poll interval", "How often the guard looks for a game launch. Shorter reacts faster.", 2),
+    ("poll_seconds", "Poll interval",
+     "How often the guard looks for a game launch and for a game that is still running. Shorter reacts faster.", 2),
     ("exit_grace_seconds", "Exit grace",
-     "How long a launch is given to close after the guard ends it, before it is started again.", 1),
+     "Once a game has been seen after the guard stopped workloads, how long no game may be running before the "
+     "guard starts them again or asks about it.", 1),
     ("no_game_timeout_seconds", "No-game timeout",
-     "How long the guard waits for a game after stopping workloads before it offers to restart them.", 0),
+     "When no game has been seen since the guard stopped workloads, how long it waits before it starts them again "
+     "or asks about it.", 0),
     ("bypass_seconds", "Bypass window",
-     "After a Launch anyway answer, the same game is let through for this long.", 0),
+     "After the guard has handled a launch (stopped workloads or let the game through) and started the game again, "
+     "the same game is not interrupted again for this long. Not applied after Cancel.", 0),
     ("dialog_retry_seconds", "Dialog retry",
-     "How long to wait before asking again when a restart question went unanswered.", 0),
+     "How long to wait before trying again when the restart question could not be shown or a workload could not be "
+     "started.", 0),
 )
 
 
@@ -37,7 +42,8 @@ class TimingTab(ScrolledTab):
             spin.setRange(float(low), float(high))
             spin.setDecimals(decimals)
             spin.setSuffix(" s")
-            spin.setKeyboardTracking(False)
+            spin.setKeyboardTracking(True)
+            spin.setAccessibleName(f"{title} in seconds")
             spin.setMinimumWidth(150)
             spin.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
             self.spins[key] = spin
@@ -71,6 +77,5 @@ class TimingTab(ScrolledTab):
             with quiet(spin):
                 if spin.value() != value:
                     spin.setValue(value)
-        with quiet(self.enabled_switch, self.remember_switch):
-            self.enabled_switch.setChecked(config.enabled)
-            self.remember_switch.setChecked(config.remember_choices)
+        set_switch(self.enabled_switch, config.enabled)
+        set_switch(self.remember_switch, config.remember_choices)

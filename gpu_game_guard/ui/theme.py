@@ -10,19 +10,28 @@ Qt widgets pick it up:
 * `QFrame` with object name `Card` is a card; use `Card`.
 * `QLabel` with the `badge` property (`ok`, `warn`, `danger`, `muted`) is a status label; use `Badge` or `Pill`.
 
+Every label of the kit shows plain text, so a string that comes from user-controlled data is never read as markup;
+`rich=True` on `styled_label` and `Callout` opts in for trusted markup such as links. `safe_text()` removes control
+and bidirectional-override characters from such strings and `plain_tooltip()` sets a tooltip that Qt cannot read as
+rich text. Sizes follow the application font: the stylesheet uses point sizes derived from the default font and the
+fixed-size controls scale with `font_scale()`.
+
 `apply_theme(app)` installs palette and stylesheet and must run before windows are created. `demo_widget()` shows the
 whole kit at once and is the reference for how the pieces fit together.
 """
 from __future__ import annotations
 
 import hashlib
+import html
 import os
-import tempfile
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from string import Template
 from typing import Callable, Dict, Optional
 
+from ..util import log
+from . import singleton
 from .qt import QtCore, QtGui, QtWidgets
 
 Qt = QtCore.Qt
@@ -35,6 +44,38 @@ ICON_STATES = ("ok", "paused", "attention", "off")
 BADGE_KINDS = ("ok", "warn", "danger", "muted")
 BUTTON_ROLES = ("secondary", "primary", "danger")
 LABEL_ROLES = ("headline", "title", "muted", "small")
+BASE_POINT_SIZE = 10.0  # the default font size the unscaled dimensions were designed for
+HEADLESS_PLATFORMS = ("offscreen", "minimal", "minimalegl")
+
+_CONTROLS = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029\ud800-\udfff\ufffe\uffff]")
+_BIDI = re.compile("[\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c]")
+_BLANKS = re.compile("[\t\n\r]")
+
+
+def safe_text(text: object, keep_newlines: bool = False) -> str:
+    """`text` as a string fit to show: control characters and bidirectional override and isolate characters are
+    removed, and newlines and tabs become a space (tabs always, newlines unless `keep_newlines`)."""
+    value = "" if text is None else str(text)
+    if keep_newlines:
+        value = value.replace("\r\n", "\n").replace("\r", "\n").replace("\t", " ")
+        return _CONTROLS.sub("", _BIDI.sub("", value))
+    return _CONTROLS.sub("", _BIDI.sub("", _BLANKS.sub(" ", value)))
+
+
+def plain_tooltip(widget: "QtWidgets.QWidget", text: str) -> None:
+    """Set a tooltip that is shown literally: Qt reads a tooltip as rich text when it looks like markup, so the text
+    is escaped and wrapped in `<qt>`, which is always rich. An empty text clears the tooltip."""
+    text = safe_text(text, keep_newlines=True)
+    wanted = f"<qt>{html.escape(text, quote=False).replace(chr(10), '<br>')}</qt>" if text else ""
+    if widget.toolTip() != wanted:
+        widget.setToolTip(wanted)
+
+
+def font_scale() -> float:
+    """The application's default font size relative to `BASE_POINT_SIZE`, never below 1."""
+    app = QtWidgets.QApplication.instance()
+    size = app.font().pointSizeF() if app is not None else BASE_POINT_SIZE
+    return max(1.0, size / BASE_POINT_SIZE) if size > 0 else 1.0
 
 
 @dataclass(frozen=True)
@@ -57,7 +98,7 @@ class Colors:
 
 LIGHT = Colors(
     window="#f3f4f7", card="#ffffff", text="#1b2130", muted="#586274", accent="#2563eb", accent_text="#ffffff",
-    border="#d5dae3", ok="#15803d", warn="#b45309", danger="#c62828", input="#ffffff", hover="#eef1f6",
+    border="#d5dae3", ok="#166534", warn="#92400e", danger="#a31616", input="#ffffff", hover="#eef1f6",
 )
 DARK = Colors(
     window="#14171c", card="#1d2128", text="#e8ebf1", muted="#9ba4b4", accent="#7aa2ff", accent_text="#0b1220",
@@ -107,10 +148,10 @@ _STYLE = Template("""
 QWidget { color: $text; }
 QDialog, QMainWindow, QWidget#Window { background: $window; }
 QLabel { background: transparent; }
-QLabel[role="headline"] { font-size: 20px; font-weight: 600; }
-QLabel[role="title"] { font-size: 15px; font-weight: 600; }
+QLabel[role="headline"] { font-size: ${headline_pt}pt; font-weight: 600; }
+QLabel[role="title"] { font-size: ${title_pt}pt; font-weight: 600; }
 QLabel[role="muted"] { color: $muted; }
-QLabel[role="small"] { color: $muted; font-size: 12px; }
+QLabel[role="small"] { color: $muted; font-size: ${small_pt}pt; }
 QToolTip { background: $card; color: $text; border: 1px solid $border; padding: 4px 8px; }
 
 QFrame#Card { background: $card; border: 1px solid $border; border-radius: ${radius_card}px; }
@@ -119,7 +160,7 @@ QFrame#Callout[kind="warn"] { background: $warn_soft; border: 1px solid $warn_li
 QFrame#Callout[kind="danger"] { background: $danger_soft; border: 1px solid $danger_line; }
 QFrame#Divider { background: $border; border: none; max-height: 1px; min-height: 1px; }
 
-QLabel[badge] { padding: 1px 8px; font-size: 12px; font-weight: 600; }
+QLabel[badge] { padding: 1px 8px; font-size: ${small_pt}pt; font-weight: 600; }
 QLabel[badge="muted"] { color: $muted; }
 QLabel[badge="ok"] { color: $ok; }
 QLabel[badge="warn"] { color: $warn; }
@@ -128,7 +169,7 @@ QLabel[pill="true"] { padding: 1px 12px; }
 
 QPushButton {
     background: $card; color: $text; border: 1px solid $border_strong; border-radius: ${radius_control}px;
-    padding: 7px 16px; min-height: 20px;
+    padding: 7px 16px; min-height: ${button_height}px;
 }
 QPushButton:hover { background: $hover; }
 QPushButton:pressed { background: $border; }
@@ -154,14 +195,14 @@ QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QSpinBox:focus, QDoubleS
 }
 QLineEdit:disabled, QPlainTextEdit:disabled, QTextEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled,
 QComboBox:disabled { color: $muted; background: $window; }
-QComboBox { padding-right: 28px; }
-QComboBox::drop-down { border: none; width: 28px; subcontrol-origin: padding; subcontrol-position: center right; }
+QComboBox { padding-right: ${drop_down}px; }
+QComboBox::drop-down { border: none; width: ${drop_down}px; subcontrol-origin: padding; subcontrol-position: center right; }
 $arrow
 QComboBox QAbstractItemView {
     background: $card; border: 1px solid $border; selection-background-color: $accent_soft; selection-color: $text;
     outline: none; padding: 4px;
 }
-QSpinBox::up-button, QSpinBox::down-button, QDoubleSpinBox::up-button, QDoubleSpinBox::down-button { width: 18px; border: none; }
+QSpinBox::up-button, QSpinBox::down-button, QDoubleSpinBox::up-button, QDoubleSpinBox::down-button { width: ${spin_button}px; border: none; }
 
 QCheckBox, QRadioButton { spacing: 8px; background: transparent; }
 $indicators
@@ -174,6 +215,7 @@ QTabBar::tab {
 }
 QTabBar::tab:hover { color: $text; }
 QTabBar::tab:selected { color: $accent; border-bottom: 2px solid $accent; }
+QTabBar::tab:focus { background: $accent_soft; }
 
 QTableView, QTreeView, QListView {
     background: $card; alternate-background-color: $window; border: 1px solid $border;
@@ -185,13 +227,14 @@ QHeaderView::section {
     background: $window; color: $muted; padding: 6px 10px; border: none; border-bottom: 1px solid $border;
     font-weight: 600;
 }
+QTableView:focus, QTreeView:focus, QListView:focus { border: 2px solid $accent; }
 QTableCornerButton::section { background: $window; border: none; }
 
 QScrollArea { background: transparent; border: none; }
-QScrollBar:vertical { background: transparent; width: 12px; margin: 2px; }
-QScrollBar:horizontal { background: transparent; height: 12px; margin: 2px; }
-QScrollBar::handle:vertical { background: $border_strong; border-radius: 4px; min-height: 32px; }
-QScrollBar::handle:horizontal { background: $border_strong; border-radius: 4px; min-width: 32px; }
+QScrollBar:vertical { background: transparent; width: ${scroll}px; margin: 2px; }
+QScrollBar:horizontal { background: transparent; height: ${scroll}px; margin: 2px; }
+QScrollBar::handle:vertical { background: $border_strong; border-radius: 4px; min-height: ${scroll_min}px; }
+QScrollBar::handle:horizontal { background: $border_strong; border-radius: 4px; min-width: ${scroll_min}px; }
 QScrollBar::handle:hover { background: $muted; }
 QScrollBar::add-line, QScrollBar::sub-line, QScrollBar::add-page, QScrollBar::sub-page { background: none; border: none; width: 0; height: 0; }
 
@@ -201,29 +244,41 @@ QMenu::item:selected { background: $accent_soft; color: $text; }
 QMenu::item:disabled { color: $muted; }
 QMenu::separator { height: 1px; background: $border; margin: 4px 8px; }
 
-QProgressBar { background: $border; border: none; border-radius: 4px; max-height: 8px; text-align: center; }
+QProgressBar { background: $border; border: none; border-radius: 4px; max-height: ${progress}px; text-align: center; }
 QProgressBar::chunk { background: $accent; border-radius: 4px; }
 """)
 
 
-def stylesheet(palette: Colors, assets: Optional[Dict[str, str]] = None) -> str:
+def stylesheet(palette: Colors, assets: Optional[Dict[str, str]] = None, scale: float = 1.0) -> str:
     """The application stylesheet for `palette`. `assets` maps `arrow` and `check` to image files used for the combo
-    box arrow and the check box tick; without them those controls keep the style's own drawing."""
+    box arrow and the check box tick; without them those controls keep the style's own drawing. `scale` is the
+    default font size relative to `BASE_POINT_SIZE`: text sizes are point sizes derived from it, and the fixed
+    dimensions that hold text or an indicator grow with it."""
     p = palette
     assets = assets or {}
-    arrow = (f"QComboBox::down-arrow {{ image: url({assets['arrow']}); width: 12px; height: 12px; }}"
+    scale = max(1.0, scale)
+    base = BASE_POINT_SIZE * scale
+
+    def px(value: float) -> int:
+        return int(round(value * scale))
+
+    def pt(factor: float) -> str:
+        return f"{base * factor:.1f}".rstrip("0").rstrip(".")
+
+    arrow = (f"QComboBox::down-arrow {{ image: url(\"{assets['arrow']}\"); width: {px(12)}px; height: {px(12)}px; }}"
              if "arrow" in assets else "")
     if "check" in assets:
         indicators = (
-            f"QCheckBox::indicator {{ width: 18px; height: 18px; border: 1px solid {p.muted}; border-radius: 5px; "
-            f"background: {p.input}; }}\n"
+            f"QCheckBox::indicator {{ width: {px(18)}px; height: {px(18)}px; border: 1px solid {p.muted}; "
+            f"border-radius: 5px; background: {p.input}; }}\n"
             f"QCheckBox::indicator:hover {{ border-color: {p.accent}; }}\n"
             f"QCheckBox::indicator:checked {{ background: {p.accent}; border: 1px solid {p.accent}; "
-            f"image: url({assets['check']}); }}\n"
+            f"image: url(\"{assets['check']}\"); }}\n"
             f"QCheckBox::indicator:focus {{ border: 2px solid {p.accent}; }}\n"
-            f"QRadioButton::indicator {{ width: 16px; height: 16px; border: 1px solid {p.muted}; "
-            f"border-radius: 9px; background: {p.input}; }}\n"
-            f"QRadioButton::indicator:checked {{ border: 5px solid {p.accent}; background: {p.input}; }}")
+            f"QRadioButton::indicator {{ width: {px(16)}px; height: {px(16)}px; border: 1px solid {p.muted}; "
+            f"border-radius: {px(9)}px; background: {p.input}; }}\n"
+            f"QRadioButton::indicator:checked {{ border: {px(5)}px solid {p.accent}; background: {p.input}; }}\n"
+            f"QRadioButton::indicator:focus {{ border: 2px solid {p.accent}; }}")
     else:
         indicators = ""
     return _STYLE.substitute(
@@ -236,6 +291,8 @@ def stylesheet(palette: Colors, assets: Optional[Dict[str, str]] = None) -> str:
         ok_soft=rgba(p.ok, 0.16), warn_soft=rgba(p.warn, 0.16), danger_soft=rgba(p.danger, 0.16),
         warn_line=rgba(p.warn, 0.55), danger_line=rgba(p.danger, 0.55),
         radius_card=RADIUS_CARD, radius_control=RADIUS_CONTROL, arrow=arrow, indicators=indicators,
+        headline_pt=pt(1.5), title_pt=pt(1.15), small_pt=pt(0.9), button_height=px(20), drop_down=px(28),
+        spin_button=px(18), scroll=px(12), scroll_min=px(32), progress=px(8),
     )
 
 
@@ -256,52 +313,79 @@ def _palette(p: Colors) -> "QtGui.QPalette":
     return qp
 
 
-def _glyph(path: Path, painter_fn: Callable[["QtGui.QPainter"], None], size: int = 36) -> None:
+def _glyph(painter_fn: Callable[["QtGui.QPainter"], None], size: int = 36) -> bytes:
+    """The PNG encoding of a `size` square image drawn by `painter_fn` on a transparent background."""
     pixmap = QtGui.QPixmap(size, size)
     pixmap.fill(Qt.transparent)
     painter = QtGui.QPainter(pixmap)
     painter.setRenderHint(QtGui.QPainter.Antialiasing)
     painter_fn(painter)
     painter.end()
-    pixmap.save(str(path), "PNG")
+    buffer = QtCore.QBuffer()
+    buffer.open(QtCore.QIODevice.WriteOnly)
+    if not pixmap.save(buffer, "PNG"):
+        raise OSError("cannot encode an image")
+    return bytes(buffer.data())
 
 
-def _write_assets(p: Colors) -> Dict[str, str]:
-    """Paint the small images the stylesheet refers to into a per-palette directory under the temp directory."""
-    key = hashlib.sha1(f"{p.muted}{p.accent_text}".encode()).hexdigest()[:10]
-    base = Path(tempfile.gettempdir()) / f"gpu-game-guard-theme-{os.getuid() if hasattr(os, 'getuid') else 0}-{key}"
+def _store(path: Path, data: bytes) -> None:
+    """Write `data` to `path` inside a private directory without following a symlink at `path`."""
     try:
-        base.mkdir(parents=True, exist_ok=True)
-
-        def arrow(painter: "QtGui.QPainter") -> None:
-            pen = QtGui.QPen(QtGui.QColor(p.muted), 4, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
-            painter.setPen(pen)
-            painter.drawPolyline(QtGui.QPolygonF([QtCore.QPointF(9, 13), QtCore.QPointF(18, 23),
-                                                  QtCore.QPointF(27, 13)]))
-
-        def tick(painter: "QtGui.QPainter") -> None:
-            pen = QtGui.QPen(QtGui.QColor(p.accent_text), 4.2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
-            painter.setPen(pen)
-            painter.drawPolyline(QtGui.QPolygonF([QtCore.QPointF(8, 19), QtCore.QPointF(15, 26),
-                                                  QtCore.QPointF(28, 11)]))
-
-        _glyph(base / "arrow.png", arrow)
-        _glyph(base / "check.png", tick)
-        return {"arrow": (base / "arrow.png").as_posix(), "check": (base / "check.png").as_posix()}
+        if path.read_bytes() == data:
+            return
     except OSError:
+        pass
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(str(path), flags, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(data)
+
+
+def _write_assets(p: Colors, root: Optional[Path] = None) -> Dict[str, str]:
+    """Paint the small images the stylesheet refers to into a private per-user directory below `root` (by default
+    the runtime directory). Any failure, or no usable directory, gives an empty mapping and the controls keep the
+    style's own drawing."""
+    base = root if root is not None else singleton.runtime_base()
+    if base is None:
+        return {}
+    key = hashlib.sha1(f"{p.muted}{p.accent_text}".encode()).hexdigest()[:10]
+
+    def arrow(painter: "QtGui.QPainter") -> None:
+        pen = QtGui.QPen(QtGui.QColor(p.muted), 4, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        painter.setPen(pen)
+        painter.drawPolyline(QtGui.QPolygonF([QtCore.QPointF(9, 13), QtCore.QPointF(18, 23), QtCore.QPointF(27, 13)]))
+
+    def tick(painter: "QtGui.QPainter") -> None:
+        pen = QtGui.QPen(QtGui.QColor(p.accent_text), 4.2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        painter.setPen(pen)
+        painter.drawPolyline(QtGui.QPolygonF([QtCore.QPointF(8, 19), QtCore.QPointF(15, 26), QtCore.QPointF(28, 11)]))
+
+    try:
+        directory = singleton.private_directory(base, "gpu-game-guard", f"theme-{key}")
+        _store(directory / "arrow.png", _glyph(arrow))
+        _store(directory / "check.png", _glyph(tick))
+        return {"arrow": (directory / "arrow.png").as_posix(), "check": (directory / "check.png").as_posix()}
+    except OSError as exc:
+        log(f"theme images are not used ({exc})")
         return {}
 
 
-def apply_theme(app: "QtWidgets.QApplication", dark: Optional[bool] = None) -> Colors:
+def apply_theme(app: "QtWidgets.QApplication", dark: Optional[bool] = None,
+                asset_root: Optional[Path] = None) -> Colors:
     """Install the palette and stylesheet on `app`. `dark` forces a scheme; by default the system's is followed.
+    The combo box arrow and the check mark are small images kept in a private directory of the runtime directory
+    (or of `asset_root`); on a headless platform, or when no private directory can be had, they are skipped.
     Returns the palette in use (also available later through `current_colors()`)."""
     global _current
     use_dark = is_dark(app) if dark is None else dark
     palette = colors(use_dark)
     _current = palette
+    headless = app.platformName() in HEADLESS_PLATFORMS
+    assets = _write_assets(palette, asset_root) if asset_root is not None or not headless else {}
     app.setStyle("Fusion")
     app.setPalette(_palette(palette))
-    app.setStyleSheet(stylesheet(palette, _write_assets(palette)))
+    scale = max(1.0, app.font().pointSizeF() / BASE_POINT_SIZE) if app.font().pointSizeF() > 0 else 1.0
+    app.setStyleSheet(stylesheet(palette, assets, scale))
     return palette
 
 
@@ -322,9 +406,12 @@ def button(text: str, role: str = "secondary", parent: Optional["QtWidgets.QWidg
 
 
 def styled_label(text: str = "", role: str = "", parent: Optional["QtWidgets.QWidget"] = None,
-                 wrap: bool = True) -> "QtWidgets.QLabel":
-    """A label with a text role: `headline`, `title`, `muted` or `small`."""
-    label = QtWidgets.QLabel(text, parent)
+                 rich: bool = False, wrap: bool = True) -> "QtWidgets.QLabel":
+    """A label with a text role: `headline`, `title`, `muted` or `small`. The text is shown literally; `rich=True`
+    is the opt-in for trusted markup (links)."""
+    label = QtWidgets.QLabel(parent)
+    label.setTextFormat(Qt.RichText if rich else Qt.PlainText)
+    label.setText(text)
     if role:
         label.setProperty("role", role)
     label.setWordWrap(wrap)
@@ -333,15 +420,20 @@ def styled_label(text: str = "", role: str = "", parent: Optional["QtWidgets.QWi
 
 class ElidedLabel(QtWidgets.QLabel):
     """A single-line label that shortens its text with an ellipsis instead of widening its window, and shows the
-    full text as a tooltip while shortened."""
+    full text as a tooltip while shortened. The text is plain and cleaned with `safe_text`."""
 
     def __init__(self, text: str = "", role: str = "", parent: Optional["QtWidgets.QWidget"] = None,
                  mode: "QtCore.Qt.TextElideMode" = Qt.ElideRight):
-        super().__init__(text, parent)
+        super().__init__(parent)
+        self.setTextFormat(Qt.PlainText)
+        self.setText(text)
         self._mode = mode
         if role:
             self.setProperty("role", role)
         self.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+
+    def setText(self, text: str) -> None:  # noqa: N802 (Qt naming)
+        super().setText(safe_text(text))
 
     def sizeHint(self) -> "QtCore.QSize":
         metrics = self.fontMetrics()
@@ -354,7 +446,7 @@ class ElidedLabel(QtWidgets.QLabel):
         painter = QtGui.QPainter(self)
         rect = self.contentsRect()
         elided = self.fontMetrics().elidedText(self.text(), self._mode, rect.width())
-        self.setToolTip(self.text() if elided != self.text() else "")
+        plain_tooltip(self, self.text() if elided != self.text() else "")
         self.style().drawItemText(painter, rect, int(self.alignment()) | int(Qt.AlignVCenter), self.palette(),
                                   self.isEnabled(), elided, QtGui.QPalette.WindowText)
 
@@ -363,7 +455,9 @@ class Badge(QtWidgets.QLabel):
     """A small tinted label for a status or a kind of thing. `kind` is `ok`, `warn`, `danger` or `muted`."""
 
     def __init__(self, text: str = "", kind: str = "muted", parent: Optional["QtWidgets.QWidget"] = None):
-        super().__init__(text, parent)
+        super().__init__(parent)
+        self.setTextFormat(Qt.PlainText)
+        self.setText(safe_text(text))
         self.setProperty("badge", "muted")
         self.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Maximum)
         self.setKind(kind)
@@ -434,12 +528,13 @@ class Card(QtWidgets.QFrame):
 class Callout(QtWidgets.QFrame):
     """A tinted note inside a window. `kind` is `""` (neutral), `warn` or `danger`."""
 
-    def __init__(self, text: str = "", kind: str = "", parent: Optional["QtWidgets.QWidget"] = None):
+    def __init__(self, text: str = "", kind: str = "", parent: Optional["QtWidgets.QWidget"] = None,
+                 rich: bool = False):
         super().__init__(parent)
         self.setObjectName("Callout")
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(12, 10, 12, 10)
-        self.label = styled_label(text, "", self)
+        self.label = styled_label(text, "", self, rich=rich)
         layout.addWidget(self.label)
         self.setKind(kind)
 
@@ -479,7 +574,7 @@ class ToggleSwitch(QtWidgets.QAbstractButton):
 
     `accessible_name` is what assistive technology reads, for example "Pause Ollama while gaming"."""
 
-    WIDTH, HEIGHT, MARGIN = 44, 24, 3
+    WIDTH, HEIGHT, MARGIN = 44, 24, 3  # the size at the base font; the real size follows the font, see `sizeHint`
 
     def __init__(self, checked: bool = False, parent: Optional["QtWidgets.QWidget"] = None,
                  accessible_name: str = ""):
@@ -498,7 +593,9 @@ class ToggleSwitch(QtWidgets.QAbstractButton):
         self.toggled.connect(self._slide)
 
     def sizeHint(self) -> "QtCore.QSize":
-        return QtCore.QSize(self.WIDTH, self.HEIGHT)
+        size = self.font().pointSizeF()
+        scale = max(1.0, size / BASE_POINT_SIZE) if size > 0 else 1.0
+        return QtCore.QSize(int(round(self.WIDTH * scale)), int(round(self.HEIGHT * scale)))
 
     def _get_offset(self) -> float:
         return self._offset
@@ -526,7 +623,7 @@ class ToggleSwitch(QtWidgets.QAbstractButton):
         if not self.isEnabled():
             painter.setOpacity(0.45)
         rect = QtCore.QRectF(0.5, 0.5, self.width() - 1, self.height() - 1)
-        track_off = QtGui.QColor(mix(p.border, p.muted, 0.55))
+        track_off = QtGui.QColor(mix(p.border, p.muted, 0.7))
         track_on = QtGui.QColor(p.accent)
         track = QtGui.QColor(
             *[round(a + (b - a) * self._offset) for a, b in zip(track_off.getRgb()[:3], track_on.getRgb()[:3])])

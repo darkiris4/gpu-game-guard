@@ -172,5 +172,54 @@ class PauseTests(StatusTestCase):
         self.assertEqual(status.paused(self.dir, now=1001.0), (True, 1600.0))
 
 
+class ValidForAndPermissionTests(StatusTestCase):
+    def test_valid_for_round_trips_and_defaults_to_15(self):
+        self.assertEqual(Status().valid_for, 15.0)
+        status.write_status(sample(valid_for=900.0, updated=1000.0), self.dir)
+        with mock.patch.object(status.time, "time", return_value=1001.0):
+            self.assertEqual(status.read_status(self.dir).valid_for, 900.0)
+
+    def test_a_long_valid_for_extends_freshness(self):
+        status.write_status(sample(valid_for=900.0, updated=1000.0), self.dir)
+        with mock.patch.object(status.time, "time", return_value=1800.0):
+            self.assertIsNotNone(status.read_status(self.dir))
+        with mock.patch.object(status.time, "time", return_value=1901.0):
+            self.assertIsNone(status.read_status(self.dir))
+
+    def test_max_age_still_applies_when_larger(self):
+        status.write_status(sample(valid_for=15.0, updated=1000.0), self.dir)
+        with mock.patch.object(status.time, "time", return_value=1100.0):
+            self.assertIsNone(status.read_status(self.dir))
+            self.assertIsNotNone(status.read_status(self.dir, max_age=200))
+
+    def test_a_missing_or_bad_valid_for_means_15(self):
+        for value in ("x", None, float("nan"), -5, True):
+            (self.dir).mkdir(parents=True, exist_ok=True)
+            (self.dir / "status.json").write_text(json.dumps({"updated": 1000.0, "valid_for": value}))
+            with mock.patch.object(status.time, "time", return_value=1016.0):
+                self.assertIsNone(status.read_status(self.dir), value)
+
+    def test_a_huge_valid_for_is_capped(self):
+        status.write_status(sample(valid_for=1e12, updated=1000.0), self.dir)
+        with mock.patch.object(status.time, "time", return_value=1000.0 + 4000):
+            self.assertIsNone(status.read_status(self.dir))
+
+    def test_new_files_are_private_and_the_directory_too(self):
+        status.write_status(sample(), self.dir)
+        status.append_event("stop", "x", self.dir)
+        status.pause(60, self.dir)
+        for name in ("status.json", "events.jsonl", "pause.json"):
+            self.assertEqual(stat.S_IMODE((self.dir / name).stat().st_mode), 0o600, name)
+        self.assertEqual(stat.S_IMODE(self.dir.stat().st_mode), 0o700)
+
+    def test_an_existing_events_file_keeps_its_mode(self):
+        self.dir.mkdir(parents=True)
+        events = self.dir / "events.jsonl"
+        events.write_text("")
+        os.chmod(events, 0o644)
+        status.append_event("stop", "x", self.dir)
+        self.assertEqual(stat.S_IMODE(events.stat().st_mode), 0o644)
+
+
 if __name__ == "__main__":
     unittest.main()

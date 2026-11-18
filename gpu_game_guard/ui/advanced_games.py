@@ -5,9 +5,10 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..config import GAME_ACTIONS
-from .advanced_common import (TabBase, bold_label, centered, error_label, make_table, quiet, table_item)
+from .advanced_common import (TabBase, bold_label, centered, error_label, focus_cell, focused_cell, make_table,
+                              quiet, table_item)
 from .qt import QtCore, QtWidgets
-from .theme import SPACE, Badge, button, styled_label
+from .theme import SPACE, Badge, button, plain_tooltip, styled_label
 
 Qt = QtCore.Qt
 GAME_ID = re.compile(r"[a-z0-9_-]+:\S+\Z")
@@ -160,7 +161,7 @@ class GamesTab(TabBase):
         header.setSectionResizeMode(3, QtWidgets.QHeaderView.Fixed)
         self.table.setColumnWidth(0, 170)
         self.table.setColumnWidth(2, 150)
-        self.table.setColumnWidth(3, 110)
+        self.table.setColumnWidth(3, max(110, self.fontMetrics().horizontalAdvance("Remove") + 64))
         layout.addWidget(self.table, 1)
         self.empty = styled_label("No game has its own rule yet. Add one to treat a game differently from the default.",
                                   "muted")
@@ -173,6 +174,7 @@ class GamesTab(TabBase):
         layout.addLayout(row)
         self.add_button.clicked.connect(self.add_game)
         self.combos: Dict[str, QtWidgets.QComboBox] = {}
+        self._keys: List[str] = []  # the game id of each table row; a change means a rebuild
         self.refresh()
 
     def refresh(self) -> None:
@@ -181,30 +183,56 @@ class GamesTab(TabBase):
         self.default_badge.setKind(DEFAULT_BADGE.get(config.on_launch, "muted"))
         self.default_text.setText(ACTION_TIPS.get(config.on_launch, ""))
         games = sorted(config.games.items())
+        keys = [game_id for game_id, _rule in games]
+        rebuild = keys != self._keys
+        focus = focused_cell(self.table)
+        focus_key = (self._keys[focus[0]], focus[1]) if focus and focus[0] < len(self._keys) else None
+        selected = self.table.currentRow()
+        selected_key = self._keys[selected] if 0 <= selected < len(self._keys) else None
         self.table.setUpdatesEnabled(False)
-        self.table.clearContents()
-        self.table.setRowCount(len(games))
-        self.combos = {}
+        if rebuild:
+            self.table.clearContents()
+            self.table.setRowCount(len(games))
+            self.combos = {}
+            self._keys = keys
         for index, (game_id, rule) in enumerate(games):
             self.table.setItem(index, 0, table_item(game_id, game_id))
             self.table.setItem(index, 1, table_item(rule.name or "(no name)", rule.name, muted=not rule.name))
-            combo = QtWidgets.QComboBox()
-            combo.addItems(list(GAME_ACTIONS))
-            for position, action in enumerate(GAME_ACTIONS):
-                combo.setItemData(position, ACTION_TIPS[action], Qt.ToolTipRole)
-            combo.setToolTip(f"What happens when {rule.name or game_id} launches. ask, stop or ignore.")
-            with quiet(combo):
-                combo.setCurrentText(rule.action)
-            combo.currentTextChanged.connect(lambda action, g=game_id, n=rule.name: self.model.set_game(g, n, action))
-            self.combos[game_id] = combo
-            self.table.setCellWidget(index, 2, combo)
-            remove = button("Remove")
-            remove.setStyleSheet("padding: 3px 14px; min-height: 0px;")
-            remove.setToolTip(f"Delete the rule for {game_id}; the default applies afterwards.")
-            remove.clicked.connect(lambda _c=False, g=game_id: self.model.remove_game(g))
-            self.table.setCellWidget(index, 3, centered(remove))
+            if rebuild:
+                self._add_widgets(index, game_id)
+            combo = self.combos[game_id]
+            plain_tooltip(combo, f"What happens when {rule.name or game_id} launches. ask, stop or ignore.")
+            combo.setAccessibleName(f"Action for {rule.name or game_id}")
+            if combo.currentText() != rule.action:
+                with quiet(combo):
+                    combo.setCurrentText(rule.action)
         self.table.setUpdatesEnabled(True)
+        if rebuild:
+            if selected_key in keys:
+                self.table.setCurrentCell(keys.index(selected_key), 0)
+            if focus_key is not None and focus_key[0] in keys:
+                focus_cell(self.table, keys.index(focus_key[0]), focus_key[1])
         self.empty.setVisible(not games)
+
+    def _add_widgets(self, index: int, game_id: str) -> None:
+        combo = QtWidgets.QComboBox()
+        combo.addItems(list(GAME_ACTIONS))
+        for position, action in enumerate(GAME_ACTIONS):
+            combo.setItemData(position, ACTION_TIPS[action], Qt.ToolTipRole)
+        combo.currentTextChanged.connect(lambda action, g=game_id: self._set_action(g, action))
+        self.combos[game_id] = combo
+        self.table.setCellWidget(index, 2, combo)
+        remove = button("Remove")
+        remove.setStyleSheet("padding: 3px 14px; min-height: 0px;")
+        remove.setAccessibleName(f"Remove the rule for {game_id}")
+        plain_tooltip(remove, f"Delete the rule for {game_id}; the default applies afterwards.")
+        remove.clicked.connect(lambda _c=False, g=game_id: self.model.remove_game(g))
+        self.table.setCellWidget(index, 3, centered(remove))
+
+    def _set_action(self, game_id: str, action: str) -> None:
+        rule = self.model.config.games.get(game_id)
+        if rule is not None and rule.action != action:
+            self.model.set_game(game_id, "", action)
 
     def add_game(self) -> None:
         dialog = AddGameDialog(list(self.model.config.games), self.model.recent_games(), self.model.config.on_launch,

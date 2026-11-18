@@ -213,11 +213,31 @@ class RuntimeTests(unittest.TestCase):
 
     def test_nul_in_a_name_does_not_raise(self):
         gpu._last_failure.clear()
-        rt = runtimes.DockerLikeRuntime("docker", lambda: {})
+        rt = runtimes.DockerLikeRuntime("docker", lambda: {}, run=gpu.run_command)
         refs = [{"kind": "container", "runtime": "docker", "name": "a\x00b"}]
-        with mock.patch("gpu_game_guard.util.log"), mock.patch("subprocess.run", side_effect=ValueError("embedded null byte")):
+        with mock.patch("gpu_game_guard.util.log"), mock.patch("subprocess.Popen", side_effect=ValueError("embedded null byte")):
             rt.stop(refs)
-            rt.start(refs)
+            self.assertEqual(rt.start(refs), refs)
+
+    def test_start_returns_the_refs_that_failed(self):
+        def run(args, timeout=None, keep_output=False):
+            return None if args[-1] in ("bad", "-v") else ""
+
+        rt = runtimes.DockerLikeRuntime("docker", lambda: {}, run)
+        refs = [{"kind": "container", "runtime": "docker", "name": name} for name in ("a", "bad", "-v")]
+        foreign = {"kind": "container", "runtime": "podman", "name": "bad"}
+        with mock.patch("gpu_game_guard.util.log"):
+            self.assertEqual(rt.start(refs + [foreign]), refs[1:])
+            self.assertEqual(rt.start(refs[:1]), [])
+
+    def test_a_runner_that_raises_fails_the_start(self):
+        def run(args, timeout=None, keep_output=False):
+            raise RuntimeError("boom")
+
+        rt = runtimes.DockerLikeRuntime("docker", lambda: {}, run)
+        ref = {"kind": "container", "runtime": "docker", "name": "a"}
+        with mock.patch("gpu_game_guard.util.log"):
+            self.assertEqual(rt.start([ref]), [ref])
 
     def test_start_only_own_refs_in_order(self):
         rt, runner = self.runtime("docker")
@@ -232,31 +252,36 @@ class RuntimeTests(unittest.TestCase):
         rt.start([{"kind": "container", "runtime": "podman", "name": "b"}])
         self.assertEqual(runner.calls, [])
 
-    def test_failures_logged_not_raised(self):
-        # The default runner reports a missing binary as a failure and logs it once, not on every call.
+    def test_failures_are_logged_once_per_subcommand_and_never_raised(self):
         gpu._last_failure.clear()
-        rt = runtimes.DockerLikeRuntime("no-such-container-runtime-xyz")
-        ref = {"kind": "container", "runtime": "no-such-container-runtime-xyz", "name": "a"}
-        with mock.patch("gpu_game_guard.util.log") as log:
+        calls = []
+
+        def popen(args, **kwargs):
+            calls.append(list(args))
+            raise FileNotFoundError(2, "No such file or directory")
+
+        rt = runtimes.DockerLikeRuntime("fake-runtime", lambda: {}, run=gpu.run_command)
+        ref = {"kind": "container", "runtime": "fake-runtime", "name": "a"}
+        with mock.patch("gpu_game_guard.util.log") as log, mock.patch("subprocess.Popen", side_effect=popen):
             rt.stop([ref])
-            rt.start([ref])
+            self.assertEqual(rt.start([ref]), [ref])
             self.assertEqual(rt.running_gpu_targets(), [])
             self.assertEqual(log.call_count, 3, "one line per subcommand")
             rt.stop([ref])
             rt.start([ref])
             self.assertEqual(rt.running_gpu_targets(), [])
         self.assertEqual(log.call_count, 3)
+        self.assertEqual(len(calls), 6)
 
     def test_installed_follows_the_command_on_path(self):
         with mock.patch("shutil.which", side_effect=lambda c: "/usr/bin/docker" if c == "docker" else None):
-            self.assertTrue(runtimes.DockerLikeRuntime("docker").installed())
-            self.assertFalse(runtimes.DockerLikeRuntime("podman").installed())
+            self.assertTrue(runtimes.DockerLikeRuntime("docker", lambda: {}, FakeRunner()).installed())
+            self.assertFalse(runtimes.DockerLikeRuntime("podman", lambda: {}, FakeRunner()).installed())
 
     def test_available(self):
         self.assertTrue(self.runtime(answers={("docker", "version"): "Client: x\n"})[0].available())
         self.assertFalse(self.runtime()[0].available())
-        with mock.patch("gpu_game_guard.util.log"):
-            self.assertFalse(runtimes.DockerLikeRuntime("no-such-container-runtime-xyz").available())
+        self.assertFalse(runtimes.DockerLikeRuntime("podman", lambda: {}, FakeRunner()).available())
 
 
 class BuildTests(unittest.TestCase):
@@ -282,17 +307,20 @@ class BuildTests(unittest.TestCase):
         self.assertEqual([r.name for r in built], ["process", "docker", "service", "command"])
 
     def test_every_runtime_has_installed_and_available(self):
-        for runtime in runtimes.build(["docker", "podman", "service", "command", "process"], lambda: None):
-            with self.subTest(runtime.name):
-                self.assertIsInstance(runtime.installed(), bool)
-                self.assertIsInstance(runtime.available(), bool)
-        for runtime in runtimes.build(["command", "process", "service"], lambda: None):
-            self.assertTrue(runtime.installed())
-        self.assertTrue(runtimes.build(["command"], lambda: None)[0].available())
-
-
-if __name__ == "__main__":
-    unittest.main()
+        with mock.patch("gpu_game_guard.gpu.run_command", return_value=None), \
+                mock.patch("gpu_game_guard.gpu.run_process", return_value=None), \
+                mock.patch("shutil.which", return_value=None):
+            built = runtimes.build(["docker", "podman", "service", "command", "process"], lambda: None)
+            for runtime in built:
+                with self.subTest(runtime.name):
+                    self.assertIsInstance(runtime.installed(), bool)
+                    self.assertIsInstance(runtime.available(), bool)
+            by_name = {runtime.name: runtime for runtime in built}
+            self.assertFalse(by_name["docker"].installed())
+            self.assertFalse(by_name["podman"].available())
+            for name in ("command", "process", "service"):
+                self.assertTrue(by_name[name].installed())
+            self.assertTrue(by_name["command"].available())
 
 
 class MissingContainerMemoryTests(unittest.TestCase):
@@ -315,3 +343,13 @@ class MissingContainerMemoryTests(unittest.TestCase):
 
     def test_nothing_measurable_is_unknown(self):
         self.assertIsNone(self.targets(None)[0].vram_mib)
+
+    def test_a_container_with_an_unreported_process_is_unknown_even_when_partly_measured(self):
+        reading = gpu.Measurement({"f" * 64: 100})
+        reading.authoritative = False
+        reading.unknown.add("f" * 64)
+        self.assertIsNone(self.targets(reading)[0].vram_mib)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -4,6 +4,8 @@ containers and services are paused, and what happens afterwards. Every control w
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import math
 import re
 import time
 from typing import Callable, Dict, List, Optional, Tuple
@@ -12,8 +14,9 @@ from ..config import AFTER_GAME, ON_LAUNCH, Config, TargetSpec
 from ..discovery import Candidate
 from ..status import Status
 from . import theme
+from .advanced_common import set_switch
 from .qt import QtCore, QtGui, QtWidgets
-from .settings_model import SettingsModel
+from .settings_model import STATE_DISABLED, STATE_OFF, STATE_PAUSED, STATE_RESTART, SettingsModel, service_state
 
 Qt = QtCore.Qt
 SPACE = theme.SPACE
@@ -51,24 +54,55 @@ def format_memory(mib: Optional[int]) -> str:
     return f"{mib / 1024:.1f} GiB" if mib >= 1024 else f"{mib} MiB"
 
 
-def clock_text(until: float, now: Optional[float] = None) -> str:
-    """A local wall-clock time such as "3:40 PM", with the weekday when it is not today."""
-    moment = time.localtime(until)
-    today = time.localtime(time.time() if now is None else now)
-    text = time.strftime("%I:%M %p", moment).lstrip("0")
+_WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+UNTIL_RESUMED = "until you resume it"
+
+
+def _clock(until: float, now: Optional[float] = None) -> Optional[str]:
+    """The 24-hour wall-clock time of `until`, with the weekday when it is not today; None when `until` is not a
+    time the platform can represent (an end beyond the year 9999 counts as no end)."""
+    try:
+        if not math.isfinite(until):
+            return None
+        moment = time.localtime(until)
+        today = time.localtime(time.time() if now is None else now)
+    except (OverflowError, OSError, ValueError, TypeError):
+        return None
+    if moment.tm_year > 9999:
+        return None
+    text = f"{moment.tm_hour:02d}:{moment.tm_min:02d}"
     if (moment.tm_year, moment.tm_yday) == (today.tm_year, today.tm_yday):
         return text
-    return f"{time.strftime('%a', moment)} {text}"
+    return f"{_WEEKDAYS[moment.tm_wday]} {text}"
+
+
+def clock_text(until: float, now: Optional[float] = None) -> str:
+    """A local wall-clock time such as "15:40", with the weekday when it is not today, in the 24-hour form whatever
+    the locale. A value that is not a representable time gives "until resumed"."""
+    return _clock(until, now) or "until resumed"
 
 
 def things(count: int) -> str:
     return f"{count} thing" if count == 1 else f"{count} things"
 
 
+def unique_label(title: str, targets: List[TargetSpec]) -> str:
+    """`title`, made different (ignoring case) from the label every target is shown under, which the
+    configuration requires."""
+    used = {(t.label or t.id).strip().lower() for t in targets}
+    candidate, number = title, 1
+    while candidate.strip().lower() in used:
+        number += 1
+        candidate = f"{title} ({number})"
+    return candidate
+
+
 def slug_id(unit: str, taken: List[str]) -> str:
     """A target id for a unit: lower case, `[a-z0-9_-]`, at most 40 characters, unique among `taken`."""
     stem = unit[:-len(".service")] if unit.endswith(".service") else unit
-    base = re.sub(r"[^a-z0-9_-]+", "-", stem.lower()).strip("-_")[:40].strip("-_") or "service"
+    base = re.sub(r"[^a-z0-9_-]+", "-", stem.lower()).strip("-_")[:40].strip("-_")
+    if not base:
+        base = "service-" + hashlib.sha1(unit.encode("utf-8", "replace")).hexdigest()[:8] if unit else "service"
     candidate, number = base, 1
     while candidate in taken:
         number += 1
@@ -208,9 +242,9 @@ class ItemRow(QtWidgets.QWidget):
         texts.addWidget(self.subtitle_label)
         row.addLayout(texts, 1)
         self.badge = theme.Badge(item.memory, "muted")
-        self.badge.setToolTip("GPU memory in use")
+        theme.plain_tooltip(self.badge, "GPU memory in use")
         row.addWidget(self.badge, 0, Qt.AlignVCenter)
-        self.switch = theme.ToggleSwitch(item.on, accessible_name=f"Pause {item.title} while gaming")
+        self.switch = theme.ToggleSwitch(item.on, accessible_name=f"Pause {theme.safe_text(item.title)} while gaming")
         self.switch.toggled.connect(lambda checked: on_toggle(self.item, checked))
         row.addWidget(self.switch, 0, Qt.AlignVCenter)
         self.update_item(item)
@@ -220,31 +254,31 @@ class ItemRow(QtWidgets.QWidget):
         self.title_label.setText(item.title)
         self.subtitle_label.setText(item.subtitle)
         self.badge.setText(item.memory)
-        self.switch.blockSignals(True)
-        self.switch.setChecked(item.on)
-        self.switch.blockSignals(False)
-        self.switch.update()
+        self.switch.setAccessibleName(f"Pause {theme.safe_text(item.title)} while gaming")
+        set_switch(self.switch, item.on)
         self.switch.setEnabled(not item.locked)
-        self.switch.setToolTip(item.locked)
+        theme.plain_tooltip(self.switch, item.locked)
 
 
 def describe(model: SettingsModel, status: Optional[Status], active: int, now: Optional[float] = None
              ) -> Tuple[str, str, str, str]:
     """(state key, headline, detail, icon state) for the status card. State keys: "watching", "paused", "off",
-    "disabled"."""
-    paused, until = model.paused()
-    if status is None:
+    "disabled", "restart-pending". The state is the one the header pill shows, from `service_state`."""
+    state, until = service_state(model, status, now)
+    if state == STATE_OFF:
         return ("off", "GPU Game Guard is not running", "Nothing will be paused until it is started.", "off")
-    if paused or status.paused:
-        if until is None and status.paused and status.paused_until not in (None, float("inf")):
-            until = status.paused_until
-        when = f"until {clock_text(until, now)}" if until is not None else "until you resume it"
+    if state == STATE_PAUSED:
+        clock = _clock(until, now) if until is not None else None
+        when = f"until {clock}" if clock else UNTIL_RESUMED
         return ("paused", f"GPU Game Guard is paused {when}",
                 "Games start as usual and nothing is stopped.", "paused")
-    if not model.saved.enabled or status.state == "disabled":
+    if state == STATE_RESTART:
+        return ("restart-pending", "GPU Game Guard needs a restart",
+                "Some saved changes take effect after the service restarts.", "attention")
+    if state == STATE_DISABLED:
         return ("disabled", "GPU Game Guard is switched off", "Games start as usual until it is switched on.", "off")
-    if status.stopped:
-        names = ", ".join(friendly_name(str(ref.get("name", ""))) for ref in status.stopped[:3])
+    if status is not None and status.stopped:
+        names = ", ".join(friendly_name(theme.safe_text(ref.get("name", ""))) for ref in status.stopped[:3])
         more = f" and {len(status.stopped) - 3} more" if len(status.stopped) > 3 else ""
         return ("watching", "GPU Game Guard is watching", f"Paused for the current game: {names}{more}.", "ok")
     if active == 0:
@@ -372,6 +406,10 @@ class BasicView(QtWidgets.QWidget):
         self.rows_layout = QtWidgets.QVBoxLayout()
         self.rows_layout.setSpacing(0)
         card.addLayout(self.rows_layout)
+        self.auto_button = theme.button("Turn automatic detection on")
+        theme.plain_tooltip(self.auto_button, "Containers are not paused while automatic detection is off.")
+        self.auto_button.clicked.connect(lambda: self.model.update(auto_containers=True))
+        card.addWidget(self.auto_button, 0, Qt.AlignLeft)
         self.empty_label = theme.styled_label("", "muted")
         self.empty_label.setAlignment(Qt.AlignCenter)
         self.empty_label.setMinimumHeight(6 * SPACE)
@@ -381,13 +419,10 @@ class BasicView(QtWidgets.QWidget):
     # data
 
     def load(self, refresh: bool = False) -> None:
-        """Look for things that could be paused (the first call, or `refresh`) and show them."""
-        self.refresh_button.setEnabled(False)
-        try:
-            self.model.candidates(refresh)
-        finally:
-            self.refresh_button.setEnabled(True)
+        """Look for things that could be paused (the first call, or `refresh`) and show them. The search runs in
+        the background; the list shows "Scanning..." until it is in."""
         self._loaded = True
+        self.model.scan(refresh)
         self.sync()
 
     def items(self) -> List[Item]:
@@ -395,17 +430,19 @@ class BasicView(QtWidgets.QWidget):
         config = self.model.config
         found: List[Item] = []
         seen = set()
-        for candidate in self.model.candidates(False) if self._loaded else []:
+        for candidate in self.model.cached_candidates() if self._loaded else []:
             item = self._item_for(candidate, config)
             if item is not None:
                 found.append(item)
                 seen.add((item.kind, item.name, item.scope))
         for spec in config.targets:
             if spec.kind == "service" and ("service", spec.unit, spec.scope) not in seen:
+                seen.add(("service", spec.unit, spec.scope))
                 found.append(Item("service", f"service:{spec.scope}:{spec.unit}", spec.unit,
                                   spec.label if spec.label and spec.label != spec.id else friendly_name(spec.unit),
                                   spec.unit + (" (user service)" if spec.scope == "user" else ""), "idle",
-                                  spec.enabled, spec.scope))
+                                  any(s.enabled for s in self._find_services(config, spec.unit, spec.scope)),
+                                  spec.scope))
         return found
 
     @staticmethod
@@ -415,21 +452,31 @@ class BasicView(QtWidgets.QWidget):
             subtitle = image or candidate.detail
             locked = ""
             ignored = config.is_ignored(candidate.name)
-            if ignored and candidate.name not in config.ignore_containers:
+            if not config.auto_containers:
+                locked = ("Automatic detection of containers is off, so this one is not paused. "
+                          "Turn automatic detection on to manage it.")
+            elif ignored and candidate.name not in config.ignore_containers:
                 locked = "Ignored by a pattern in Advanced"
             return Item("container", candidate.key, candidate.name, friendly_name(candidate.name), subtitle,
                         format_memory(candidate.vram_mib), config.auto_containers and not ignored, locked=locked)
         if candidate.kind == "service":
             scope = (candidate.spec or {}).get("scope", "system")
-            spec = BasicView._find_service(config, candidate.name, scope)
+            specs = BasicView._find_services(config, candidate.name, scope)
             return Item("service", candidate.key, candidate.name, friendly_name(candidate.name),
                         candidate.name + (" (user service)" if scope == "user" else ""),
-                        format_memory(candidate.vram_mib), bool(spec and spec.enabled), scope)
+                        format_memory(candidate.vram_mib), any(s.enabled for s in specs), scope)
         return None
 
     @staticmethod
-    def _find_service(config: Config, unit: str, scope: str) -> Optional[TargetSpec]:
-        return next((t for t in config.targets if t.kind == "service" and t.unit == unit and t.scope == scope), None)
+    def _find_services(config: Config, unit: str, scope: str) -> List[TargetSpec]:
+        """Every configured service target for a unit and scope, however many a hand-made file holds."""
+        return [t for t in config.targets if t.kind == "service" and t.unit == unit and t.scope == scope]
+
+    def active_count(self) -> int:
+        """How many things are set to be paused: the switched-on rows plus the enabled command and process
+        targets, which have no row here."""
+        hidden = sum(1 for t in self.model.config.targets if t.kind in ("command", "process") and t.enabled)
+        return sum(1 for item in self.items() if item.on) + hidden
 
     # updates
 
@@ -445,16 +492,21 @@ class BasicView(QtWidgets.QWidget):
         else:
             for row, item in zip(self._rows, items):
                 row.update_item(item)
-        if self._loaded:
-            self.empty_label.setText("Nothing is using the GPU right now. Start your apps and press Refresh.")
+        scanning = bool(self.model.scanning)
+        if scanning or not self._loaded:
+            self.empty_label.setText("Scanning...")
         else:
-            self.empty_label.setText("Looking for apps that use your graphics card...")
+            self.empty_label.setText("Nothing is using the GPU right now. Start your apps and press Refresh.")
+        self.refresh_button.setEnabled(not scanning)
+        self.refresh_button.setText("Scanning..." if self.model.scanning else "Refresh")
+        self.auto_button.setVisible(not config.auto_containers)
         self.empty_label.setVisible(not items)
         self.refresh_status()
 
     def _rebuild(self, items: List[Item], keys: List[Tuple[str, str]]) -> None:
         for widget in self._widgets:
             self.rows_layout.removeWidget(widget)
+            widget.hide()
             widget.deleteLater()
         self._rows, self._widgets = [], []
         for index, item in enumerate(items):
@@ -472,11 +524,11 @@ class BasicView(QtWidgets.QWidget):
     def refresh_status(self, now: Optional[float] = None) -> None:
         """Update the status card from the service's status and the pause state."""
         status = self.model.status()
-        active = sum(1 for item in self.items() if item.on)
+        active = self.active_count()
         state, headline, detail, icon = describe(self.model, status, active, now)
         self.state = state
-        self.headline.setText(headline)
-        self.detail.setText(detail)
+        self.headline.setText(theme.safe_text(headline))
+        self.detail.setText(theme.safe_text(detail))
         self.status_icon.setPixmap(theme.app_icon(icon).pixmap(48, 48))
         enabled = self.model.config.enabled
         paused = state == "paused"
@@ -488,24 +540,19 @@ class BasicView(QtWidgets.QWidget):
         self.button_row.setVisible(not (state == "off" and enabled))
 
     def _toggled(self, item: Item, on: bool) -> None:
+        config = self.model.config
         if item.kind == "container":
-            ignored = [name for name in self.model.config.ignore_containers if name != item.name]
-            if on:
-                if not self.model.config.auto_containers:
-                    self.model.update(auto_containers=True, ignore_containers=ignored)
-                else:
-                    self.model.update(ignore_containers=ignored)
-            else:
-                self.model.update(ignore_containers=ignored + [item.name])
+            ignored = [name for name in config.ignore_containers if name != item.name]
+            self.model.update(ignore_containers=ignored if on else ignored + [item.name])
             return
-        existing = self._find_service(self.model.config, item.name, item.scope)
-        if not on:
-            if existing is not None:
-                self.model.remove_target(existing.id)
+        specs = self._find_services(config, item.name, item.scope)
+        if specs:
+            changed = [dataclasses.replace(spec, enabled=on) for spec in specs if spec.enabled != on]
+            for spec in changed:
+                self.model.set_target(spec)
             return
-        if existing is not None:
-            self.model.set_target(dataclasses.replace(existing, enabled=True))
-            return
-        taken = [t.id for t in self.model.config.targets]
-        self.model.set_target(TargetSpec(id=slug_id(item.name, taken), kind="service", label=item.title,
-                                         unit=item.name, scope=item.scope))
+        if on:
+            taken = [t.id for t in config.targets]
+            self.model.set_target(TargetSpec(id=slug_id(item.name, taken), kind="service",
+                                             label=unique_label(item.title, config.targets), unit=item.name,
+                                             scope=item.scope))

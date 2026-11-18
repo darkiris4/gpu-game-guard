@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import os
+import signal
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -43,6 +46,11 @@ class CgroupTests(unittest.TestCase):
         self.assertIsNone(gpu.container_id_from_cgroup("0::/system.slice/docker-abc.scope\n"))
 
 
+def py(code, *extra):
+    """An argument list running a Python snippet with the interpreter running the tests."""
+    return [sys.executable, "-c", code, *extra]
+
+
 class RunCommandTests(unittest.TestCase):
     def setUp(self):
         gpu._last_failure.clear()
@@ -52,26 +60,32 @@ class RunCommandTests(unittest.TestCase):
             for _ in range(5):
                 gpu.run_command(["definitely-not-a-real-binary-xyz"])
             self.assertEqual(log.call_count, 1)
-            gpu.run_command(["sh", "-c", "exit 4"])
-            gpu.run_command(["sh", "-c", "exit 4"])
+            gpu.run_command(py("import sys; sys.exit(4)"))
+            gpu.run_command(py("import sys; sys.exit(4)"))
             self.assertEqual(log.call_count, 2, "a different failure of another command is logged")
-            self.assertEqual(gpu.run_command(["echo", "ok"]), "ok\n")
+            self.assertEqual(gpu.run_command(py("print('ok')")), "ok\n")
             gpu.run_command(["definitely-not-a-real-binary-xyz"])
             self.assertEqual(log.call_count, 2, "a different command succeeding does not reset the first one's failure")
 
     def test_a_failure_logs_again_after_the_same_command_succeeds(self):
+        code = "import sys; sys.exit(int(sys.argv[1]))"
         with mock.patch("gpu_game_guard.util.log") as log:
-            gpu.run_command(["sh", "-c", "exit 4"])
-            self.assertEqual(gpu.run_command(["sh", "-c", "exit 0"]), "")
-            gpu.run_command(["sh", "-c", "exit 4"])
-            self.assertEqual(log.call_count, 2, "sh failed, sh recovered then failed again: two lines")
+            gpu.run_command(py(code, "4"))
+            self.assertEqual(gpu.run_command(py(code, "0")), "")
+            gpu.run_command(py(code, "4"))
+            self.assertEqual(log.call_count, 2, "the same program failed, recovered, then failed again: two lines")
 
     def test_subcommand_failures_are_tracked_separately(self):
+        script = "import sys; sys.exit(int(sys.argv[1]))"
         with mock.patch("gpu_game_guard.util.log") as log:
-            gpu.run_command(["ls", "/no/such/path-xyz"])
-            gpu.run_command(["ls", "/"])  # the same command with another second argument succeeding
-            gpu.run_command(["ls", "/no/such/path-xyz"])
-            self.assertEqual(log.call_count, 1)
+            gpu.run_command(["definitely-not-a-real-binary-xyz", "a"])
+            gpu.run_command(["definitely-not-a-real-binary-xyz", "b"])
+            gpu.run_command(["definitely-not-a-real-binary-xyz", "a"])
+            self.assertEqual(log.call_count, 2, "the second argument is part of the key")
+            gpu.run_command(py(script, "1"))
+            gpu.run_command(py(script, "0"))
+            gpu.run_command(py(script, "1"))
+            self.assertEqual(log.call_count, 4)
 
     def test_failure_keys_are_bounded(self):
         with mock.patch("gpu_game_guard.util.log"):
@@ -80,17 +94,17 @@ class RunCommandTests(unittest.TestCase):
         self.assertLessEqual(len(gpu._last_failure), gpu._MAX_FAILURE_KEYS)
 
     def test_keep_output_on_failure(self):
-        script = "echo partial; echo broken >&2; exit 1"
+        script = "import sys; print('partial'); sys.stderr.write('broken\\n'); sys.exit(1)"
         with mock.patch("gpu_game_guard.util.log") as log:
-            self.assertIsNone(gpu.run_command(["sh", "-c", script]))
-            self.assertEqual(gpu.run_command(["sh", "-c", script], keep_output=True), "partial\n")
-            self.assertIsNone(gpu.run_command(["sh", "-c", "echo broken >&2; exit 1"], keep_output=True))
-        self.assertEqual(log.call_count, 1, "the same failure is logged once")
+            self.assertIsNone(gpu.run_command(py(script)))
+            self.assertEqual(gpu.run_command(py(script), keep_output=True), "partial\n")
+            self.assertIsNone(gpu.run_command(py("import sys; sys.stderr.write('broken\\n'); sys.exit(1)"), keep_output=True))
+        self.assertEqual(log.call_count, 2, "the same failure is logged once; the other program has its own key")
 
     def test_embedded_nul_and_undecodable_output(self):
         with mock.patch("gpu_game_guard.util.log") as log:
-            self.assertIsNone(gpu.run_command(["echo", "a\x00b"]))
-            out = gpu.run_command(["sh", "-c", "printf '\\377ok'"])
+            self.assertIsNone(gpu.run_command([sys.executable, "a\x00b"]))
+            out = gpu.run_command(py("import sys; sys.stdout.buffer.write(b'\\xffok')"))
         self.assertEqual(log.call_count, 1)
         self.assertTrue(out.endswith("ok"))
 
@@ -101,17 +115,136 @@ class RunCommandTests(unittest.TestCase):
 
     def test_non_zero_exit(self):
         with mock.patch("gpu_game_guard.util.log") as log:
-            self.assertIsNone(gpu.run_command(["sh", "-c", "echo broken >&2; exit 3"]))
+            self.assertIsNone(gpu.run_command(py("import sys; sys.stderr.write('broken\\n'); sys.exit(3)")))
         self.assertEqual(log.call_count, 1)
         self.assertIn("broken", log.call_args[0][0])
+        self.assertIn("status 3", log.call_args[0][0])
 
     def test_timeout(self):
         with mock.patch("gpu_game_guard.util.log") as log:
-            self.assertIsNone(gpu.run_command(["sleep", "5"], timeout=0.1))
+            self.assertIsNone(gpu.run_command(py("import time; time.sleep(5)"), timeout=0.1))
         self.assertEqual(log.call_count, 1)
 
     def test_success(self):
-        self.assertEqual(gpu.run_command(["echo", "hi"]), "hi\n")
+        self.assertEqual(gpu.run_command(py("print('hi')")), "hi\n")
+
+
+class ExecutionTests(unittest.TestCase):
+    """How commands the guard runs itself are executed: files instead of pipes, own session, bounded output."""
+
+    def setUp(self):
+        gpu._last_failure.clear()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_a_background_grandchild_holding_the_output_does_not_delay_the_call(self):
+        pidfile = Path(self.tmp.name) / "pid"
+        code = ("import subprocess, sys\n"
+                "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+                "open(sys.argv[1], 'w').write(str(child.pid))\n"
+                "print('parent done')\n")
+        started = time.monotonic()
+        result = gpu.run_process(py(code, str(pidfile)), timeout=20)
+        elapsed = time.monotonic() - started
+        grandchild = int(pidfile.read_text())
+        try:
+            self.assertEqual((result.returncode, result.stdout.strip()), (0, "parent done"))
+            self.assertLess(elapsed, 10)
+        finally:
+            os.kill(grandchild, signal.SIGKILL)
+
+    def test_a_timeout_ends_the_whole_process_group(self):
+        pidfile = Path(self.tmp.name) / "pid"
+        code = ("import subprocess, sys, time\n"
+                "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+                "open(sys.argv[1], 'w').write(str(child.pid))\n"
+                "time.sleep(60)\n")
+        with mock.patch("gpu_game_guard.util.log"):
+            self.assertIsNone(gpu.run_process(py(code, str(pidfile)), timeout=1.5))
+        grandchild = int(pidfile.read_text())
+        try:
+            for _ in range(50):
+                try:
+                    state = Path(f"/proc/{grandchild}/stat").read_text().rsplit(")", 1)[1].split()[0]
+                except OSError:
+                    state = "gone"
+                if state in ("gone", "Z"):
+                    break
+                time.sleep(0.1)
+            self.assertIn(state, ("gone", "Z"))
+        finally:
+            try:
+                os.kill(grandchild, signal.SIGKILL)
+            except OSError:
+                pass
+
+    def test_a_command_that_ignores_sigterm_is_killed_after_the_grace_period(self):
+        code = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+        started = time.monotonic()
+        with mock.patch("gpu_game_guard.util.log"), mock.patch.object(gpu, "_KILL_GRACE", 0.5):
+            self.assertIsNone(gpu.run_process(py(code), timeout=0.5))
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_the_command_runs_in_its_own_session(self):
+        result = gpu.run_process(py("import os; print(os.getsid(0) == os.getpid())"))
+        self.assertEqual(result.stdout.strip(), "True")
+
+    def test_output_is_read_back_up_to_one_mebibyte_per_stream(self):
+        code = "import sys; sys.stdout.write('a' * (3 * 1024 * 1024)); sys.stderr.write('b' * (2 * 1024 * 1024))"
+        result = gpu.run_process(py(code))
+        self.assertEqual((len(result.stdout), len(result.stderr)), (1024 * 1024, 1024 * 1024))
+
+    def test_stdin_is_closed(self):
+        result = gpu.run_process(py("import sys; print(repr(sys.stdin.read()))"))
+        self.assertEqual(result.stdout.strip(), "''")
+
+
+class LoggingTests(unittest.TestCase):
+    def setUp(self):
+        gpu._last_failure.clear()
+
+    def test_the_key_is_the_first_two_arguments(self):
+        self.assertEqual(gpu._command_key(["systemctl", "--user", "stop", "x"]), "systemctl --user")
+        self.assertEqual(gpu._command_key(["ls"]), "ls")
+
+    def test_interpreter_programs_are_keyed_by_a_hash_of_the_program(self):
+        one = gpu._command_key(["python3", "-c", "print(1)"])
+        two = gpu._command_key(["python3", "-c", "print(2)"])
+        self.assertNotEqual(one, two)
+        self.assertEqual(one, gpu._command_key(["python3", "-c", "print(1)", "extra"]))
+        self.assertTrue(one.startswith("python3 "))
+        self.assertNotIn("print", one)
+        self.assertNotEqual(gpu._command_key(["python3", "-m", "a"]), gpu._command_key(["python3", "-m", "b"]))
+        self.assertEqual(gpu._command_key(["python3", "script.py", "x"]), "python3 script.py")
+
+    def test_different_programs_through_one_interpreter_log_separately(self):
+        with mock.patch("gpu_game_guard.util.log") as log:
+            gpu.run_command(py("import sys; sys.exit(1)"))
+            gpu.run_command(py("import sys; sys.exit(2)"))
+        self.assertEqual(log.call_count, 2)
+
+    def test_logged_text_is_truncated(self):
+        with mock.patch("gpu_game_guard.util.log") as log:
+            gpu.log_once("k" * 500, "m" * 500)
+        line = log.call_args[0][0]
+        self.assertLessEqual(len(line), 200 + 2 + 200)
+        self.assertTrue(line.endswith("..."))
+
+    def test_a_long_error_detail_is_truncated(self):
+        with mock.patch("gpu_game_guard.util.log") as log:
+            gpu.run_command(py("import sys; sys.stderr.write('x' * 1000); sys.exit(1)"))
+        self.assertLess(len(log.call_args[0][0]), 450)
+
+
+class ValidUnitTests(unittest.TestCase):
+    def test_accepted(self):
+        for unit in ("ollama.service", "getty@tty1.service", "a:b_c-d.service", "A.1.service"):
+            self.assertTrue(gpu.valid_unit(unit), unit)
+
+    def test_refused(self):
+        for unit in ("-x.service", "--user.service", "a*.service", "a?.service", "a[b].service", "a b.service",
+                     "a/b.service", "x.timer", ".service", "", "x.service\n", None, 5):
+            self.assertFalse(gpu.valid_unit(unit), repr(unit))
 
 
 class TotalsTests(unittest.TestCase):
@@ -328,12 +461,27 @@ class HostSpecTests(unittest.TestCase):
             gpu.usable_specs(self.config(bad, good, off, other), "service")
         self.assertEqual(log.call_count, 1)
 
-    def test_empty_and_invalid_lists_log_once_and_return_nothing(self):
+    def test_an_empty_list_is_silent_and_an_unusable_config_logs_once(self):
         with mock.patch("gpu_game_guard.util.log") as log:
             self.assertEqual(gpu.usable_specs(self.config(), "command"), [])
             self.assertEqual(gpu.usable_specs(self.config(), "command"), [])
+            self.assertEqual(log.call_count, 0)
+            self.assertEqual(gpu.usable_specs(lambda: types.SimpleNamespace(targets=None), "process"), [])
             self.assertEqual(gpu.usable_specs(lambda: types.SimpleNamespace(targets=None), "process"), [])
             self.assertEqual(gpu.usable_specs(lambda: 1 / 0, "service"), [])
+            self.assertEqual(log.call_count, 2)
+
+    def test_disabled_specs_are_returned_on_request(self):
+        off = types.SimpleNamespace(id="c", kind="service", unit="c.service", scope="user", enabled=False)
+        self.assertEqual(gpu.usable_specs(self.config(off), "service"), [])
+        self.assertEqual(gpu.usable_specs(self.config(off), "service", include_disabled=True), [off])
+        self.assertIs(gpu.find_spec(self.config(off), "service", {"id": "c"}, include_disabled=True), off)
+
+    def test_service_units_are_validated_strictly(self):
+        bad = [types.SimpleNamespace(id=f"b{n}", kind="service", unit=unit, scope="system", enabled=True)
+               for n, unit in enumerate(("-x.service", "a*.service", "a[b].service"))]
+        with mock.patch("gpu_game_guard.util.log") as log:
+            self.assertEqual(gpu.usable_specs(self.config(*bad), "service"), [])
         self.assertEqual(log.call_count, 3)
 
     def test_find_spec_and_own_refs(self):
@@ -366,10 +514,6 @@ class RunProcessTests(unittest.TestCase):
             self.assertIsNone(gpu.run_process([sys.executable, "-c", "import time; time.sleep(5)"], timeout=0.2))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class MeasurementTests(unittest.TestCase):
     def test_nvidia_results_are_authoritative_and_fdinfo_results_are_not(self):
         with tempfile.TemporaryDirectory() as root:
@@ -383,3 +527,45 @@ class MeasurementTests(unittest.TestCase):
             result = gpu.vram_by_container(proc, run=lambda *a, **k: None)
             self.assertEqual(result, {"a" * 64: 2})
             self.assertFalse(result.authoritative)
+
+
+class NotAvailableMemoryTests(unittest.TestCase):
+    """nvidia-smi prints "[N/A]" for processes whose memory it cannot report; that is unknown, never zero."""
+
+    def smi(self, rows):
+        return lambda args, **_: rows
+
+    def test_a_pid_without_a_figure_makes_the_reading_non_authoritative(self):
+        result = gpu.vram_by_pid(Path("/nonexistent"), run=self.smi("10, 300\n11, [N/A]\n"))
+        self.assertEqual(dict(result), {10: 300})
+        self.assertFalse(result.authoritative)
+        self.assertEqual(result.unknown, {11})
+        self.assertIsNone(gpu.memory_for_pids(result, [11]))
+        self.assertIsNone(gpu.memory_for_pids(result, [10, 11]), "a partial sum is not offered as the figure")
+        self.assertEqual(gpu.memory_for_pids(result, [10]), 300)
+        self.assertIsNone(gpu.memory_for_pids(result, [99]))
+
+    def test_a_complete_reading_stays_authoritative(self):
+        result = gpu.vram_by_pid(Path("/nonexistent"), run=self.smi("10, 300\n"))
+        self.assertTrue(result.authoritative)
+        self.assertEqual(gpu.memory_for_pids(result, [99]), 0)
+
+    def test_a_container_with_an_unreported_process_is_unknown(self):
+        with tempfile.TemporaryDirectory() as root:
+            proc = Path(root)
+            for pid, container in (("10", CONTAINER), ("11", OTHER)):
+                (proc / pid).mkdir()
+                (proc / pid / "cgroup").write_text(f"0::/system.slice/docker-{container}.scope\n")
+            result = gpu.vram_by_container(proc, run=self.smi("10, 100\n11, [N/A]\n"))
+        self.assertEqual(dict(result), {CONTAINER: 100})
+        self.assertFalse(result.authoritative)
+        self.assertEqual(result.unknown, {OTHER})
+
+    def test_the_user_manager_uid_of_a_cgroup(self):
+        own = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/x.service\n"
+        self.assertEqual(gpu.user_manager_uid(own), 1000)
+        self.assertIsNone(gpu.user_manager_uid("0::/system.slice/x.service\n"))
+
+
+if __name__ == "__main__":
+    unittest.main()

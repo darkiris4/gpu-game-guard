@@ -6,8 +6,8 @@ from typing import Any, List, Optional
 
 from .. import config as config_module
 from ..discovery import BUILTIN_PROTECT
-from .advanced_common import (NUMBER_RANGES, ListEditor, RestartNote, ScrolledTab, divider, mono_font, quiet,
-                              setting_row)
+from .advanced_common import (NUMBER_RANGES, ListEditor, RestartNote, ScrolledTab, divider, mono_font, plain_tip,
+                              quiet, set_switch, setting_row)
 from .qt import QtCore, QtWidgets
 from .theme import SPACE, Card, ToggleSwitch, button, styled_label
 
@@ -23,8 +23,12 @@ KNOWN_RUNTIMES = list(config_module.DEFAULT_RUNTIMES)
 
 
 def runtime_order(config_runtimes: List[str]) -> List[str]:
-    """The runtimes as listed in the editor: the configured ones in order, then the remaining known ones."""
-    first = [r for r in config_runtimes if r in KNOWN_RUNTIMES]
+    """The runtimes as listed in the editor: the configured ones in order, unknown names included, then the
+    remaining known ones."""
+    first: List[str] = []
+    for name in config_runtimes:
+        if name not in first:
+            first.append(name)
     return first + [r for r in KNOWN_RUNTIMES if r not in first]
 
 
@@ -77,7 +81,8 @@ class DetectionTab(ScrolledTab):
         self.heavy_spin = QtWidgets.QSpinBox()
         self.heavy_spin.setRange(int(low), int(high))
         self.heavy_spin.setSuffix(" MiB")
-        self.heavy_spin.setKeyboardTracking(False)
+        self.heavy_spin.setKeyboardTracking(True)
+        self.heavy_spin.setAccessibleName("Heavy workload threshold in MiB")
         self.heavy_spin.setMinimumWidth(150)
         limits.addWidget(setting_row(
             "Heavy workload threshold",
@@ -129,8 +134,8 @@ class DetectionTab(ScrolledTab):
 
     def refresh(self) -> None:
         config = self.model.config
-        with quiet(self.auto_switch, self.heavy_spin):
-            self.auto_switch.setChecked(config.auto_containers)
+        set_switch(self.auto_switch, config.auto_containers)
+        with quiet(self.heavy_spin):
             if self.heavy_spin.value() != config.heavy_vram_mib:
                 self.heavy_spin.setValue(config.heavy_vram_mib)
         self.ignore_editor.set_items(list(config.ignore_containers))
@@ -140,31 +145,43 @@ class DetectionTab(ScrolledTab):
 
     # Runtime order and selection.
     def _load_runtimes(self, enabled: List[str]) -> None:
-        wanted = [(name, name in enabled) for name in runtime_order(enabled)]
-        if wanted != self.runtimes():
-            self._show_runtimes(wanted)
+        """Show the configured runtimes. The order on screen is kept while the enabled names it implies still equal
+        the configuration, so unticking a runtime does not move it."""
+        shown = self.runtimes()
+        if shown and [name for name, on in shown if on] == list(enabled) and {n for n, _ in shown} >= set(enabled):
+            return
+        self._show_runtimes([(name, name in enabled) for name in runtime_order(enabled)])
 
     def _show_runtimes(self, order: List[tuple]) -> None:
         current = self.runtime_list.currentRow()
         with quiet(self.runtime_list):
             self.runtime_list.clear()
             for name, on in order:
-                item = QtWidgets.QListWidgetItem(f"{name}  -  {RUNTIME_NOTES[name]}")
+                known = name in RUNTIME_NOTES
+                item = QtWidgets.QListWidgetItem(
+                    f"{name}  -  {RUNTIME_NOTES[name]}" if known else f"{name}  -  unknown (kept as it is)")
                 item.setData(Qt.UserRole, name)
-                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-                item.setCheckState(Qt.Checked if on else Qt.Unchecked)
-                item.setToolTip(f"{name}: {RUNTIME_NOTES[name]}.")
+                if known:
+                    item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                    item.setCheckState(Qt.Checked if on else Qt.Unchecked)
+                    item.setToolTip(plain_tip(f"{name}: {RUNTIME_NOTES[name]}."))
+                else:
+                    item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                    item.setToolTip(plain_tip(f"{name} is not a runtime this version knows. It stays in the "
+                                              "configuration unchanged and the guard ignores it."))
                 self.runtime_list.addItem(item)
             if 0 <= current < self.runtime_list.count():
                 self.runtime_list.setCurrentRow(current)
         self._update_move_buttons()
 
     def runtimes(self) -> List[tuple]:
-        """(name, ticked) for every row, in the order shown."""
+        """(name, enabled) for every row, in the order shown. An unknown name counts as enabled: it is kept."""
         result = []
         for i in range(self.runtime_list.count()):
             item = self.runtime_list.item(i)
-            result.append((item.data(Qt.UserRole), item.checkState() == Qt.Checked))
+            name = item.data(Qt.UserRole)
+            known = name in RUNTIME_NOTES
+            result.append((name, item.checkState() == Qt.Checked if known else True))
         return result
 
     def _write_runtimes(self) -> None:
@@ -182,7 +199,6 @@ class DetectionTab(ScrolledTab):
             return
         order = self.runtimes()
         order[row], order[target] = order[target], order[row]
-        self.model.update(runtimes=[name for name, on in order if on])
-        # An unticked runtime has no place in the saved order, so the display order is restored after the reload.
         self._show_runtimes(order)
         self.runtime_list.setCurrentRow(target)
+        self._write_runtimes()

@@ -113,5 +113,28 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual((rig.prompter.launch_asked, rig.trigger.ended), ([], []))
 
 
+class PreservationEndToEndTests(unittest.TestCase):
+    def test_a_remembered_choice_keeps_unknown_keys_and_a_concurrent_save(self):
+        rig = Rig(self, {"future": [1, 2], "games": {"steam:5": {"action": "stop", "note": "n"}}},
+                  launch="stop", remember="stop")
+        rig.trigger.launches = [make_launch(10)]
+        rig.step()
+        data = json.loads(rig.config_path.read_text())
+        self.assertEqual(data["future"], [1, 2])
+        self.assertEqual(data["games"]["steam:5"]["note"], "n")
+        self.assertEqual(data["games"]["steam:730"]["action"], "stop")
+        rig.step()  # the watcher picks up the guard's own write without complaint
+        self.assertEqual(rig.guard.config_error, None)
+
+    def test_an_invalid_file_is_left_alone_and_the_game_still_starts(self):
+        rig = Rig(self, {"on_launch": "ask"}, launch="stop", remember="stop")
+        rig.step()
+        rig.config_path.write_text("{broken")
+        rig.trigger.launches = [make_launch(10)]
+        rig.step()
+        self.assertEqual(rig.config_path.read_text(), "{broken")
+        self.assertEqual(len(rig.trigger.relaunched), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

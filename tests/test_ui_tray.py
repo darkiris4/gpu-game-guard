@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import time
 import types
 import unittest
+from pathlib import Path
 from unittest import mock
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
-from gpu_game_guard.ui import qt  # noqa: E402
+from gpu_game_guard.ui import qt, singleton  # noqa: E402
 
 if qt.available():
     from gpu_game_guard.ui import theme, tray
@@ -126,8 +128,9 @@ class TrayTests(unittest.TestCase):
 
     def test_left_click_opens_the_settings(self):
         c = self.make(status())
-        self.fake.on_activated(qt.QtWidgets.QSystemTrayIcon.Trigger)
-        self.fake.on_activated(qt.QtWidgets.QSystemTrayIcon.Context)
+        with mock.patch("gpu_game_guard.ui.tray.settings_running", return_value=False):
+            self.fake.on_activated(qt.QtWidgets.QSystemTrayIcon.Trigger)
+            self.fake.on_activated(qt.QtWidgets.QSystemTrayIcon.Context)
         self.assertEqual(self.calls, ["settings"])
         del c
 
@@ -173,11 +176,71 @@ class TrayTests(unittest.TestCase):
             tray.open_settings()
         self.assertEqual(log.call_count, 1)
 
-    def test_run_without_a_system_tray_returns_zero(self):
+    def test_run_without_a_system_tray_waits_then_returns_zero(self):
+        sleeps = []
         with mock.patch.object(qt.QtWidgets.QSystemTrayIcon, "isSystemTrayAvailable", return_value=False), \
                 mock.patch("gpu_game_guard.ui.tray.log") as log:
-            self.assertEqual(tray.run(), 0)
-        self.assertEqual(log.call_count, 1)
+            self.assertEqual(tray.run(sleep=sleeps.append), 0)
+        self.assertEqual(sleeps, [30.0] * 20)
+        self.assertEqual(log.call_count, 2)
+
+    def test_wait_for_tray_stops_when_the_tray_appears(self):
+        answers = iter([False, False, True])
+        sleeps = []
+        with mock.patch("gpu_game_guard.ui.tray.log"):
+            self.assertTrue(tray.wait_for_tray(lambda: next(answers), sleeps.append))
+        self.assertEqual(sleeps, [30.0, 30.0])
+        self.assertTrue(tray.wait_for_tray(lambda: True, sleeps.append))
+
+    def test_absurd_pause_times_read_as_until_resumed(self):
+        for until in (1e300, 2 ** 70, -1e18, float("nan"), float("-inf"), "soon", 253402300800.0, -1.0):
+            icon, line, tip = tray.describe(status(paused=True, paused_until=until))
+            self.assertEqual((icon, line), ("paused", "Paused until resumed"), until)
+            self.assertIn("until resumed", tip)
+        with mock.patch("gpu_game_guard.ui.tray.time.localtime", side_effect=OSError("range")):
+            self.assertEqual(tray.describe(status(paused=True, paused_until=5.0))[1], "Paused until resumed")
+
+    def test_asking_is_shown_while_the_file_is_valid(self):
+        now = time.time()
+        fresh = status(state="asking", game={"title": "Doom"}, updated=now - 20, valid_for=60.0)
+        self.assertEqual(tray.describe(fresh)[1], "Waiting for your answer about Doom")
+        stale = status(state="asking", game={"title": "Doom"}, updated=now - 200, valid_for=60.0)
+        self.assertEqual(tray.describe(stale)[1], "Watching for games")
+        default = status(state="asking", game={"title": "Doom"}, updated=now - 5)
+        self.assertEqual(tray.describe(default)[1], "Waiting for your answer about Doom")
+
+    def test_tooltip_is_set_only_when_it_changes(self):
+        c = self.make(status())
+        before = len(self.fake.tooltips)
+        c.refresh()
+        c.refresh()
+        self.assertEqual(len(self.fake.tooltips), before)
+        self.current = None
+        c.refresh()
+        self.assertEqual(len(self.fake.tooltips), before + 1)
+
+    def test_hostile_title_is_clean_in_the_menu_and_the_tooltip(self):
+        title = "A & B <b>x</b>\u202e\n\x00"
+        c = self.make(status(state="asking", game={"title": title}))
+        self.assertEqual(c.status_action.text(), "Waiting for your answer about A && B <b>x</b>")
+        self.assertEqual(c.menu_summary()[0][0], "Waiting for your answer about A & B <b>x</b>")
+        self.assertEqual(self.fake.tooltips[-1],
+                         "GPU Game Guard: waiting for your answer (A &amp; B &lt;b&gt;x&lt;/b&gt;)")
+        self.assertNotIn("\u202e", c.tooltip)
+
+    def test_click_does_not_start_a_second_settings_window(self):
+        c = self.make(status())
+        with tempfile.TemporaryDirectory() as tmp:
+            held = singleton.acquire("settings", Path(tmp))
+            real = singleton.acquire
+            with mock.patch("gpu_game_guard.ui.tray.singleton.acquire", lambda n: real(n, Path(tmp))):
+                self.fake.on_activated(qt.QtWidgets.QSystemTrayIcon.Trigger)
+                self.assertEqual(self.calls, [])
+                held.release()
+                self.fake.on_activated(qt.QtWidgets.QSystemTrayIcon.Trigger)
+                self.assertEqual(self.calls, ["settings"])
+                self.assertIsNotNone(real("settings", Path(tmp)))
+        del c
 
 
 if __name__ == "__main__":

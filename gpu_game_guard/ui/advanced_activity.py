@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .advanced_common import BadgeDelegate, TabBase, bold_label, clock_text, make_table, table_item
 from .qt import QtCore, QtWidgets
-from .theme import SPACE, Card, Pill, styled_label
+from .theme import SPACE, Card, Pill, safe_text, styled_label
 
 Qt = QtCore.Qt
 REFRESH_MS = 2000
@@ -30,7 +30,7 @@ def event_kind(kind: str) -> str:
 
 
 def ref_name(ref: dict) -> str:
-    return str(ref.get("name") or ref.get("unit") or ref.get("id") or "?")
+    return safe_text(ref.get("name") or ref.get("unit") or ref.get("id") or "?")
 
 
 class ActivityTab(TabBase):
@@ -76,6 +76,7 @@ class ActivityTab(TabBase):
         layout.addWidget(status)
         events = Card("Recent events", "Newest first. The list refreshes every two seconds while this tab is open.")
         self.table = make_table(["Time", "Event", "Message"], row_height=34)
+        self.table.setMinimumHeight(120)
         header = self.table.horizontalHeader()
         header.setStretchLastSection(True)
         self.table.setColumnWidth(0, 96)
@@ -112,24 +113,27 @@ class ActivityTab(TabBase):
             for value in self.values.values():
                 value.setText("-")
             return
-        text, kind = STATE_BADGES.get(status.state, (status.state, "muted"))
+        text, kind = STATE_BADGES.get(status.state, (safe_text(status.state), "muted"))
         self.state_pill.setText(text)
         self.state_pill.setKind(kind)
-        self.state_line.setText(f"Version {status.version or '?'}, process {status.pid}, {status.targets} configured "
-                                f"target{'' if status.targets == 1 else 's'}.")
+        self.state_line.setText(safe_text(f"Version {status.version or '?'}, process {status.pid}, {status.targets} "
+                                          f"configured target{'' if status.targets == 1 else 's'}."))
         if status.paused:
             until = status.paused_until
-            paused = "Until resumed" if until is None or not math.isfinite(until) else "Until " + clock_text(until)
+            end = "-" if until is None or not math.isfinite(until) else clock_text(until)
+            paused = "Until resumed" if end == "-" else "Until " + end
         else:
             paused = "No"
         game = status.game or {}
         stopped = ", ".join(ref_name(r) for r in status.stopped)
         self.values["paused"].setText(paused)
-        self.values["game"].setText(f"{game.get('title') or game.get('id')} ({game.get('id')})" if game else "None")
-        self.values["stopped"].setText(stopped or "Nothing")
-        self.values["dialog"].setText(f"{status.dialog or 'none'}, "
-                                      f"{'can ask' if status.can_ask else 'cannot ask'}")
-        self.values["config"].setText("Accepted" if status.config_ok else f"Rejected: {status.config_error or 'unknown'}")
+        self.values["game"].setText(safe_text(f"{game.get('title') or game.get('id')} ({game.get('id')})")
+                                    if game else "None")
+        self.values["stopped"].setText(safe_text(stopped) or "Nothing")
+        self.values["dialog"].setText(safe_text(f"{status.dialog or 'none'}, "
+                                                f"{'can ask' if status.can_ask else 'cannot ask'}"))
+        self.values["config"].setText("Accepted" if status.config_ok
+                                      else safe_text(f"Rejected: {status.config_error or 'unknown'}"))
 
     def _refresh_events(self) -> None:
         events = list(reversed(self.model.events(100)))

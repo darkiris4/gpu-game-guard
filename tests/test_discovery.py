@@ -6,10 +6,12 @@ import types
 import unittest
 from pathlib import Path
 
-from gpu_game_guard import discovery, gpu
+from gpu_game_guard import discovery
 from gpu_game_guard.config import Config, TargetSpec
 from gpu_game_guard.model import Target
 
+UID = 1000
+USER_SLICE = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/"
 DOCKER_ID = "4f96b9e7ddac377fc068d30686c8f0e1d2264f2fed8afdc72b49a7ebdee5f18d"
 
 
@@ -29,9 +31,10 @@ class Fixture(unittest.TestCase):
         self.proc = Path(self.tmp.name)
         self.mib = {}
 
-    def add(self, pid, comm, cgroup="0::/user.slice/user-1000.slice/session-2.scope\n", cmdline=None, mib=100):
+    def add(self, pid, comm, cgroup="0::/user.slice/user-1000.slice/session-2.scope\n", cmdline=None, mib=100, uid=UID):
         base = self.proc / str(pid)
         base.mkdir()
+        (base / "status").write_text(f"Name:\t{comm}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n")
         (base / "comm").write_text(comm + "\n")
         (base / "cgroup").write_text(cgroup)
         (base / "cmdline").write_bytes(("\0".join(cmdline or [comm]) + "\0").encode())
@@ -39,7 +42,7 @@ class Fixture(unittest.TestCase):
 
     def discover(self, config=None, runtimes=()):
         smi = "".join(f"{pid}, {mib}\n" for pid, mib in self.mib.items())
-        return discovery.discover(config or Config(), list(runtimes), self.proc, run=lambda args, **_: smi)
+        return discovery.discover(config or Config(), list(runtimes), self.proc, run=lambda args, **_: smi, uid=UID)
 
     def by_key(self, candidates):
         return {c.key: c for c in candidates}
@@ -73,6 +76,22 @@ class ProtectTests(unittest.TestCase):
         self.assertTrue(discovery.is_protected(types.SimpleNamespace(), "bash"))
         self.assertFalse(discovery.is_protected(types.SimpleNamespace(), "obs"))
 
+    def test_session_daemons_are_protected(self):
+        for name in ("bluetoothd", "gnome-keyring-daemon", "xdg-desktop-portal", "xdg-desktop-portal-gtk", "gnome-shell",
+                     "org.gnome.Shell.Notifications", "ibus-daemon", "fcitx5", "at-spi-bus-launcher", "at-spi2-registryd",
+                     "gvfsd", "gvfs-udisks2-volume-monitor", "polkitd", "udisksd", "upowerd", "NetworkManager",
+                     "NetworkManager-dispatcher", "wpa_supplicant", "cupsd", "cups-browsed", "accounts-daemon", "colord",
+                     "rtkit-daemon", "systemd-resolved", "dbus-broker", "gamescope", "gamescope-wl"):
+            with self.subTest(name):
+                self.assertTrue(discovery.is_protected(Config(), name), name)
+
+    def test_app_scoped_units_are_checked_without_prefix_and_instance(self):
+        self.assertEqual(discovery._protect_names("app-steam@abc.service"), ["app-steam@abc.service", "app-steam@abc", "steam"])
+        self.assertEqual(discovery._protect_names("ollama.service"), ["ollama.service", "ollama"])
+        self.assertEqual(discovery.stable_stem("app-obs@3f9a1c.service"), "obs")
+        self.assertEqual(discovery.stable_stem("app-obs.service"), "app-obs")
+        self.assertEqual(discovery.stable_stem("ollama.service"), "ollama")
+
 
 class ContainerTests(Fixture):
     def test_containers_come_first_with_managed_flag(self):
@@ -83,6 +102,7 @@ class ContainerTests(Fixture):
         config = Config.from_json({"ignore_containers": ["plex"]})
         found = self.discover(config, runtimes)
         self.assertEqual([c.kind for c in found], ["container", "container", "process"])
+        self.assertNotIn("service", [c.kind for c in found], "a service runtime's targets are not containers")
         by_key = self.by_key(found)
         ollama, plex = by_key["container:docker:ollama"], by_key["container:docker:plex"]
         self.assertTrue(ollama.managed)
@@ -114,7 +134,7 @@ class HostTests(Fixture):
         self.add(11, "ollama", "0::/system.slice/ollama.service\n", mib=500)
         self.add(12, "obs", mib=200)
         self.add(13, "obs", mib=100)
-        self.add(14, "blender", "0::/user.slice/user-1000.slice/user@1000.service/app.slice/ollama.service\n", mib=1)
+        self.add(14, "blender", USER_SLICE + "ollama.service\n", mib=1)
         found = self.discover()
         by_key = self.by_key(found)
         self.assertEqual([c.kind for c in found], ["service", "service", "process"])
@@ -150,6 +170,45 @@ class HostTests(Fixture):
         found = self.discover(Config.from_json({"protect": ["my-editor"]}))
         self.assertEqual([c.key for c in found], ["process:python3"])
 
+    def test_services_are_protected_by_the_comm_of_their_processes(self):
+        self.add(10, "gnome-shell", "0::/system.slice/shell-helper.service\n")
+        self.add(11, "worker", "0::/system.slice/mixed.service\n")
+        self.add(12, "ibus-daemon", "0::/system.slice/mixed.service\n")
+        self.add(13, "worker", "0::/system.slice/plain.service\n")
+        self.assertEqual([c.key for c in self.discover()], ["service:system:plain.service"])
+
+    def test_a_unit_with_a_python_guard_process_is_protected(self):
+        self.add(10, "python3", "0::/system.slice/guardian.service\n", cmdline=["python3", "-m", "gpu_game_guard"])
+        self.assertEqual(self.discover(), [])
+
+    def test_app_forms_are_protected_and_other_apps_get_a_stable_id(self):
+        self.add(10, "worker", USER_SLICE + "app-steam@abc123.service\n")
+        self.add(11, "worker", USER_SLICE + "app-gamescope@x.service\n")
+        self.add(12, "worker", USER_SLICE + "app-blender@9f8e7d.service\n")
+        (candidate,) = self.discover()
+        self.assertEqual(candidate.spec["id"], "blender")
+        self.assertEqual(candidate.label, "blender")
+        self.assertEqual(candidate.spec["unit"], "app-blender@9f8e7d.service")
+
+    def test_only_the_current_users_units_and_processes_are_offered(self):
+        self.add(10, "worker", "0::/user.slice/user-1001.slice/user@1001.service/app.slice/theirs.service\n")
+        self.add(11, "worker", USER_SLICE + "mine.service\n")
+        self.add(12, "theirproc", uid=1001)
+        self.add(13, "myproc")
+        self.add(14, "worker", "0::/system.slice/shared.service\n", uid=0)
+        self.assertEqual(sorted(c.key for c in self.discover()),
+                         ["process:myproc", "service:system:shared.service", "service:user:mine.service"])
+
+    def test_processes_with_unreadable_ownership_are_not_offered(self):
+        self.add(10, "worker")
+        (self.proc / "10" / "status").unlink()
+        self.assertEqual(self.discover(), [])
+
+    def test_names_too_short_to_be_matched_are_not_offered(self):
+        self.add(10, "ab")
+        self.add(11, "abc")
+        self.assertEqual([c.key for c in self.discover()], ["process:abc"])
+
     def test_container_processes_and_the_guard_itself_are_skipped(self):
         self.add(10, "ollama", f"0::/system.slice/docker-{DOCKER_ID}.scope\n")
         self.add(os.getpid(), "worker")
@@ -157,7 +216,7 @@ class HostTests(Fixture):
 
     def test_already_managed_targets_are_marked(self):
         self.add(10, "ollama", "0::/system.slice/ollama.service\n")
-        self.add(11, "ollama", "0::/user.slice/user-1000.slice/user@1000.service/app.slice/ollama.service\n")
+        self.add(11, "ollama", USER_SLICE + "ollama.service\n")
         self.add(12, "obs-studio")
         config = (Config().with_target(TargetSpec(id="o", kind="service", unit="ollama.service", scope="system"))
                   .with_target(TargetSpec(id="obs", kind="process", match="obs*")))
@@ -173,7 +232,7 @@ class HostTests(Fixture):
         self.assertEqual(candidate.spec["id"], "obs-2")
 
     def test_unmeasurable_gpu_memory_yields_only_containers(self):
-        found = discovery.discover(Config(), [], self.proc, run=lambda args, **_: None)
+        found = discovery.discover(Config(), [], self.proc, run=lambda args, **_: None, uid=UID)
         self.assertEqual(found, [])
 
     def test_odd_names_are_not_offered_as_process_globs(self):
@@ -181,8 +240,11 @@ class HostTests(Fixture):
         self.add(11, "a*b")
         self.assertEqual(self.discover(), [])
 
-    def test_gpu_module_is_what_measures(self):
-        self.assertTrue(callable(gpu.vram_by_pid))
+    def test_the_default_uid_is_the_running_users(self):
+        self.add(10, "mine", uid=os.getuid())
+        smi = "10, 5\n"
+        found = discovery.discover(Config(), [], self.proc, run=lambda args, **_: smi)
+        self.assertEqual([c.key for c in found], ["process:mine"])
 
 
 if __name__ == "__main__":

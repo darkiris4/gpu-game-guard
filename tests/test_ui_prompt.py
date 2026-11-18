@@ -59,6 +59,13 @@ class SelfCommandTests(unittest.TestCase):
     def test_without_arguments_falls_back_to_module(self):
         main = types.SimpleNamespace(__spec__=None)
         self.assertEqual(prompt.self_command(main, [], "py"), ["py", "-m", "gpu_game_guard"])
+        with mock.patch.object(prompt.sys, "argv", []):
+            self.assertEqual(prompt.self_command(main, None, "py"), ["py", "-m", "gpu_game_guard"])
+
+    def test_dash_c_and_stdin_fall_back_to_module(self):
+        main = types.SimpleNamespace(__spec__=None)
+        for first in ("-c", "-", "-m", ""):
+            self.assertEqual(prompt.self_command(main, [first, "x"], "py"), ["py", "-m", "gpu_game_guard"], first)
 
 
 class PayloadTests(unittest.TestCase):
@@ -208,8 +215,9 @@ class DialogTests(unittest.TestCase):
 
     def run_dialog(self, data, act):
         out = io.StringIO()
-        code = prompt.run_prompt([data["kind"]], io.StringIO(json.dumps(data)), out, execute=act,
-                                 environ={"QT_QPA_PLATFORM": "offscreen"})
+        with mock.patch.object(prompt, "test_platform", "offscreen"):
+            code = prompt.run_prompt([data["kind"]], io.StringIO(json.dumps(data)), out, execute=act,
+                                     environ={"QT_QPA_PLATFORM": "offscreen"})
         return code, (json.loads(out.getvalue()) if out.getvalue() else None)
 
     def press(self, dialog, key):
@@ -227,11 +235,11 @@ class DialogTests(unittest.TestCase):
 
     def test_primary_button_is_stop_and_default(self):
         dialog = prompt.build_dialog(payload())
-        self.assertEqual(dialog.buttons["stop"].text(), "Stop and launch")
+        self.assertEqual(dialog.buttons["stop"].text(), "&Stop and launch")
         self.assertTrue(dialog.buttons["stop"].isDefault())
         self.assertEqual(dialog.buttons["stop"].property("role"), "primary")
-        self.assertEqual(dialog.buttons["anyway"].text(), "Launch anyway")
-        self.assertEqual(dialog.buttons["cancel"].text(), "Cancel")
+        self.assertEqual(dialog.buttons["anyway"].text(), "Launch &anyway")
+        self.assertEqual(dialog.buttons["cancel"].text(), "&Cancel")
 
     def test_remember_checkbox(self):
         def tick_then(button):
@@ -274,12 +282,12 @@ class DialogTests(unittest.TestCase):
                                  "label": ""}])
         dialog = prompt.build_dialog(data)
         names = [w.text() for w in dialog.findChildren(QtWidgets.QLabel)]
-        self.assertIn("<b>x</b> ", names)
+        self.assertIn("<b>x</b>", names)
 
-    def test_many_targets_scroll(self):
-        targets = [{"kind": "process", "name": f"p{i}", "image": "", "vram_mib": i, "label": ""} for i in range(9)]
-        dialog = prompt.build_dialog(payload(targets=targets))
-        self.assertTrue(dialog.findChildren(QtWidgets.QScrollArea))
+    def test_the_target_list_is_a_scroll_area(self):
+        dialog = prompt.build_dialog(payload())
+        self.assertIs(dialog.list_area.widget().parent().parent(), dialog.list_area)
+        self.assertEqual(dialog.list_area.verticalScrollBarPolicy(), QtCore.Qt.ScrollBarAsNeeded)
 
     def test_restart_buttons(self):
         data = payload("restart", False)
@@ -295,13 +303,237 @@ class DialogTests(unittest.TestCase):
     def test_restart_labels(self):
         dialog = prompt.build_dialog(payload("restart", False))
         self.assertEqual([dialog.buttons[k].text() for k in ("restart", "later", "leave")],
-                         ["Restart", "Ask me later", "Leave stopped"])
+                         ["&Restart", "Ask me &later", "Leave &stopped"])
         self.assertTrue(dialog.buttons["restart"].isDefault())
         self.assertIsNone(dialog.remember_box)
 
     def test_answer_is_accepted_by_the_parent_parser(self):
         _, answer = self.run_dialog(payload(), lambda d: d.buttons["stop"].click())
         self.assertEqual(prompt.parse_answer("launch", json.dumps(answer)), answer)
+
+
+def many(count):
+    return [{"kind": "process", "name": f"p{i}", "image": "", "vram_mib": i, "label": ""} for i in range(count)]
+
+
+@unittest.skipUnless(qt.available(), "PyQt5 is not installed")
+class HostileTitleTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = qt.app()
+        from gpu_game_guard.ui import theme
+        theme.apply_theme(cls.app, dark=False)
+        cls.theme = theme
+
+    def test_title_is_literal_and_nothing_is_rich_text(self):
+        hostile = '<img src="file:///etc/passwd"><a href="file:///etc/passwd">x</a><b>B</b>'
+        data = payload(targets=[{"kind": "container", "name": hostile, "image": hostile, "vram_mib": 1,
+                                 "label": hostile}])
+        data["title"] = hostile
+        dialog = prompt.build_dialog(data)
+        labels = dialog.findChildren(QtWidgets.QLabel)
+        self.assertEqual(dialog.findChild(QtWidgets.QLabel, "Headline").text(), "Launching " + hostile)
+        self.assertTrue(any(w.text() == hostile for w in labels))
+        for label in labels:
+            self.assertNotEqual(label.textFormat(), QtCore.Qt.RichText, label.text())
+            self.assertNotEqual(label.textFormat(), QtCore.Qt.AutoText, label.text())
+        for label in labels:
+            self.assertFalse(label.openExternalLinks())
+            if label.toolTip():
+                self.assertNotIn("<img", label.toolTip())
+        self.assertFalse(dialog.grab().isNull())
+
+    def test_control_characters_never_reach_a_label(self):
+        data = payload(targets=[{"kind": "container", "name": "a\nb\tc\u202ed\x00", "image": "i\r\nj",
+                                 "vram_mib": 1, "label": ""}])
+        data["title"] = "x\ny\u202e"
+        dialog = prompt.build_dialog(data)
+        for label in dialog.findChildren(QtWidgets.QLabel):
+            for char in ("\n", "\t", "\u202e", "\x00", "\r"):
+                self.assertNotIn(char, label.text())
+        self.assertEqual(dialog.findChild(QtWidgets.QLabel, "TargetName").text(), "a b cd")
+
+    def test_unbreakable_title_does_not_widen_the_dialog(self):
+        data = payload()
+        data["title"] = "W" * 400
+        dialog = prompt.build_dialog(data)
+        dialog.place_in(QtCore.QRect(0, 0, 3000, 2000))
+        self.assertLessEqual(dialog.width(), int(prompt.MAX_WIDTH * self.theme.font_scale()))
+        self.assertLessEqual(dialog.sizeHint().width(), dialog.maximumWidth())
+        headline = dialog.findChild(QtWidgets.QLabel, "Headline")
+        self.assertIn("…", headline.text())
+        self.assertIn("W" * 400, headline.toolTip())
+        self.assertLessEqual(headline.sizeHint().width(), dialog.maximumWidth())
+
+    def test_long_title_with_spaces_is_capped_and_wraps(self):
+        data = payload()
+        data["title"] = "word " * 100
+        dialog = prompt.build_dialog(data)
+        text = dialog.findChild(QtWidgets.QLabel, "Headline").text()
+        self.assertLessEqual(len(text), len("Launching ") + prompt.HEADLINE_TITLE_LIMIT)
+
+
+@unittest.skipUnless(qt.available(), "PyQt5 is not installed")
+class WindowBehaviourTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = qt.app()
+        from gpu_game_guard.ui import theme
+        theme.apply_theme(cls.app, dark=False)
+
+    def press(self, dialog, key):
+        QtWidgets.QApplication.sendEvent(dialog.focusWidget() or dialog,
+                                         QtGui.QKeyEvent(QtCore.QEvent.KeyPress, key, QtCore.Qt.NoModifier))
+
+    @staticmethod
+    def on_screen(dialog, area):
+        """Make the dialog treat `area` as the screen under the pointer."""
+        dialog.target_screen = lambda: types.SimpleNamespace(availableGeometry=lambda: area)
+
+    def test_many_targets_are_capped_to_the_screen_and_scroll(self):
+        dialog = prompt.build_dialog(payload(targets=many(40)))
+        self.on_screen(dialog, QtCore.QRect(0, 0, 1280, 720))
+        dialog.show()
+        self.app.processEvents()
+        self.assertLessEqual(dialog.height(), int(720 * 0.8))
+        self.assertLessEqual(dialog.maximumHeight(), int(720 * 0.8))
+        bar = dialog.list_area.verticalScrollBar()
+        self.assertGreater(bar.maximum(), 0)
+        dialog.close()
+
+    def test_few_targets_do_not_scroll(self):
+        dialog = prompt.build_dialog(payload(targets=many(2)))
+        self.on_screen(dialog, QtCore.QRect(0, 0, 1920, 1080))
+        dialog.show()
+        self.app.processEvents()
+        self.assertEqual(dialog.list_area.verticalScrollBar().maximum(), 0)
+        dialog.close()
+
+    def test_window_is_placed_fully_inside_the_available_area(self):
+        for area in (QtCore.QRect(0, 0, 1920, 1080), QtCore.QRect(1920, 40, 1280, 700),
+                     QtCore.QRect(-1600, 30, 1600, 870), QtCore.QRect(0, 0, 700, 520)):
+            dialog = prompt.build_dialog(payload(targets=many(6)))
+            dialog.place_in(area)
+            frame = dialog.frameGeometry()
+            self.assertTrue(area.contains(frame.topLeft()), (area, frame))
+            self.assertTrue(area.contains(frame.bottomRight()), (area, frame))
+        self.assertLessEqual(frame.width(), 700)
+
+    def test_the_screen_under_the_pointer_is_chosen(self):
+        dialog = prompt.build_dialog(payload())
+        with mock.patch.object(QtWidgets.QApplication, "screenAt", return_value=None):
+            self.assertIs(dialog.target_screen(), QtWidgets.QApplication.primaryScreen())
+        other = object()
+        with mock.patch.object(QtWidgets.QApplication, "screenAt", return_value=other):
+            self.assertIs(dialog.target_screen(), other)
+
+    def test_initial_focus_is_the_stop_button(self):
+        for kind, button in (("launch", "stop"), ("restart", "restart")):
+            dialog = prompt.build_dialog(payload(kind, kind == "launch"))
+            dialog.show()
+            self.app.processEvents()
+            self.assertIs(dialog.focusWidget(), dialog.buttons[button], kind)
+            dialog.close()
+
+    def test_enter_is_ignored_for_the_first_700_ms(self):
+        now = [100.0]
+        dialog = prompt.build_dialog(payload(), clock=lambda: now[0])
+        self.press(dialog, QtCore.Qt.Key_Return)  # not shown yet
+        self.assertEqual(dialog.choice, "cancel")
+        dialog.show()
+        for key in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
+            now[0] = 100.0 + 0.5
+            self.press(dialog, key)
+            self.assertEqual(dialog.choice, "cancel")
+            self.assertTrue(dialog.isVisible())
+        now[0] = 100.0 + 0.8
+        self.assertTrue(dialog.enter_allowed())
+        self.press(dialog, QtCore.Qt.Key_Return)
+        self.assertEqual(dialog.choice, "stop")
+        dialog.close()
+
+    def test_escape_works_immediately(self):
+        dialog = prompt.build_dialog(payload(), clock=lambda: 0.0)
+        dialog.show()
+        self.press(dialog, QtCore.Qt.Key_Escape)
+        self.assertFalse(dialog.isVisible())
+        self.assertEqual(dialog.choice, "cancel")
+
+    def test_enter_in_the_checkbox_is_ignored_too(self):
+        now = [0.0]
+        dialog = prompt.build_dialog(payload(), clock=lambda: now[0])
+        dialog.show()
+        dialog.remember_box.setFocus()
+        self.press(dialog, QtCore.Qt.Key_Return)
+        self.assertEqual(dialog.choice, "cancel")
+        dialog.close()
+
+    def test_every_button_has_a_distinct_mnemonic(self):
+        for kind in ("launch", "restart"):
+            dialog = prompt.build_dialog(payload(kind, kind == "launch"))
+            widgets = list(dialog.buttons.values()) + ([dialog.remember_box] if dialog.remember_box else [])
+            keys = [w.text().split("&")[1][0].lower() for w in widgets]
+            self.assertEqual(len(keys), len(set(keys)), kind)
+
+    def test_dialog_renders_at_a_larger_font_in_both_schemes(self):
+        from gpu_game_guard.ui import theme
+        original = self.app.font()
+        try:
+            font = QtGui.QFont(original)
+            font.setPointSizeF(16)
+            self.app.setFont(font)
+            for dark in (False, True):
+                theme.apply_theme(self.app, dark=dark)
+                dialog = prompt.build_dialog(payload(targets=many(3)))
+                dialog.place_in(QtCore.QRect(0, 0, 1920, 1080))
+                self.assertFalse(dialog.grab().isNull())
+                self.assertLessEqual(dialog.width(), int(prompt.MAX_WIDTH * theme.font_scale()))
+                self.assertGreater(dialog.minimumWidth(), prompt.MIN_WIDTH)
+        finally:
+            self.app.setFont(original)
+            theme.apply_theme(self.app, dark=False)
+
+
+class PlatformTests(unittest.TestCase):
+    def test_wayland_is_preferred_when_nothing_is_chosen(self):
+        self.assertEqual(prompt.platform_changes({"WAYLAND_DISPLAY": "wayland-0", "DISPLAY": ":0"}),
+                         {"QT_QPA_PLATFORM": "wayland;xcb"})
+        self.assertEqual(prompt.platform_changes({"DISPLAY": ":0"}), {})
+        self.assertEqual(prompt.platform_changes({}), {})
+
+    def test_an_explicit_real_platform_is_kept(self):
+        for value in ("xcb", "wayland", "wayland;xcb", "eglfs"):
+            self.assertEqual(prompt.platform_changes({"QT_QPA_PLATFORM": value, "WAYLAND_DISPLAY": "w"}), {})
+
+    def test_inherited_headless_platforms_are_removed(self):
+        for value in ("offscreen", "minimal", "minimalegl", "vnc", "linuxfb", "Offscreen", "vnc:size=800x600"):
+            self.assertEqual(prompt.platform_changes({"QT_QPA_PLATFORM": value, "DISPLAY": ":0"}),
+                             {"QT_QPA_PLATFORM": None}, value)
+        self.assertEqual(prompt.platform_changes({"QT_QPA_PLATFORM": "offscreen", "WAYLAND_DISPLAY": "w"}),
+                         {"QT_QPA_PLATFORM": "wayland;xcb"})
+
+    def test_effective_environment_and_the_test_hook(self):
+        env = {"QT_QPA_PLATFORM": "offscreen", "DISPLAY": ":0"}
+        self.assertNotIn("QT_QPA_PLATFORM", prompt.effective_environment(env))
+        self.assertEqual(env["QT_QPA_PLATFORM"], "offscreen")
+        with mock.patch.object(prompt, "test_platform", "offscreen"):
+            self.assertEqual(prompt.effective_environment({})["QT_QPA_PLATFORM"], "offscreen")
+
+    def test_run_prompt_without_a_display_and_only_a_headless_platform_fails(self):
+        out = io.StringIO()
+        with mock.patch("gpu_game_guard.ui.prompt.qt.available", return_value=True), \
+                mock.patch("gpu_game_guard.ui.prompt.log"):
+            code = prompt.run_prompt(["launch"], io.StringIO("{}"), out, environ={"QT_QPA_PLATFORM": "offscreen"})
+        self.assertEqual((code, out.getvalue()), (1, ""))
+
+    def test_run_prompt_applies_the_choice_to_the_real_environment(self):
+        fake = {"QT_QPA_PLATFORM": "offscreen", "WAYLAND_DISPLAY": "w"}
+        with mock.patch.object(prompt.os, "environ", fake), \
+                mock.patch("gpu_game_guard.ui.prompt.qt.available", return_value=True), \
+                mock.patch("gpu_game_guard.ui.prompt.log"):
+            code = prompt.run_prompt(["launch"], io.StringIO("not json"), io.StringIO(), environ=fake)
+        self.assertEqual(code, 2)
+        self.assertEqual(fake["QT_QPA_PLATFORM"], "wayland;xcb")
 
 
 class RunPromptFailureTests(unittest.TestCase):
@@ -312,8 +544,9 @@ class RunPromptFailureTests(unittest.TestCase):
 
     def run_it(self, argv, text="{}", environ=None, **kwargs):
         out = io.StringIO()
-        code = prompt.run_prompt(argv, io.StringIO(text), out, environ=environ if environ is not None else {},
-                                 **kwargs)
+        with mock.patch.object(prompt, "test_platform", "offscreen" if environ else None):
+            code = prompt.run_prompt(argv, io.StringIO(text), out, environ=environ if environ is not None else {},
+                                     **kwargs)
         return code, out.getvalue()
 
     def test_bad_usage(self):

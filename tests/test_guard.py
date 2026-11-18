@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import math
 import tempfile
 import unittest
@@ -453,12 +454,12 @@ class RuntimeTests(GuardCase):
         env.advance(1)
         self.assertEqual(env.prompter.launch_asked, [["ollama"]])
 
-    def test_a_ref_for_a_missing_runtime_is_logged_and_forgotten(self):
+    def test_a_ref_for_a_missing_runtime_is_logged_and_kept(self):
         env = self.env(running=())
         env.state.add([ref("x", "podman")], env.now - 3600)
         out = env.advance(1)
         self.assertIn("podman", out)
-        self.assertEqual(env.state.stopped, [])
+        self.assertEqual(env.state.stopped, [ref("x", "podman")])
 
     def test_a_failing_trigger_does_not_make_its_launches_look_new(self):
         env = self.env()
@@ -649,13 +650,13 @@ class HandlerTests(GuardCase):
         self.assertEqual(len(env.prompter.notifications), 1)
         self.assertEqual(env.prompter.notifications[0][1], "Could not start Portal again.")
 
-    def test_start_raising_is_logged_and_the_state_cleared(self):
+    def test_start_raising_is_logged_and_the_state_kept(self):
         env = self.env(running=())
         env.docker.start = lambda refs: 1 / 0
         env.state.add([ref("a")], env.now - 3600)
         out = env.advance(1)
         self.assertIn("start through docker failed", out)
-        self.assertEqual(env.state.stopped, [])
+        self.assertEqual(env.state.stopped, [ref("a")])
 
     def test_notify_raising_is_logged_and_does_not_stop_the_flow(self):
         env = self.env()
@@ -878,7 +879,7 @@ class RememberTests(GuardCase):
     def test_a_save_failure_is_logged_and_never_raised(self):
         env = self.env_with("stop")
         env.trigger.launches = [make_launch(10)]
-        with mock.patch("gpu_game_guard.guard.save_config", side_effect=OSError("disk full")):
+        with mock.patch("gpu_game_guard.config.save", side_effect=OSError("disk full")):
             out = env.advance(1)
         self.assertIn("could not remember", out)
         self.assertEqual(env.docker.stopped, ["ollama"])
@@ -997,6 +998,184 @@ class StatusChannelTests(GuardCase):
         env = self.env(can_ask=False)
         env.advance(1)
         self.assertFalse(self.read(env).can_ask)
+
+
+def view(env):
+    """The status as written, read as of the fake clock."""
+    with mock.patch.object(status.time, "time", return_value=env.now):
+        return status.read_status(env.status_dir)
+
+
+class ConfigPreservationTests(RememberTests):
+    def test_unknown_keys_survive_a_remembered_choice(self):
+        self.path.write_text('{"future": {"a": 1}, "games": {"steam:9": {"action": "stop", "note": "n"}}}')
+        env = self.env_with("stop")
+        env.trigger.launches = [make_launch(10)]
+        with contextlib.redirect_stderr(io.StringIO()):
+            env.advance(1)
+        data = json.loads(self.path.read_text())
+        self.assertEqual(data["future"], {"a": 1})
+        self.assertEqual(data["games"]["steam:9"]["note"], "n")
+        self.assertEqual(data["games"]["steam:730"]["action"], "stop")
+
+    def test_a_settings_save_made_while_the_dialog_was_open_survives(self):
+        env = self.env_with("stop")
+        configmod.save(Config(heavy_vram_mib=777), self.path)
+        original = env.prompter.launch
+
+        def launch(*args):
+            configmod.save(Config(heavy_vram_mib=777, dialog="zenity"), self.path)  # saved while the dialog is open
+            return original(*args)
+
+        env.prompter.launch = launch
+        env.trigger.launches = [make_launch(10)]
+        env.advance(1)
+        saved = configmod.load(self.path)
+        self.assertEqual((saved.heavy_vram_mib, saved.dialog, saved.games["steam:730"].action), (777, "zenity", "stop"))
+
+    def test_an_invalid_file_on_disk_is_not_overwritten(self):
+        self.path.write_text("{broken")
+        env = self.env_with("stop")
+        env.trigger.launches = [make_launch(10)]
+        out = env.advance(1)
+        self.assertEqual(self.path.read_text(), "{broken")
+        self.assertIn("could not remember", out)
+        self.assertEqual(env.docker.stopped, ["ollama"])
+        self.assertEqual(list(self.path.parent.glob("*.broken-*")), [])
+
+
+class FailedStartTests(GuardCase):
+    def stopped_env(self, **options):
+        env = self.env(running=(), **options)
+        env.state.add([ref("a"), ref("b")], env.now - 3600)
+        return env
+
+    def test_failed_refs_are_kept_and_reported(self):
+        env = self.stopped_env()
+        env.docker.fail_start = ["b"]
+        out = env.advance(1)
+        self.assertEqual(env.docker.started, ["a"])
+        self.assertEqual(env.state.stopped, [ref("b")])
+        self.assertIn("could not start b", out)
+        event = [e for e in status.read_events(directory=env.status_dir) if e["kind"] == "restart"][-1]
+        self.assertEqual(event["message"], "started a again; could not start b")
+        self.assertEqual(view(env).stopped, [ref("b")])
+        self.assertEqual(State(env.state.path).stopped, [ref("b")])
+        self.assertEqual(env.prompter.notifications[-1][1], "Started a again; could not start b.")
+
+    def test_it_asks_again_after_the_retry_interval_and_clears_what_started(self):
+        env = self.stopped_env()
+        env.docker.fail_start = ["b"]
+        env.advance(1)
+        env.advance(10)
+        self.assertEqual(env.prompter.restart_asked, [["a", "b"]])
+        env.docker.fail_start = []
+        env.advance(env.config.dialog_retry_seconds)
+        self.assertEqual(env.prompter.restart_asked[-1], ["b"])
+        self.assertEqual(env.docker.started, ["a", "b"])
+        self.assertEqual(env.state.stopped, [])
+
+    def test_with_after_game_restart_the_same_holds(self):
+        env = self.stopped_env(config=Config(after_game="restart"))
+        env.docker.fail_start = ["a", "b"]
+        env.advance(1)
+        self.assertEqual(len(env.state.stopped), 2)
+        event = [e for e in status.read_events(directory=env.status_dir) if e["kind"] == "restart"][-1]
+        self.assertEqual(event["message"], "could not start a, b")
+        env.docker.fail_start = []
+        env.advance(env.config.dialog_retry_seconds)
+        self.assertEqual((env.state.stopped, env.docker.started), ([], ["a", "b"]))
+
+    def test_a_ref_whose_provider_is_missing_counts_as_failed(self):
+        env = self.env(running=())
+        env.state.add([ref("a"), ref("x", "podman")], env.now - 3600)
+        env.advance(1)
+        self.assertEqual(env.state.stopped, [ref("x", "podman")])
+
+    def test_a_provider_returning_none_means_nothing_failed(self):
+        env = self.stopped_env()
+        env.docker.start = lambda refs: None
+        env.advance(1)
+        self.assertEqual(env.state.stopped, [])
+
+    def test_a_ref_of_a_disabled_or_removed_target_is_still_passed_to_its_provider(self):
+        env = self.env(running=())
+        service = FakeRuntime("service")
+        env.guard.runtimes.append(service)
+        gone = {"kind": "service", "runtime": "service", "name": "Old", "unit": "old.service", "scope": "user"}
+        env.state.add([gone], env.now - 3600)
+        env.advance(1)
+        self.assertEqual(service.started, ["Old"])
+        self.assertEqual(env.state.stopped, [])
+
+    def test_two_targets_with_one_label_are_both_stopped_and_restarted(self):
+        env = self.env(running=())
+        runtime = FakeRuntime("service")
+        runtime.running_gpu_targets = lambda: [
+            Target("service", "service", "Same", extra={"id": i}) for i in ("a", "b") if i in runtime.running]
+        runtime.running = ["a", "b"]
+        runtime.stop = lambda refs: [runtime.running.remove(r["id"]) for r in refs]
+        runtime.start = lambda refs: runtime.started.extend(r["id"] for r in refs)
+        env.guard.runtimes.append(runtime)
+        env.trigger.launches = [make_launch(10)]
+        env.advance(1)
+        self.assertEqual(sorted(r["id"] for r in env.state.stopped), ["a", "b"])
+        env.trigger.launches = []
+        env.advance(200)
+        self.assertEqual(sorted(runtime.started), ["a", "b"])
+
+
+class StatusWriteRateTests(GuardCase):
+    def count_writes(self, env, steps, seconds):
+        with mock.patch.object(status, "write_status", wraps=status.write_status) as write:
+            for _ in range(steps):
+                env.advance(seconds)
+        return write.call_count
+
+    def test_an_idle_guard_writes_at_most_twelve_times_a_minute(self):
+        env = self.env(running=())
+        env.advance(1)
+        self.assertLessEqual(self.count_writes(env, 60, 1), 12)
+
+    def test_an_idle_guard_still_writes_now_and_then(self):
+        env = self.env(running=())
+        env.advance(1)
+        self.assertGreaterEqual(self.count_writes(env, 60, 1), 10)
+
+    def test_a_change_is_written_at_once(self):
+        env = self.env(running=())
+        env.advance(1)
+        with mock.patch.object(status, "write_status", wraps=status.write_status) as write:
+            env.trigger.launches = [make_launch(10)]
+            env.advance(0.2)
+        self.assertEqual(write.call_count, 1)
+        self.assertEqual(view(env).game["id"], "steam:730")
+
+    def test_valid_for_is_long_while_asking_and_while_a_restart_is_pending(self):
+        env = self.env(launch="stop")
+        seen = []
+        original = env.prompter.launch
+
+        def launch(*args):
+            seen.append(view(env))
+            return original(*args)
+
+        env.prompter.launch = launch
+        env.trigger.launches = [make_launch(10)]
+        env.advance(1)
+        self.assertEqual((seen[0].state, seen[0].valid_for), ("asking", 900.0))
+        after = view(env)
+        self.assertEqual((after.state, after.valid_for), ("restart-pending", 900.0))
+        env.trigger.launches = []
+        env.state.clear()
+        env.advance(10)
+        self.assertEqual(view(env).valid_for, 15.0)
+
+    def test_the_state_leaves_asking_after_the_dialog_returns(self):
+        env = self.env(launch="cancel")
+        env.trigger.launches = [make_launch(10)]
+        env.advance(1)
+        self.assertNotEqual(view(env).state, "asking")
 
 
 if __name__ == "__main__":

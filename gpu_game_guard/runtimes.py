@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import shutil
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import gpu, util
 from .commands import CommandRuntime
@@ -104,26 +104,30 @@ class DockerLikeRuntime:
         """True when the command exists and its daemon answers."""
         return self._run([self.command, "version"]) is not None
 
-    def _own(self, refs: Sequence[Ref]) -> List[str]:
-        names = []
+    def _names(self, refs: Sequence[Ref]) -> List[Tuple[Ref, Optional[str]]]:
+        """(ref, container name) for each ref of this runtime; the name is None for one that cannot be used."""
+        found: List[Tuple[Ref, Optional[str]]] = []
         for ref in refs:
             if not isinstance(ref, dict) or ref.get("kind") != "container" or ref.get("runtime") != self.name:
                 continue
             name = ref.get("name")
             if not isinstance(name, str) or not name:
-                continue
-            if name.startswith("-"):  # a leading dash would be read as an option
+                found.append((ref, None))
+            elif name.startswith("-"):  # a leading dash would be read as an option
                 util.log(f"{self.command}: skipping container name '{name}'")
-                continue
-            names.append(name)
-        return names
+                found.append((ref, None))
+            else:
+                found.append((ref, name))
+        return found
 
-    def _change(self, verb: str, name: str) -> None:
-        """Run `stop` or `start` for one container; a failure is logged and never raised."""
+    def _change(self, verb: str, name: str) -> bool:
+        """Run `stop` or `start` for one container; True when the command succeeded. A failure is logged and never
+        raised."""
         try:
-            self._run([self.command, verb, "--", name], timeout=CHANGE_TIMEOUT)
+            return self._run([self.command, verb, "--", name], timeout=CHANGE_TIMEOUT) is not None
         except Exception as exc:
             util.log(f"{self.command} {verb}: {exc}")
+            return False
 
     def running_gpu_targets(self) -> List[Target]:
         out = self._run([self.command, "ps", "-q"])
@@ -159,19 +163,21 @@ class DockerLikeRuntime:
                 measured = None
             else:  # a source that could not see every process cannot say that a missing container holds none
                 measured = vram.get(ref_id, 0 if getattr(vram, "authoritative", True) else None)
+                if ref_id in getattr(vram, "unknown", ()):  # a process of it holds memory that was not reported
+                    measured = None
             targets.append(Target("container", self.name, name, str(image), measured, ref_id))
         return sorted(targets, key=lambda target: target.name)
 
     def stop(self, refs: Sequence[Ref]) -> None:
-        names = self._own(refs)
+        names = [name for _, name in self._names(refs) if name is not None]
         if not names:
             return
         with ThreadPoolExecutor(max_workers=len(names)) as pool:
             list(pool.map(lambda name: self._change("stop", name), names))
 
-    def start(self, refs: Sequence[Ref]) -> None:
-        for name in self._own(refs):
-            self._change("start", name)
+    def start(self, refs: Sequence[Ref]) -> Optional[List[Ref]]:
+        """Start the containers; returns the refs that could not be started."""
+        return [ref for ref, name in self._names(refs) if name is None or not self._change("start", name)]
 
 
 def build(names: Sequence[str], get_config: Optional[Callable[[], Any]] = None) -> List[Runtime]:

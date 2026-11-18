@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import math
 import re
 import sys
 import time
@@ -21,14 +22,21 @@ EXIT_INTERRUPTED = 130
 QT_MISSING = "Install python3-pyqt5 (sudo apt install python3-pyqt5)"
 _DURATION = re.compile(r"(\d+(?:\.\d+)?)([smhd])\Z")
 _UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+MAX_PAUSE_DAYS = 365
+MAX_PAUSE_SECONDS = MAX_PAUSE_DAYS * 86400
 
 
 def parse_duration(text: str) -> float:
     """Seconds in a duration such as 90s, 30m, 2h or 1d."""
     match = _DURATION.match(text.strip().lower())
-    if not match or float(match.group(1)) <= 0:
-        raise argparse.ArgumentTypeError(f"{text!r} is not a duration; use a number and s, m, h or d (for example 30m)")
-    return float(match.group(1)) * _UNIT_SECONDS[match.group(2)]
+    if not match or (len(match.group(1)) <= 40 and float(match.group(1)) <= 0):
+        raise argparse.ArgumentTypeError(f"{text[:40]!r} is not a duration; use a number and s, m, h or d (for example 30m)")
+    digits = match.group(1)
+    seconds = float(digits) * _UNIT_SECONDS[match.group(2)] if len(digits) <= 40 else math.inf
+    if not math.isfinite(seconds) or seconds > MAX_PAUSE_SECONDS:
+        shown = text.strip() if len(text.strip()) <= 20 else text.strip()[:17] + "..."
+        raise argparse.ArgumentTypeError(f"{shown!r} is too long; the longest pause is {MAX_PAUSE_DAYS} days")
+    return seconds
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -53,7 +61,8 @@ def build_parser() -> argparse.ArgumentParser:
     pause_parser = commands.add_parser("pause", parents=[common],
                                        help="stop intercepting launches for a while (launches start untouched)")
     pause_parser.add_argument("--for", dest="duration", type=parse_duration, metavar="DURATION", default=None,
-                              help="how long, such as 90s, 30m, 2h or 1d (default: until 'resume')")
+                              help="how long, such as 90s, 30m, 2h or 1d, at most 365 days "
+                                   "(default: until 'resume')")
     commands.add_parser("resume", parents=[common], help="end a pause")
     status_parser = commands.add_parser("status", parents=[common],
                                         help="show what the running service is doing (exit 1 when it is not running)")
@@ -239,6 +248,9 @@ def command_config(args) -> int:
     problems = configmod.validate(data)
     for problem in problems:
         print(f"{path}: {problem}", file=sys.stderr)
+    if any("unknown key" in problem for problem in problems):
+        print("unknown keys are reported as likely typos; this version keeps them in the file unchanged "
+              "when it saves", file=sys.stderr)
     print("config is valid" if not problems else f"{len(problems)} problem(s) found")
     return EXIT_FAILED if problems else EXIT_OK
 
@@ -248,6 +260,10 @@ def _clock(wall: float) -> str:
 
 
 def command_pause(args) -> int:
+    duration = args.duration
+    if duration is not None and (not math.isfinite(duration) or not 0 < duration <= MAX_PAUSE_SECONDS):
+        print(f"gpu-game-guard: the pause must be longer than zero and at most {MAX_PAUSE_DAYS} days", file=sys.stderr)
+        return EXIT_USAGE
     statusmod.pause(args.duration)
     if args.duration is None:
         print("paused until resumed (gpu-game-guard resume)")
@@ -310,13 +326,23 @@ def _load_for_edit(args):
     return cfg
 
 
-def _save(cfg, path: Path) -> bool:
+class _Refused(Exception):
+    """An edit that does not apply to the file as it is now; the message says why."""
+
+
+def _edit(args, mutate) -> bool:
+    """Apply `mutate` to the config file under its lock; prints the problem and returns False on failure."""
     try:
-        configmod.save(cfg, path)
+        configmod.update_file(mutate, args.config)
+    except _Refused as exc:
+        print(str(exc), file=sys.stderr)
+    except configmod.ConfigError as exc:
+        print(f"{args.config}: {exc.reason}", file=sys.stderr)
     except OSError as exc:
-        print(f"cannot write {path}: {exc.strerror or exc}", file=sys.stderr)
-        return False
-    return True
+        print(f"cannot write {args.config}: {exc.strerror or exc}", file=sys.stderr)
+    else:
+        return True
+    return False
 
 
 def command_targets(args) -> int:
@@ -333,15 +359,19 @@ def command_targets(args) -> int:
     if not args.id:
         print(f"targets {args.action} needs a target id", file=sys.stderr)
         return EXIT_USAGE
-    spec = cfg.target(args.id)
-    if spec is None:
+    if cfg.target(args.id) is None:
         print(f"no target with id {args.id!r}", file=sys.stderr)
         return EXIT_FAILED
-    if args.action == "remove":
-        updated = cfg.without_target(args.id)
-    else:
-        updated = cfg.with_target(dataclasses.replace(spec, enabled=args.action == "enable"))
-    if not _save(updated, args.config):
+
+    def mutate(current):
+        spec = current.target(args.id)
+        if spec is None:
+            raise _Refused(f"no target with id {args.id!r}")
+        if args.action == "remove":
+            return current.without_target(args.id)
+        return current.with_target(dataclasses.replace(spec, enabled=args.action == "enable"))
+
+    if not _edit(args, mutate):
         return EXIT_FAILED
     print({"remove": "removed", "enable": "enabled", "disable": "disabled"}[args.action] + f" {args.id}")
     return EXIT_OK
@@ -380,9 +410,20 @@ def command_presets(args) -> int:
         return EXIT_FAILED
     if not presets.applicable(preset):
         print(f"note: what {preset.label!r} manages was not found on this system", file=sys.stderr)
-    if not _save(cfg.with_target(spec), args.config):
+
+    def mutate(current):
+        if current.target(spec.id) is not None:
+            raise _Refused(f"target {spec.id!r} is already configured")
+        return current.with_target(spec)
+
+    if not _edit(args, mutate):
         return EXIT_FAILED
     print(f"added {spec.id}")
+    if spec.kind not in cfg.runtimes:
+        fixed = json.dumps(list(cfg.runtimes) + [spec.kind])
+        print(f"warning: the {spec.kind!r} provider is not in \"runtimes\", so {spec.id!r} is never used; in "
+              f"{args.config} set \"runtimes\": {fixed} and restart the service "
+              "(systemctl --user restart gpu-game-guard)", file=sys.stderr)
     if spec.kind == "service" and spec.scope == "system":
         print(f"stopping a system service needs authorisation: sudo gpu-game-guard polkit allow {spec.unit}")
     return EXIT_OK
@@ -449,7 +490,12 @@ def command_settings(args) -> int:
     except ImportError:
         print(QT_MISSING, file=sys.stderr)
         return EXIT_FAILED
-    return int(run())
+    if not getattr(args, "config_given", False):
+        return int(run())
+    try:
+        return int(run(config_path=args.config))
+    except TypeError:  # a settings window that does not take the parameter
+        return int(run())
 
 
 def command_tray(args) -> int:
@@ -480,7 +526,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         args = parser.parse_args(argv)
     except SystemExit as exc:
         return int(exc.code) if isinstance(exc.code, int) else EXIT_USAGE
-    if not hasattr(args, "config"):
+    args.config_given = hasattr(args, "config")
+    if not args.config_given:
         args.config = configmod.config_path()
     command = args.command or "run"
     handlers = {

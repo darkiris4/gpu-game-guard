@@ -124,11 +124,46 @@ class MessageTests(unittest.TestCase):
         self.assertIn("no GPU memory measured right now", zero)
         self.assertNotIn("unknown", zero)
 
+    def test_wording_follows_the_kinds_of_the_targets(self):
+        def intro(*kinds):
+            targets = [Target(k, "x", f"n{i}", "", 1) for i, k in enumerate(kinds)]
+            return dialogs.launch_message(launch("G"), targets, None, "plain")
+        self.assertIn("because these containers have access", intro("container"))
+        self.assertIn("because these services have access", intro("service", "service"))
+        self.assertIn("because these programs have access", intro("process", "command"))
+        self.assertIn("because these containers, services or programs have access",
+                      intro("process", "container", "service"))
+        self.assertIn("because these containers or services have access", intro("service", "container"))
+        self.assertIn("these programs have", intro("mystery"))
+        self.assertNotIn("containers", intro("service"))
+        self.assertEqual(dialogs.kind_phrase(), "programs and services")
+        self.assertIn("stopped these services or programs earlier",
+                      dialogs.restart_message(["a", "b"], "plain", ["service", "process"]))
+
+    def test_restart_dialogs_name_the_kind_of_the_refs(self):
+        run = FakeRun(done(0))
+        with patched(run):
+            dialogs.ZenityPrompter().restart([{"name": "a", "kind": "service"}])
+        self.assertIn("stopped these services earlier", argument_of(run.calls[0], "--text"))
+
+    def test_notification_that_cannot_ask_is_kind_neutral(self):
+        p = dialogs.NotifyPrompter(which_of("notify-send"))
+        p._actions = False
+        with mock.patch.object(p, "notify") as notify:
+            p.launch(launch("G"), [Target("service", "service", "s", "", 1)], None)
+        self.assertIn("GPU services running", notify.call_args[0][1])
+        self.assertNotIn("containers", notify.call_args[0][1])
+
+    def test_bidirectional_controls_are_removed(self):
+        text = dialogs.launch_message(launch("a\u202eb\u2066c\u200fd"), [target()], None, "plain")
+        self.assertIn("a b c d", text)
+
     def test_restart_message_is_neutral(self):
         for markup in ("html", "pango", "plain"):
             message = dialogs.restart_message(["a"], markup)
             self.assertIn("GPU Game Guard", message)
-            self.assertIn("stopped these containers earlier. Restart them?", message)
+            self.assertIn("stopped these programs and services earlier. Restart them?", message)
+            self.assertIn("stopped these containers earlier", dialogs.restart_message(["a"], markup, ["container"]))
             self.assertNotIn("closed", message)
 
     def test_pango_has_no_list_markup_and_uses_bullets(self):
@@ -242,7 +277,7 @@ class ZenityTests(unittest.TestCase):
     def test_launch_command_line(self):
         command = self.ask(done(0))[1].calls[0]
         self.assertEqual(command[:2], ["zenity", "--question"])
-        for flag, value in (("--title", "GPU Game Guard"), ("--ok-label", "Stop containers and launch"),
+        for flag, value in (("--title", "GPU Game Guard"), ("--ok-label", "Stop and launch"),
                             ("--cancel-label", "Launch anyway"), ("--extra-button", "Cancel")):
             self.assertEqual(argument_of(command, flag), value)
         text = argument_of(command, "--text")
@@ -308,7 +343,7 @@ class KdialogTests(unittest.TestCase):
             dialogs.KdialogPrompter().launch(launch(), [target("a&b<c>")], None)
         command = run.calls[0]
         self.assertIn("--yesnocancel", command)
-        self.assertEqual(argument_of(command, "--yes-label"), "Stop containers and launch")
+        self.assertEqual(argument_of(command, "--yes-label"), "Stop and launch")
         self.assertEqual(argument_of(command, "--no-label"), "Launch anyway")
         self.assertEqual(argument_of(command, "--cancel-label"), "Cancel")
         self.assertIn("a&amp;b&lt;c&gt;", command[-1])
@@ -407,7 +442,7 @@ class NotifyTests(unittest.TestCase):
                 self.assertEqual(p.launch(launch(), [target()], None), expected)
             ask = run.calls[-1]
             self.assertIn("--wait", ask)
-            self.assertIn("--action=stop=Stop containers and launch", ask)
+            self.assertIn("--action=stop=Stop and launch", ask)
         for answer, expected in (("restart\n", True), ("leave\n", False), ("", None), ("bogus\n", None)):
             p, run = self.prompter("--action", answer)
             with patched(run):

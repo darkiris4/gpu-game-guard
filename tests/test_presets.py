@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -82,6 +83,7 @@ class ShippedTests(unittest.TestCase):
 class FakeOllama(BaseHTTPRequestHandler):
     models = []
     unloaded = []
+    refuse = []  # model names whose unload request is answered with an error
 
     def log_message(self, *args):
         pass
@@ -95,14 +97,14 @@ class FakeOllama(BaseHTTPRequestHandler):
     def do_POST(self):
         payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self.unloaded.append((self.path, payload))
-        self.send_response(200)
+        self.send_response(500 if payload["model"] in self.refuse else 200)
         self.end_headers()
         self.wfile.write(b"{}")
 
 
 class UnloadScriptTests(unittest.TestCase):
     def setUp(self):
-        FakeOllama.models, FakeOllama.unloaded = [], []
+        FakeOllama.models, FakeOllama.unloaded, FakeOllama.refuse = [], [], []
         self.server = HTTPServer(("127.0.0.1", 0), FakeOllama)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
@@ -114,8 +116,13 @@ class UnloadScriptTests(unittest.TestCase):
         self.assertIn("127.0.0.1:11434", text)
         return text.replace("127.0.0.1:11434", address or self.address)
 
-    def run_script(self, key, address=None):
-        return subprocess.run([sys.executable, "-c", self.script(key, address)], capture_output=True, timeout=30).returncode
+    def run_script(self, key, address=None, env=None):
+        return self.run_full(key, address, env).returncode
+
+    def run_full(self, key, address=None, env=None):
+        environment = dict(os.environ, **(env or {}))
+        return subprocess.run([sys.executable, "-c", self.script(key, address)], capture_output=True, text=True,
+                              timeout=30, env=environment)
 
     def test_stop_unloads_every_model(self):
         FakeOllama.models = ["llama3:8b", "qwen2:7b"]
@@ -124,7 +131,38 @@ class UnloadScriptTests(unittest.TestCase):
                                                ("/api/generate", {"model": "qwen2:7b", "keep_alive": 0})])
 
     def test_stop_exits_zero_when_ollama_is_not_running(self):
-        self.assertEqual(self.run_script("stop", "127.0.0.1:1"), 0)
+        done = self.run_full("stop", "127.0.0.1:1")
+        self.assertEqual(done.returncode, 0)
+        self.assertIn("not reachable", done.stderr)
+
+    def test_stop_reports_what_it_did_on_stderr(self):
+        FakeOllama.models = ["llama3:8b"]
+        done = self.run_full("stop")
+        self.assertEqual((done.returncode, done.stdout), (0, ""))
+        self.assertIn("unloaded llama3:8b", done.stderr)
+
+    def test_stop_continues_after_a_failure_and_exits_non_zero(self):
+        FakeOllama.models = ["bad:1", "good:2"]
+        FakeOllama.refuse = ["bad:1"]
+        done = self.run_full("stop")
+        self.assertEqual(done.returncode, 1)
+        self.assertEqual([payload["model"] for _, payload in FakeOllama.unloaded], ["bad:1", "good:2"])
+        self.assertIn("could not unload bad:1", done.stderr)
+        self.assertIn("unloaded good:2", done.stderr)
+
+    def test_both_scripts_ignore_proxy_settings(self):
+        FakeOllama.models = ["m"]
+        proxy = {"http_proxy": "http://127.0.0.1:1", "HTTP_PROXY": "http://127.0.0.1:1", "all_proxy": "http://127.0.0.1:1",
+                 "no_proxy": "", "NO_PROXY": ""}
+        self.assertEqual(self.run_script("check", env=proxy), 0)
+        self.assertEqual(self.run_script("stop", env=proxy), 0)
+        self.assertEqual(len(FakeOllama.unloaded), 1)
+
+    def test_scripts_keep_the_standard_address_and_a_proxy_free_opener(self):
+        spec = by_id()["ollama-unload"].spec
+        for key in ("stop", "check"):
+            self.assertIn("ProxyHandler({})", spec[key][2])
+            self.assertIn("http://127.0.0.1:11434", spec[key][2])
 
     def test_check_exits_zero_only_with_loaded_models(self):
         self.assertEqual(self.run_script("check"), 1)

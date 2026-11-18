@@ -37,12 +37,17 @@ def __getattr__(name: str) -> Any:
 
 
 def app(argv: Optional[List[str]] = None) -> Any:
-    """The QApplication singleton, created on first use with a desktop-neutral application name."""
+    """The QApplication singleton, created on first use with a desktop-neutral application name. High-DPI scaling
+    and high-resolution pixmaps are switched on before it is created, which is the only time Qt accepts them."""
+    from PyQt5 import QtCore as core
     from PyQt5 import QtWidgets as widgets
 
     existing = widgets.QApplication.instance()
     if existing is not None:
         return existing
+    for attribute in ("AA_EnableHighDpiScaling", "AA_UseHighDpiPixmaps"):  # only effective before the application exists
+        if hasattr(core.Qt, attribute):
+            core.QCoreApplication.setAttribute(getattr(core.Qt, attribute), True)
     instance = widgets.QApplication(list(argv) if argv else [APP_NAME])
     instance.setApplicationName(APP_NAME)
     instance.setApplicationDisplayName(APP_NAME)

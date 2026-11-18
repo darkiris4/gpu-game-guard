@@ -627,5 +627,121 @@ class RunWiringTests(Sandbox):
         self.assertIn("poll_seconds", live.error)
 
 
+class PauseBoundsTests(Sandbox):
+    def test_absurd_durations_are_rejected_and_nothing_is_written(self):
+        for text in ("1" * 400 + "d", "99999999999999999999999d", "366d", "9" * 400 + "s", "1e5d", "100000d", "5000000h"):
+            code, _, err = self.cli("pause", "--for", text)
+            self.assertEqual(code, 2, text[:20])
+            self.assertFalse((self.state / "pause.json").exists())
+        code, _, err = self.cli("pause", "--for", "366d")
+        self.assertIn("365 days", err)
+
+    def test_the_maximum_is_accepted(self):
+        self.assertEqual(self.cli("pause", "--for", "365d")[0], 0)
+        self.assertEqual(cli.parse_duration("365d"), 365 * 86400)
+
+    def test_command_pause_refuses_a_bad_duration_given_directly(self):
+        args = types.SimpleNamespace(duration=float("inf"))
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.state)}), redirect_stderr(io.StringIO()):
+            self.assertEqual(cli.command_pause(args), 2)
+        self.assertFalse((self.state / "pause.json").exists())
+
+
+class ConfigEditPreservationTests(Sandbox):
+    def test_unknown_keys_survive_targets_edits(self):
+        self.write({"future": {"k": 1}, "games": {"steam:1": {"action": "stop", "note": "n"}},
+                    "targets": [dict(TARGETS[2], pinned=True), TARGETS[0]]})
+        self.assertEqual(self.cli("targets", "disable", TARGETS[2]["id"])[0], 0)
+        data = self.stored()
+        self.assertEqual(data["future"], {"k": 1})
+        self.assertEqual(data["games"]["steam:1"]["note"], "n")
+        self.assertTrue(data["targets"][0]["pinned"])
+        self.assertFalse(data["targets"][0]["enabled"])
+        self.assertEqual(self.cli("targets", "remove", TARGETS[0]["id"])[0], 0)
+        self.assertEqual(self.stored()["future"], {"k": 1})
+
+    def test_unknown_keys_survive_presets_add(self):
+        self.write({"future": 1})
+        a, b = PresetsCommandTests.patched(self, [fake_preset("p1")])
+        with a, b:
+            self.assertEqual(self.cli("presets", "add", "p1")[0], 0)
+        self.assertEqual(self.stored()["future"], 1)
+
+    def test_a_backup_is_left_by_an_edit(self):
+        self.write({"targets": TARGETS})
+        self.cli("targets", "disable", TARGETS[2]["id"])
+        self.assertEqual(len(json.loads((self.dir / "config.json.bak").read_text())["targets"]), 3)
+
+    def test_config_show_includes_unknown_keys(self):
+        self.write({"future": {"k": 1}})
+        code, out, _ = self.cli("config", "show")
+        self.assertEqual((code, json.loads(out)["future"]), (0, {"k": 1}))
+
+    def test_config_validate_explains_that_unknown_keys_are_kept(self):
+        self.write({"future": 1})
+        code, _, err = self.cli("config", "validate")
+        self.assertEqual(code, 1)
+        self.assertIn("unknown key", err)
+        self.assertIn("keeps them", err)
+
+
+class PresetProviderWarningTests(Sandbox):
+    def test_a_provider_missing_from_runtimes_is_warned_about_with_the_fix(self):
+        self.write({"runtimes": ["docker", "podman"]})
+        a, b = PresetsCommandTests.patched(self, [fake_preset("p1")])
+        with a, b:
+            code, out, err = self.cli("presets", "add", "p1")
+        self.assertEqual(code, 0)
+        self.assertIn("added p1", out)
+        self.assertIn('"runtimes": ["docker", "podman", "service"]', err)
+        self.assertIn("restart", err)
+        self.assertEqual(config.load(self.path).target("p1").kind, "service")
+
+    def test_no_warning_when_the_provider_is_listed(self):
+        a, b = PresetsCommandTests.patched(self, [fake_preset("p1")])
+        with a, b:
+            _, _, err = self.cli("presets", "add", "p1")
+        self.assertNotIn("runtimes", err)
+
+    def test_command_presets_are_checked_too(self):
+        self.write({"runtimes": ["docker"]})
+        spec = {"id": "c1", "kind": "command", "label": "C", "stop": ["a"], "start": ["b"]}
+        a, b = PresetsCommandTests.patched(self, [fake_preset("c1", spec)])
+        with a, b:
+            _, _, err = self.cli("presets", "add", "c1")
+        self.assertIn('"runtimes": ["docker", "command"]', err)
+
+
+class SettingsConfigPathTests(Sandbox):
+    def test_the_config_path_is_passed_only_when_given(self):
+        calls = []
+
+        def run_window(**kwargs):
+            calls.append(kwargs)
+            return 0
+
+        helper = QtCommandTests("test_settings_and_tray_call_run")
+        patches = helper.modules(True, settings={"run": run_window})
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.assertEqual(self.cli("settings")[0], 0)
+        self.assertEqual(calls, [{"config_path": self.path}])
+        calls.clear()
+        with mock.patch.object(cli.configmod, "config_path", return_value=self.path):
+            self.assertEqual(run("settings", state_dir=self.state)[0], 0)
+        self.assertEqual(calls, [{}])
+
+    def test_a_window_without_the_parameter_is_started_without_it(self):
+        def run_window():
+            return 0
+
+        helper = QtCommandTests("test_settings_and_tray_call_run")
+        for patch in helper.modules(True, settings={"run": run_window}):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.assertEqual(self.cli("settings")[0], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

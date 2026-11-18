@@ -1,21 +1,24 @@
-"""Configured systemd services as a Runtime."""
+"""Configured systemd services as a Runtime. Every unit is validated strictly (see `gpu.valid_unit`) and passed to
+systemctl after `--`. A start follows the unit and scope recorded in the ref, so it works after the target's spec was
+disabled or removed."""
 from __future__ import annotations
 
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import gpu, util
 from .model import Ref, Target
 
 CHANGE_TIMEOUT = 120.0  # stopping a service waits for its own shutdown first
 QUERY_TIMEOUT = 10.0
-_AUTH_FAILURES = ("interactive authentication required", "access denied", "failed to stop")
+_AUTH_FAILURES = ("interactive authentication required", "access denied", "authentication is required")
 
 
-def _systemctl(spec: Any, *args: str) -> List[str]:
-    return ["systemctl", *(["--user"] if getattr(spec, "scope", None) == "user" else []), *args]
+def _systemctl(scope: Optional[str], *args: str, unit: str) -> List[str]:
+    """A systemctl command line; `--` keeps the unit from being read as an option."""
+    return ["systemctl", *(["--user"] if scope == "user" else []), *args, "--", unit]
 
 
 class ServiceRuntime:
@@ -39,7 +42,7 @@ class ServiceRuntime:
         return self._which("systemctl") is not None
 
     def _is_active(self, spec: Any) -> bool:
-        result = self._run(_systemctl(spec, "is-active", spec.unit), timeout=QUERY_TIMEOUT)
+        result = self._run(_systemctl(spec.scope, "is-active", unit=spec.unit), timeout=QUERY_TIMEOUT)
         return result is not None and result.stdout.strip() == "active"
 
     def _unit_pids(self, unit: str, pids: Sequence[int]) -> List[int]:
@@ -68,31 +71,60 @@ class ServiceRuntime:
             targets.append(Target("service", self.name, gpu.display_name(spec), "", vram, "", extra))
         return targets
 
-    def _report_failure(self, verb: str, spec: Any, result: gpu.CommandResult) -> None:
+    def _report_failure(self, verb: str, unit: str, scope: str, result: gpu.CommandResult) -> None:
         detail = (result.stderr.strip() or result.stdout.strip()).splitlines()
         text = detail[-1] if detail else f"exit status {result.returncode}"
         refused = any(marker in " ".join(detail).lower() for marker in _AUTH_FAILURES)
-        if (spec.scope or "system") == "system" and refused:
-            gpu.log_once(f"service {verb} {spec.unit}",
-                         f"systemctl {verb} {spec.unit}: not authorised ({text}); "
-                         f"run 'sudo gpu-game-guard polkit allow {spec.unit}' to allow it without a password")
+        if scope == "system" and refused:
+            gpu.log_once(f"service {verb} {unit}",
+                         f"systemctl {verb} {unit}: not authorised ({text}); "
+                         f"run 'sudo gpu-game-guard polkit allow {unit}' to allow it without a password")
         else:
-            gpu.log_once(f"service {verb} {spec.unit}", f"systemctl {verb} {spec.unit}: {text}")
+            gpu.log_once(f"service {verb} {unit}", f"systemctl {verb} {unit}: {text}")
 
-    def _change(self, verb: str, ref: Ref) -> None:
+    def _resolve(self, verb: str, ref: Ref) -> Optional[Tuple[str, str]]:
+        """(unit, scope) to act on for a ref, or None after logging why it is refused.
+
+        A stop follows the live configuration only. A start (the spec may have been disabled or
+        removed since the stop) follows the ref's own unit and scope, falling back to the live configuration for a
+        ref that records none. Either way the unit must pass the strict unit rule.
+        """
+        own_unit, own_scope = ref.get("unit"), ref.get("scope") or "system"
+        spec = None
+        if verb == "stop" or own_unit is None:
+            spec = gpu.find_spec(self._get_config, "service", ref, include_disabled=verb == "start")
+        candidates = []
+        if verb == "start":
+            candidates.append((own_unit, own_scope))
+        if spec is not None:
+            candidates.append((spec.unit, spec.scope or "system"))
+        for unit, scope in candidates:
+            if unit is None:
+                continue
+            if not gpu.valid_unit(unit) or scope not in ("system", "user"):
+                gpu.log_once(f"service unit {unit}", f"service: refusing unit {str(unit)[:100]!r} (scope {str(scope)[:20]!r}): not a valid service unit")
+                return None
+            return unit, scope
+        return None
+
+    def _change(self, verb: str, ref: Ref) -> bool:
+        """Run `stop` or `start` for one ref; True when systemctl succeeded. Never raises."""
         try:
-            spec = gpu.find_spec(self._get_config, "service", ref)
-            if spec is None:
-                return
-            result = self._run(_systemctl(spec, "--no-ask-password", verb, spec.unit), timeout=CHANGE_TIMEOUT)
+            resolved = self._resolve(verb, ref)
+            if resolved is None:
+                return False
+            unit, scope = resolved
+            result = self._run(_systemctl(scope, "--no-ask-password", verb, unit=unit), timeout=CHANGE_TIMEOUT)
             if result is None:
-                return
+                return False
             if result.returncode != 0:
-                self._report_failure(verb, spec, result)
-            else:
-                gpu.clear_failure(f"service {verb} {spec.unit}")
+                self._report_failure(verb, unit, scope, result)
+                return False
+            gpu.clear_failure(f"service {verb} {unit}")
+            return True
         except Exception as exc:
             util.log(f"service {verb}: {exc}")
+            return False
 
     def stop(self, refs: Sequence[Ref]) -> None:
         own = gpu.own_refs(refs, "service", self.name)
@@ -101,6 +133,6 @@ class ServiceRuntime:
         with ThreadPoolExecutor(max_workers=len(own)) as pool:
             list(pool.map(lambda ref: self._change("stop", ref), own))
 
-    def start(self, refs: Sequence[Ref]) -> None:
-        for ref in gpu.own_refs(refs, "service", self.name):
-            self._change("start", ref)
+    def start(self, refs: Sequence[Ref]) -> Optional[List[Ref]]:
+        """Start the services; returns the refs that could not be started."""
+        return [ref for ref in gpu.own_refs(refs, "service", self.name) if not self._change("start", ref)]

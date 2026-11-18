@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -14,9 +15,13 @@ from gpu_game_guard.config import TargetSpec  # noqa: E402
 from gpu_game_guard.discovery import Candidate  # noqa: E402
 from gpu_game_guard.ui import qt  # noqa: E402
 
+PAYLOAD = '<b>x</b><img src="file:///etc/passwd"><a href="x">y</a>'
+
 if qt.available():
-    from gpu_game_guard.ui import basic, theme
+    from gpu_game_guard.ui import basic, settings_model, theme
     from gpu_game_guard.ui.settings_model import SettingsModel
+
+    QtCore, QtWidgets = qt.QtCore, qt.QtWidgets
 
 
 def container(name, image="", vram=None):
@@ -53,7 +58,7 @@ class BasicViewTests(unittest.TestCase):
                       service("ollama.service", 6400), process("obs")]
         self.discoveries = 0
         self.model = SettingsModel(self.dir / "config.json", self.status_dir, discover=self.discover,
-                                   runner=lambda argv: (0, ""))
+                                   runner=lambda argv: (0, ""), threaded=False)
         self.view = basic.BasicView(self.model, autoload=False)
         self.addCleanup(self.view.deleteLater)
 
@@ -69,7 +74,7 @@ class BasicViewTests(unittest.TestCase):
 
     def test_nothing_is_discovered_until_load(self):
         self.assertEqual(self.discoveries, 0)
-        self.assertIn("Looking", self.view.empty_label.text())
+        self.assertIn("Scanning", self.view.empty_label.text())
         self.view.load()
         self.assertEqual(self.discoveries, 1)
 
@@ -134,13 +139,23 @@ class BasicViewTests(unittest.TestCase):
         self.assertFalse(row.switch.isEnabled())
         self.assertTrue(row.switch.toolTip())
 
-    def test_turning_a_container_on_enables_auto_containers(self):
+    def test_containers_cannot_be_switched_on_while_detection_is_off(self):
         self.model.update(auto_containers=False)
         self.view.load()
-        switch = self.rows()["comfyui"].switch
-        self.assertFalse(switch.isChecked())
-        switch.setChecked(True)
+        row = self.rows()["comfyui"]
+        self.assertFalse(row.switch.isChecked())
+        self.assertFalse(row.switch.isEnabled())
+        self.assertIn("Automatic detection", row.switch.toolTip())
+        self.assertFalse(self.view.auto_button.isHidden())
+        self.view.auto_button.click()
         self.assertTrue(self.model.config.auto_containers)
+        self.assertTrue(self.view.auto_button.isHidden())
+        self.assertTrue(self.rows()["comfyui"].switch.isEnabled())
+        self.assertTrue(self.rows()["comfyui"].switch.isChecked())
+
+    def test_the_automatic_detection_button_is_hidden_while_detection_is_on(self):
+        self.view.load()
+        self.assertTrue(self.view.auto_button.isHidden())
 
     def test_service_toggle_adds_and_removes_a_target(self):
         self.view.load()
@@ -152,7 +167,29 @@ class BasicViewTests(unittest.TestCase):
                          ("service", "ollama.service", "system", "Ollama", True))
         self.assertEqual(configmod.validate(self.model.config.to_json()), [])
         switch.setChecked(False)
-        self.assertEqual(self.model.config.targets, [])
+        self.assertEqual([(t.id, t.enabled) for t in self.model.config.targets], [("ollama", False)])
+        self.assertFalse(self.rows()["ollama.service"].switch.isChecked())
+
+    def test_switching_a_service_off_keeps_a_hand_made_spec(self):
+        spec = TargetSpec(id="llm", kind="service", label="My LLM", unit="ollama.service", extra={"note": "keep"})
+        twin = TargetSpec(id="llm-2", kind="service", label="My LLM 2", unit="ollama.service")
+        self.model.set_target(spec)
+        self.model.set_target(twin)
+        self.view.load()
+        switch = self.rows()["ollama.service"].switch
+        self.assertTrue(switch.isChecked())
+        switch.setChecked(False)
+        self.assertEqual([(t.id, t.label, t.enabled) for t in self.model.config.targets],
+                         [("llm", "My LLM", False), ("llm-2", "My LLM 2", False)])
+        self.assertEqual(self.model.config.target("llm").extra, {"note": "keep"})
+        switch.setChecked(True)
+        self.assertEqual([(t.id, t.enabled) for t in self.model.config.targets], [("llm", True), ("llm-2", True)])
+
+    def test_a_service_with_one_enabled_spec_of_several_shows_as_on(self):
+        self.model.set_target(TargetSpec(id="a", kind="service", label="A", unit="ollama.service", enabled=False))
+        self.model.set_target(TargetSpec(id="b", kind="service", label="B", unit="ollama.service"))
+        self.view.load()
+        self.assertTrue(self.rows()["ollama.service"].switch.isChecked())
 
     def test_service_toggle_picks_an_unused_id(self):
         self.model.set_target(TargetSpec(id="ollama", kind="command", stop=["a"], start=["b"]))
@@ -185,8 +222,8 @@ class BasicViewTests(unittest.TestCase):
         self.assertEqual(row.badge.text(), "idle")
         self.assertTrue(row.switch.isChecked())
         row.switch.setChecked(False)
-        self.assertEqual(self.model.config.targets, [])
-        self.assertEqual(self.rows(), {})
+        self.assertEqual([(t.id, t.enabled) for t in self.model.config.targets], [("ollama", False)])
+        self.assertFalse(self.rows()["ollama.service"].switch.isChecked())
 
     def test_rows_follow_changes_made_elsewhere(self):
         self.view.load()
@@ -264,6 +301,31 @@ class BasicViewTests(unittest.TestCase):
         self.rows()["open-webui"].switch.setChecked(False)
         self.assertEqual(self.view.detail.text(), "Nothing is set to be paused right now.")
 
+    def test_command_and_process_targets_count_as_set_to_be_paused(self):
+        self.found = []
+        self.watching()
+        self.model.set_target(TargetSpec(id="job", kind="command", stop=["a"], start=["b"]))
+        self.model.set_target(TargetSpec(id="obs", kind="process", match="obs"))
+        self.view.load()
+        self.assertEqual(self.view.detail.text(), "Ready to pause 2 things when a game starts.")
+        self.model.set_target(TargetSpec(id="job", kind="command", stop=["a"], start=["b"], enabled=False))
+        self.assertEqual(self.view.detail.text(), "Ready to pause 1 thing when a game starts.")
+        self.model.set_target(TargetSpec(id="obs", kind="process", match="obs", enabled=False))
+        self.assertEqual(self.view.detail.text(), "Nothing is set to be paused right now.")
+
+    def test_the_card_and_the_header_pill_agree_about_a_pending_restart(self):
+        self.watching()
+        self.model.update(dialog="none")
+        self.model.apply()
+        self.view.refresh_status()
+        self.assertEqual(self.view.state, "restart-pending")
+        self.assertEqual(self.view.headline.text(), "GPU Game Guard needs a restart")
+        self.assertEqual(settings_model.service_state(self.model)[0], settings_model.STATE_RESTART)
+        self.model.pause()
+        self.view.refresh_status()
+        self.assertEqual(self.view.state, "paused")
+        self.assertEqual(settings_model.service_state(self.model)[0], settings_model.STATE_PAUSED)
+
     def test_status_buttons_when_watching(self):
         self.watching()
         self.view.refresh_status()
@@ -280,6 +342,7 @@ class BasicViewTests(unittest.TestCase):
         self.assertAlmostEqual(until, time.time() + 3600, delta=30)
         self.assertEqual(self.view.headline.text(),
                          f"GPU Game Guard is paused until {basic.clock_text(until)}")
+        self.assertRegex(basic.clock_text(until), r"^(\w{3} )?\d\d:\d\d$")
         self.assertFalse(self.view.resume_button.isHidden())
         self.assertTrue(self.view.pause_hour.isHidden())
         self.view.resume_button.click()
@@ -312,15 +375,32 @@ class BasicViewTests(unittest.TestCase):
 
     def test_clock_text(self):
         now = time.mktime((2026, 11, 18, 12, 0, 0, 0, 0, -1))
-        self.assertEqual(basic.clock_text(time.mktime((2026, 11, 18, 15, 40, 0, 0, 0, -1)), now), "3:40 PM")
-        self.assertEqual(basic.clock_text(time.mktime((2026, 11, 18, 9, 5, 0, 0, 0, -1)), now), "9:05 AM")
-        self.assertEqual(basic.clock_text(time.mktime((2026, 11, 19, 9, 5, 0, 0, 0, -1)), now), "Thu 9:05 AM")
+        self.assertEqual(basic.clock_text(time.mktime((2026, 11, 18, 15, 40, 0, 0, 0, -1)), now), "15:40")
+        self.assertEqual(basic.clock_text(time.mktime((2026, 11, 18, 9, 5, 0, 0, 0, -1)), now), "09:05")
+        self.assertEqual(basic.clock_text(time.mktime((2026, 11, 19, 9, 5, 0, 0, 0, -1)), now), "Thu 09:05")
+
+    def test_clock_text_survives_values_no_clock_can_show(self):
+        for value in (1e18, 1e30, float("inf"), float("nan"), 253402300800.0 * 10):
+            self.assertEqual(basic.clock_text(value), "until resumed", value)
+
+    def test_a_pause_that_ends_beyond_year_9999_reads_as_until_resumed(self):
+        self.watching()
+        statusmod.pause(1e12, self.status_dir)
+        self.view.refresh_status()
+        self.assertEqual(self.view.headline.text(), "GPU Game Guard is paused until you resume it")
 
     def test_slug_ids(self):
         self.assertEqual(basic.slug_id("My App@1.service", []), "my-app-1")
         self.assertEqual(basic.slug_id("ollama.service", ["ollama", "ollama-2"]), "ollama-3")
         self.assertEqual(len(basic.slug_id("x" * 80 + ".service", [])), 40)
-        self.assertEqual(basic.slug_id("###.service", []), "service")
+        self.assertTrue(basic.slug_id("###.service", []).startswith("service-"))
+        self.assertNotEqual(basic.slug_id("###.service", []), basic.slug_id("%%%.service", []))
+
+    def test_a_new_service_label_never_repeats_an_existing_one(self):
+        targets = [TargetSpec(id="a", kind="command", label="Ollama", stop=["x"], start=["y"]),
+                   TargetSpec(id="b", kind="service", label="Ollama (2)", unit="b.service")]
+        self.assertEqual(basic.unique_label("ollama", targets), "ollama (3)")
+        self.assertEqual(basic.unique_label("Other", targets), "Other")
 
     def test_footnote_link_requests_advanced(self):
         seen = []
@@ -331,6 +411,45 @@ class BasicViewTests(unittest.TestCase):
     def test_switches_have_accessible_names(self):
         self.view.load()
         self.assertEqual(self.rows()["comfyui"].switch.accessibleName(), "Pause Comfyui while gaming")
+
+    def test_the_status_card_and_rows_show_markup_literally(self):
+        payload = PAYLOAD
+        self.found = [container(payload, payload, 10)]
+        statusmod.write_status(statusmod.Status(
+            updated=time.time(), state="game-running",
+            stopped=[{"kind": "container", "runtime": "docker", "name": payload}]), self.status_dir)
+        self.view.load()
+        self.view.refresh_status()
+        for label in self.view.findChildren(QtWidgets.QLabel):
+            if label is not self.view.footnote and QtCore.Qt.mightBeRichText(label.text()):
+                self.assertEqual(label.textFormat(), QtCore.Qt.PlainText, label.text())
+        self.assertIn("<b>", self.view.detail.text())
+        row = list(self.rows().values())[0]
+        self.assertEqual(row.title_label.textFormat(), QtCore.Qt.PlainText)
+
+    def test_the_load_is_in_the_background_and_lands_on_the_ui_thread(self):
+        gate = threading.Event()
+        threads = []
+
+        def slow(config):
+            threads.append(threading.current_thread())
+            gate.wait(5)
+            return [container("comfyui")]
+
+        model = SettingsModel(self.dir / "other.json", self.status_dir, discover=slow, runner=lambda argv: (0, ""))
+        view = basic.BasicView(model, autoload=False)
+        self.addCleanup(view.deleteLater)
+        self.addCleanup(model.shutdown)
+        view.load()
+        self.assertTrue(model.scanning)
+        self.assertEqual(view.empty_label.text(), "Scanning...")
+        self.assertFalse(view.refresh_button.isEnabled())
+        gate.set()
+        self.assertTrue(model.wait_scan(5))
+        self.assertIsNot(threads[0], threading.main_thread())
+        self.assertFalse(model.scanning)
+        self.assertEqual([row.item.name for row in view._rows], ["comfyui"])
+        self.assertTrue(view.refresh_button.isEnabled())
 
     def test_renders_populated_and_empty_in_both_themes(self):
         self.watching()

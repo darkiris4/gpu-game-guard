@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -57,7 +58,7 @@ class Base(unittest.TestCase):
         return list(self.found)
 
     def make(self) -> "SettingsModel":
-        return SettingsModel(self.path, self.status_dir, discover=self.discover, runner=self.runner)
+        return SettingsModel(self.path, self.status_dir, discover=self.discover, runner=self.runner, threaded=False)
 
 
 @unittest.skipUnless(qt.available(), "PyQt5 is not installed")
@@ -146,7 +147,7 @@ class ModelTests(Base):
         self.assertEqual(model.config, Config())
         model.update(on_launch="stop")
         problems = model.apply()
-        self.assertIn("not valid JSON", problems[0])
+        self.assertIn("could not be read", problems[0])
         self.assertEqual(self.path.read_text(), "{ not json")
         model.accept_defaults()
         self.assertEqual(model.load_error, "")
@@ -358,7 +359,7 @@ class ModelTests(Base):
 
 
 @unittest.skipUnless(qt.available(), "PyQt5 is not installed")
-class WindowTests(Base):
+class WindowBase(Base):
     def setUp(self):
         super().setUp()
         theme.apply_theme(self.app, dark=False)
@@ -380,6 +381,8 @@ class WindowTests(Base):
     def watching(self):
         statusmod.write_status(statusmod.Status(updated=time.time()), self.status_dir)
 
+
+class WindowTests(WindowBase):
     def test_basic_is_the_default_page(self):
         window = self.window()
         self.assertEqual(window.mode, "basic")
@@ -453,13 +456,17 @@ class WindowTests(Base):
         window.model.apply()
         window.restart_banner.button.click()
         self.assertFalse(window.restart_banner.isHidden())
-        self.assertIn("Failed to connect to bus", window.problems_callout.label.text())
+        shown = window.problems_callout.label.text()
+        self.assertIn("Failed to connect to bus", shown)
+        self.assertTrue(shown.startswith("Settings saved, but the service could not be restarted:"))
+        self.assertNotIn("were not saved", shown)
 
     def test_unreadable_config_offers_the_defaults(self):
         self.path.write_text("nope")
         window = self.window()
         self.assertFalse(window.load_callout.isHidden())
-        window.load_callout.button.click()
+        window.confirm_defaults = lambda w: True
+        window.defaults_button.click()
         self.assertTrue(window.load_callout.isHidden())
         self.assertTrue(window.apply_button.isEnabled())
 
@@ -518,9 +525,16 @@ class WindowTests(Base):
         self.assertEqual(self.window().mode, "basic")
 
     def test_small_saved_size_is_raised_to_the_minimum(self):
-        self.prefs.write_text(json.dumps({"size": [100, 100]}))
+        self.prefs.write_text(json.dumps({"size": [250, 300]}))
         window = self.window()
-        self.assertEqual((window.width(), window.height()), (780, 600))
+        self.assertEqual((window.width(), window.height()), (window.minimumWidth(), window.minimumHeight()))
+        self.assertGreaterEqual(window.minimumWidth(), 780)
+
+    def test_sizes_outside_the_accepted_range_fall_back_to_the_default(self):
+        for size in ([100, 100], [10 ** 9, 600], [900, 10 ** 30], [900, 1.5e3], [True, True], [900], [-5, 700]):
+            self.prefs.write_text(json.dumps({"size": size}))
+            window = self.window()
+            self.assertEqual((window.width(), window.height()), settings.DEFAULT_SIZE, size)
 
     def test_prefs_default_next_to_the_config(self):
         window = settings.SettingsWindow(self.make())
@@ -567,6 +581,233 @@ class WindowTests(Base):
             out = self.dir / f"window-{dark}.png"
             self.assertTrue(theme.render(window, str(out)))
             self.assertGreater(out.stat().st_size, 1000)
+
+
+@unittest.skipUnless(qt.available(), "PyQt5 is not installed")
+class RecoveryWindowTests(WindowBase):
+    """The window around a file that cannot be loaded, merged saves and the single Apply."""
+
+    def test_the_callout_lists_every_problem_and_offers_two_ways_out(self):
+        text = json.dumps({"on_launch": "sometimes", "heavy_vram_mib": -4})
+        self.path.write_text(text)
+        window = self.window()
+        shown = window.load_callout.label.text()
+        self.assertIn("on_launch", shown)
+        self.assertIn("heavy_vram_mib", shown)
+        self.assertEqual(window.load_callout.button.text(), "Open in Raw editor to fix")
+        self.assertEqual(window.defaults_button.text(), "Start from the defaults")
+        self.assertEqual(self.path.read_text(), text)
+
+    def test_declining_the_defaults_changes_nothing(self):
+        self.path.write_text("{")
+        window = self.window()
+        window.confirm_defaults = lambda w: False
+        window.defaults_button.click()
+        self.assertFalse(window.load_callout.isHidden())
+        self.assertFalse(window.model.dirty)
+
+    def test_the_raw_editor_opens_on_the_text_of_the_file_not_the_defaults(self):
+        text = '{"on_launch": "sometimes", "games": {"steam:1": {"name": "Precious", "action": "stop"}}}'
+        self.path.write_text(text)
+        window = self.window()
+        window.load_callout.button.click()
+        self.assertEqual(window.mode, "advanced")
+        self.assertEqual(window.advanced.current_name(), "Raw config")
+        self.assertEqual(window.advanced.raw.text(), text)
+        window.advanced.raw.set_text(text.replace("sometimes", "stop"))
+        self.assertTrue(window.load_callout.isHidden())
+        self.assertTrue(window.apply())
+        saved = configmod.load(self.path)
+        self.assertEqual((saved.on_launch, saved.games["steam:1"].name), ("stop", "Precious"))
+
+    def test_starting_from_the_defaults_says_where_the_old_file_went(self):
+        self.path.write_text("{ not json")
+        window = self.window()
+        window.confirm_defaults = lambda w: True
+        window.defaults_button.click()
+        self.assertFalse(window.notice_callout.isHidden())
+        self.assertIn(".broken-", window.notice_callout.label.text())
+        self.assertTrue(window.apply())
+        copies = list(self.dir.glob("config.json.broken-*"))
+        self.assertEqual(len(copies), 1)
+        self.assertIn(str(copies[0]), window.notice_callout.label.text())
+        self.assertEqual(copies[0].read_text(), "{ not json")
+
+    def test_a_merged_save_is_announced(self):
+        window = self.window()
+        window.model.update(after_game="leave")
+        configmod.update_file(lambda c: c.with_game("steam:9", "Nine", "stop"), self.path)
+        self.assertTrue(window.apply())
+        self.assertIn("your edits were merged", window.notice_callout.label.text())
+        self.assertFalse(window.notice_callout.isHidden())
+        window.model.update(after_game="restart")
+        window.revert()
+        self.assertTrue(window.notice_callout.isHidden())
+
+    def test_the_footer_apply_covers_edits_made_in_the_raw_tab(self):
+        window = self.window()
+        window.set_mode("advanced", save=False)
+        raw = window.advanced.raw
+        data = window.model.config.to_json()
+        data["heavy_vram_mib"] = 2222
+        raw.set_text(json.dumps(data))
+        self.assertTrue(window.apply_button.isEnabled())
+        window.apply_button.click()
+        self.assertEqual(configmod.load(self.path).heavy_vram_mib, 2222)
+        raw.set_text("{")
+        self.assertTrue(window.apply_button.isEnabled())
+        self.assertFalse(window.apply())
+        self.assertIn("Raw config", window.problems_callout.label.text())
+
+    def test_the_window_picks_up_an_edit_made_elsewhere_while_it_has_none(self):
+        window = self.window()
+        configmod.update_file(lambda c: Config.from_json({**c.to_json(), "on_launch": "stop"}), self.path)
+        window.tick()
+        self.assertEqual(window.basic.on_launch.value(), "stop")
+        self.assertFalse(window.apply_button.isEnabled())
+
+    def test_markup_in_a_problem_is_shown_literally(self):
+        payload = '<b>x</b><img src="file:///etc/passwd"><a href="x">y</a>'
+        self.path.write_text(json.dumps({"games": {payload: {"action": payload}}}))
+        window = self.window()
+        label = window.load_callout.label
+        self.assertEqual(label.textFormat(), QtCore.Qt.PlainText)
+        self.assertIn("<b>x</b>", label.text())
+        window.confirm_defaults = lambda w: True
+        window.model.update(on_launch="stop")
+        window.model.set_raw_problems([payload])
+        window.apply()
+        self.assertEqual(window.problems_callout.label.textFormat(), QtCore.Qt.PlainText)
+        self.assertIn("<b>x</b>", window.problems_callout.label.text())
+
+    def test_the_pill_and_the_status_card_say_the_same_thing(self):
+        window = self.window()
+        self.watching()
+        window.model.update(dialog="none")
+        window.model.apply()
+        for paused in (False, True):
+            if paused:
+                window.model.pause()
+            window.refresh()
+            state = {"Restart pending": "restart-pending", "Paused": "paused"}[window.pill.text()]
+            self.assertEqual(window.basic.state, state)
+
+    def test_the_application_font_widens_the_minimum_size(self):
+        original = QtWidgets.QApplication.font()
+        self.addCleanup(QtWidgets.QApplication.setFont, original)
+        window = self.window()
+        window.screen_limit = lambda: QtCore.QSize(6000, 6000)
+        window.set_mode("advanced", save=False)
+        big = QtCore.QSize(6000, 6000)
+        window.fit_minimum(big)
+        normal = window.minimumWidth()
+        large = QtGui.QFont(original)
+        large.setPointSizeF(16)
+        QtWidgets.QApplication.setFont(large)
+        theme.apply_theme(self.app, dark=False)
+        self.app.processEvents()
+        window.fit_minimum(big)
+        self.assertGreater(window.minimumWidth(), normal)
+
+    def test_no_button_is_clipped_at_the_minimum_size_in_the_default_and_a_large_font(self):
+        original = QtWidgets.QApplication.font()
+        self.addCleanup(QtWidgets.QApplication.setFont, original)
+        self.addCleanup(theme.apply_theme, self.app, False)
+        for points in (None, 16):
+            if points:
+                font = QtGui.QFont(original)
+                font.setPointSizeF(points)
+                QtWidgets.QApplication.setFont(font)
+                theme.apply_theme(self.app, dark=False)
+            window = self.window()
+            window.screen_limit = lambda: QtCore.QSize(6000, 6000)
+            window.set_mode("advanced", save=False)
+            window.show()
+            window.fit_minimum()
+            for name in window.advanced.tab_names():
+                window.advanced.show_tab(name)
+                window.resize(window.minimumSize())
+                self.app.processEvents()
+                for widget in window.findChildren(QtWidgets.QPushButton):
+                    if widget.isVisibleTo(window) and widget.text():
+                        self.assertGreaterEqual(widget.width() + 2, widget.sizeHint().width(),
+                                                f"{points} {name} {widget.text()}")
+            tabs = window.advanced.tabs.tabBar()
+            self.assertGreaterEqual(tabs.width(), tabs.sizeHint().width(), points)
+
+
+@unittest.skipUnless(qt.available(), "PyQt5 is not installed")
+class RunTests(Base):
+    def test_a_second_window_exits_quietly(self):
+        from unittest import mock
+
+        with mock.patch.object(settings.singleton, "acquire", return_value=None) as acquire, \
+                mock.patch.object(settings, "log") as log, mock.patch.object(settings, "SettingsWindow") as window:
+            self.assertEqual(settings.run(self.path), 0)
+        acquire.assert_called_once_with("settings")
+        window.assert_not_called()
+        self.assertEqual(log.call_count, 1)
+
+    def test_run_uses_the_given_config_and_releases_the_lock(self):
+        from unittest import mock
+
+        lock = mock.Mock()
+        seen = {}
+
+        class Recorder(QtWidgets.QMainWindow):
+            def __init__(self, model):
+                super().__init__()
+                seen["path"] = model.path
+                seen["model"] = model
+
+            def show(self):
+                seen["shown"] = True
+
+        with mock.patch.object(settings.singleton, "acquire", return_value=lock), \
+                mock.patch.object(settings, "SettingsWindow", Recorder), \
+                mock.patch.object(QtWidgets.QApplication, "exec_", return_value=7):
+            self.assertEqual(settings.run(config_path=self.path), 7)
+        self.assertEqual(seen["path"], self.path)
+        self.assertTrue(seen["shown"])
+        lock.release.assert_called_once_with()
+
+    def test_the_lock_is_released_when_the_window_fails(self):
+        from unittest import mock
+
+        lock = mock.Mock()
+        with mock.patch.object(settings.singleton, "acquire", return_value=lock), \
+                mock.patch.object(settings, "SettingsWindow", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                settings.run()
+        lock.release.assert_called_once_with()
+
+    def test_the_window_scans_in_the_background(self):
+        gate = threading.Event()
+
+        def slow(config):
+            gate.wait(5)
+            return [candidate("comfy")]
+
+        model = SettingsModel(self.path, self.status_dir, discover=slow, runner=self.runner)
+        window = settings.SettingsWindow(model, self.dir / "ui.json")
+        self.addCleanup(window.deleteLater)
+        self.addCleanup(model.shutdown)
+        window.basic.load()
+        self.assertEqual(window.basic.empty_label.text(), "Scanning...")
+        self.assertFalse(window.basic.refresh_button.isEnabled())
+        gate.set()
+        self.assertTrue(model.wait_scan(5))
+        self.assertEqual([row.item.name for row in window.basic._rows], ["comfy"])
+
+    def test_closing_waits_for_a_running_scan(self):
+        gate = threading.Event()
+        model = SettingsModel(self.path, self.status_dir, discover=lambda c: (gate.wait(5), [])[1], runner=self.runner)
+        window = settings.SettingsWindow(model, self.dir / "ui.json")
+        self.addCleanup(window.deleteLater)
+        model.scan()
+        threading.Timer(0.2, gate.set).start()
+        window.close()
+        self.assertFalse(model.scanning)
 
 
 if __name__ == "__main__":

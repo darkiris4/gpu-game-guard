@@ -71,8 +71,9 @@ class Runtime(Protocol):
     def stop(self, refs: Sequence[Ref]) -> None:
         """Stop the referenced targets (in parallel). Failures are logged, not raised."""
 
-    def start(self, refs: Sequence[Ref]) -> None:
-        """Start the referenced targets. Failures are logged, not raised."""
+    def start(self, refs: Sequence[Ref]) -> Optional[List[Ref]]:
+        """Start the referenced targets. Failures are logged, not raised. Returns the refs that could NOT be
+        started; an empty list or None means none failed. The guard keeps the returned refs and asks again later."""
 
 
 class Prompter(Protocol):

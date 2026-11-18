@@ -1,9 +1,14 @@
-"""Configured commands as a Runtime: a stop command, a start command and an optional running check."""
+"""Configured commands as a Runtime: a stop command, a start command and an optional running check.
+
+A target with a `check` is running while the check exits 0. A target without one has nothing to ask, so the runtime
+keeps a record in memory: after a `stop` command exits with status 0 the target counts as stopped (not running)
+until `start` runs for it, and it counts as running otherwise. The record lives in the runtime instance only, so a
+new process starts out assuming every check-less target is running."""
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Sequence
+from typing import Any, Callable, List, Optional, Sequence, Set
 
 from . import gpu, util
 from .model import Ref, Target
@@ -27,6 +32,7 @@ class CommandRuntime:
         self._get_config = get_config
         self._run = run or gpu.run_process
         self._proc = proc
+        self._stopped: Set[str] = set()  # ids of targets without a check whose stop command succeeded
 
     def installed(self) -> bool:
         return True
@@ -36,7 +42,7 @@ class CommandRuntime:
 
     def _is_running(self, spec: Any) -> bool:
         if not spec.check:
-            return True
+            return spec.id not in self._stopped
         result = self._run(list(spec.check), timeout=_timeout(spec))
         return result is not None and result.returncode == 0
 
@@ -44,23 +50,28 @@ class CommandRuntime:
         return [Target("command", self.name, gpu.display_name(spec), "", None, "", {"id": spec.id})
                 for spec in gpu.usable_specs(self._get_config, "command") if self._is_running(spec)]
 
-    def _change(self, verb: str, ref: Ref) -> None:
+    def _change(self, verb: str, ref: Ref) -> bool:
+        """Run the `stop` or `start` command of a ref; True when it exited with status 0. Never raises."""
         try:
-            spec = gpu.find_spec(self._get_config, "command", ref)
+            spec = gpu.find_spec(self._get_config, "command", ref, include_disabled=verb == "start")
             if spec is None:
-                return
+                return False
             result = self._run(list(spec.stop if verb == "stop" else spec.start), timeout=_timeout(spec))
             if result is None:
-                return
+                return False
             if result.returncode != 0:
                 detail = result.stderr.strip().splitlines()
                 gpu.log_once(f"command {verb} {spec.id}",
                              f"{spec.id} {verb} command exited with status {result.returncode}"
                              + (f" ({detail[-1]})" if detail else ""))
-            else:
-                gpu.clear_failure(f"command {verb} {spec.id}")
+                return False
+            gpu.clear_failure(f"command {verb} {spec.id}")
+            if verb == "stop":
+                self._stopped.add(spec.id)
+            return True
         except Exception as exc:
             util.log(f"command {verb}: {exc}")
+            return False
 
     def stop(self, refs: Sequence[Ref]) -> None:
         own = gpu.own_refs(refs, "command", self.name)
@@ -69,6 +80,13 @@ class CommandRuntime:
         with ThreadPoolExecutor(max_workers=len(own)) as pool:
             list(pool.map(lambda ref: self._change("stop", ref), own))
 
-    def start(self, refs: Sequence[Ref]) -> None:
+    def start(self, refs: Sequence[Ref]) -> Optional[List[Ref]]:
+        """Run the start commands; returns the refs whose command failed or whose target is no longer configured.
+        Running a start clears the target's stopped mark."""
+        failed = []
         for ref in gpu.own_refs(refs, "command", self.name):
-            self._change("start", ref)
+            if isinstance(ref.get("id"), str):
+                self._stopped.discard(ref["id"])
+            if not self._change("start", ref):
+                failed.append(ref)
+        return failed

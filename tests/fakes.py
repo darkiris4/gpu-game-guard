@@ -40,6 +40,7 @@ class FakeRuntime:
         self.started: List[str] = []
         self.fail_scan = False
         self.refuse_stop: List[str] = []  # names that keep running when asked to stop
+        self.fail_start: List[str] = []  # names that cannot be started; `start` returns their refs
         self.is_available = True
 
     def installed(self) -> bool:
@@ -60,10 +61,16 @@ class FakeRuntime:
                 if ref["name"] not in self.refuse_stop:
                     self.running = [n for n in self.running if n != ref["name"]]
 
-    def start(self, refs: Sequence[Ref]) -> None:
+    def start(self, refs: Sequence[Ref]) -> List[Ref]:
+        failed: List[Ref] = []
         for ref in refs:
-            if ref["runtime"] == self.name:
+            if ref["runtime"] != self.name:
+                continue
+            if ref["name"] in self.fail_start:
+                failed.append(ref)
+            else:
                 self.started.append(ref["name"])
+        return failed
 
 
 class FakePrompter:

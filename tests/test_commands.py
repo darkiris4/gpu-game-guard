@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sys
 import types
 import unittest
 from unittest import mock
@@ -48,7 +47,7 @@ class CommandRuntimeTests(unittest.TestCase):
         self.specs = [spec(timeout=12)]
         runtime = self.runtime()
         runtime.stop([ref])
-        runtime.start([ref])
+        self.assertEqual(runtime.start([ref]), [])
         self.assertEqual(self.calls, [(["stop-it"], 12.0), (["start-it"], 12.0)])
 
     def test_default_timeout_and_foreign_refs(self):
@@ -57,12 +56,60 @@ class CommandRuntimeTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
         runtime.stop([{"kind": "command", "runtime": "command", "name": "Models", "id": "unload"}])
         self.assertEqual(self.calls[0][1], 60.0)
+        self.assertEqual(runtime.start([{"kind": "service", "runtime": "service", "name": "x", "id": "unload"}]), [])
 
     def test_missing_id_is_logged_and_skipped(self):
         with mock.patch("gpu_game_guard.util.log") as log:
             self.runtime().stop([{"kind": "command", "runtime": "command", "name": "Old", "id": "old"}])
         self.assertEqual(self.calls, [])
-        self.assertTrue(log.called)
+        self.assertIn("no configured target with id 'old'", log.call_args[0][0])
+
+    def test_start_for_a_gone_target_is_reported_failed(self):
+        ref = {"kind": "command", "runtime": "command", "name": "Old", "id": "old"}
+        with mock.patch("gpu_game_guard.util.log"):
+            self.assertEqual(self.runtime().start([ref]), [ref])
+        self.assertEqual(self.calls, [])
+
+    def test_start_for_a_disabled_target_still_runs_its_command(self):
+        self.specs = [spec(enabled=False)]
+        ref = {"kind": "command", "runtime": "command", "name": "Models", "id": "unload"}
+        self.assertEqual(self.runtime().start([ref]), [])
+        self.assertEqual([call[0] for call in self.calls], [["start-it"]])
+
+    def test_start_returns_the_refs_whose_command_failed(self):
+        self.specs = [spec(id="a", start=["a-start"]), spec(id="b", start=["b-start"])]
+        self.results["b-start"] = gpu.CommandResult(1, "", "no")
+        refs = [{"kind": "command", "runtime": "command", "name": n, "id": n} for n in ("a", "b")]
+        with mock.patch("gpu_game_guard.util.log"):
+            self.assertEqual(self.runtime().start(refs), [refs[1]])
+
+    def test_a_target_without_a_check_is_stopped_after_a_successful_stop_until_started(self):
+        ref = {"kind": "command", "runtime": "command", "name": "Models", "id": "unload"}
+        runtime = self.runtime()
+        self.assertEqual(len(runtime.running_gpu_targets()), 1)
+        runtime.stop([ref])
+        self.assertEqual(runtime.running_gpu_targets(), [])
+        self.assertEqual(runtime.start([ref]), [])
+        self.assertEqual(len(runtime.running_gpu_targets()), 1)
+
+    def test_a_failed_stop_leaves_a_target_without_a_check_running(self):
+        self.results["stop-it"] = gpu.CommandResult(2, "", "bad")
+        runtime = self.runtime()
+        with mock.patch("gpu_game_guard.util.log"):
+            runtime.stop([{"kind": "command", "runtime": "command", "name": "Models", "id": "unload"}])
+        self.assertEqual(len(runtime.running_gpu_targets()), 1)
+
+    def test_the_stopped_mark_is_per_target_and_ignored_with_a_check(self):
+        self.specs = [spec(id="a", label="A"), spec(id="b", label="B", check=["probe"])]
+        refs = [{"kind": "command", "runtime": "command", "name": n, "id": n.lower()} for n in ("A", "B")]
+        runtime = self.runtime()
+        runtime.stop(refs)
+        self.assertEqual([t.name for t in runtime.running_gpu_targets()], ["B"], "the check decides for B")
+        self.results["probe"] = gpu.CommandResult(1, "", "")
+        self.assertEqual(runtime.running_gpu_targets(), [])
+        self.results["probe"] = gpu.CommandResult(0, "", "")
+        runtime.start(refs)
+        self.assertEqual([t.name for t in runtime.running_gpu_targets()], ["A", "B"])
 
     def test_non_zero_exit_is_logged_once(self):
         self.results["stop-it"] = gpu.CommandResult(2, "", "bad\n")
@@ -75,20 +122,24 @@ class CommandRuntimeTests(unittest.TestCase):
         self.assertEqual(log.call_count, 1)
 
     def test_a_command_that_cannot_run_never_raises(self):
-        runtime = CommandRuntime(lambda: types.SimpleNamespace(targets=[spec(stop=["no-such-command-xyz"])]))
+        self.results["stop-it"] = None
+        ref = {"kind": "command", "runtime": "command", "name": "Models", "id": "unload"}
+        runtime = self.runtime()
+        runtime.stop([ref])
+        self.assertEqual(runtime.start([ref]), [])
+        self.assertEqual([call[0] for call in self.calls], [["stop-it"], ["start-it"]])
+        self.assertEqual(len(runtime.running_gpu_targets()), 1, "a stop that did not run leaves the target running")
+
+    def test_a_runner_that_raises_is_logged_and_fails_the_start(self):
+        def broken(args, timeout=None):
+            raise RuntimeError("boom")
+
+        runtime = CommandRuntime(lambda: types.SimpleNamespace(targets=self.specs), run=broken)
         ref = {"kind": "command", "runtime": "command", "name": "Models", "id": "unload"}
         with mock.patch("gpu_game_guard.util.log") as log:
             runtime.stop([ref])
-            runtime.stop([ref])
-        self.assertEqual(log.call_count, 1)
-
-    def test_really_runs_without_a_shell(self):
-        out = []
-        runtime = CommandRuntime(lambda: types.SimpleNamespace(
-            targets=[spec(stop=[sys.executable, "-c", "import sys; sys.exit('$HOME && x')"], start=["true"])]))
-        with mock.patch("gpu_game_guard.util.log", side_effect=out.append):
-            runtime.stop([{"kind": "command", "runtime": "command", "name": "Models", "id": "unload"}])
-        self.assertIn("$HOME && x", out[0])
+            self.assertEqual(runtime.start([ref]), [ref])
+        self.assertEqual(log.call_count, 2)
 
     def test_invalid_specs_do_not_hide_valid_ones(self):
         self.specs = [spec(id="bad", stop=[]), spec(id="good", label="Good")]

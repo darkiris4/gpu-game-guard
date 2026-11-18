@@ -19,14 +19,11 @@ from gpu_game_guard.model import Target  # noqa: E402
 from gpu_game_guard.status import Status  # noqa: E402
 from gpu_game_guard.ui import qt  # noqa: E402
 
-try:
-    from gpu_game_guard.ui import settings_model
-except Exception:  # the real model is optional for these tests
-    settings_model = None
-
 if qt.available():
     from gpu_game_guard.ui import (advanced, advanced_activity, advanced_common, advanced_dialogs, advanced_games,
-                                   advanced_target_dialogs, advanced_testrun, advanced_timing, theme)
+                                   advanced_target_dialogs, advanced_testrun, advanced_timing,
+                                   settings_model, theme)
+    from gpu_game_guard.ui.advanced_raw import parse_problems as raw_parse
 
     QtCore, QtGui, QtWidgets = qt.QtCore, qt.QtGui, qt.QtWidgets
 
@@ -106,6 +103,11 @@ if qt.available():
             self.restart_calls = 0
             self.candidate_calls = 0
             self._announced = False
+            self.candidates_loaded = False
+            self.scanning = False
+            self.raw_problems = []
+            self.raw_file_text = ""
+            self.load_problems = []
 
         @property
         def config(self):
@@ -113,14 +115,18 @@ if qt.available():
 
         @property
         def dirty(self):
-            return self._config != self.saved
+            return self._config != self.saved or bool(self.raw_problems)
 
         def _replace(self, cfg):
             self._config = cfg
             self.changed.emit()
 
         def set_config(self, cfg):
+            self.raw_problems = []
             self._replace(copy.deepcopy(cfg))
+
+        def set_raw_problems(self, problems):
+            self.raw_problems = list(problems)
 
         def update(self, **fields):
             self._replace(dataclasses.replace(copy.deepcopy(self._config), **fields))
@@ -150,8 +156,21 @@ if qt.available():
             self.candidate_calls += 1
             if not self._announced or refresh:
                 self._announced = True
+                self.candidates_loaded = True
                 self.changed.emit()
             return list(self._candidates)
+
+        def scan(self, refresh=True):
+            if self.candidates_loaded and not refresh:
+                return False
+            self.candidates(refresh)
+            return True
+
+        def cached_candidates(self):
+            return list(self._candidates) if self.candidates_loaded else []
+
+        def shutdown(self):
+            pass
 
         def status(self):
             return self._status
@@ -257,7 +276,7 @@ class ViewTests(Base):
         model = FakeModel(sample_config())
         view = advanced.AdvancedView(model, which=lambda n: None, polkit_status=lambda u: None)
         self.assertEqual(model.candidate_calls, 0)
-        self.assertIn("Detecting", view.targets.caption.text())
+        self.assertIn("Scanning", view.targets.caption.text())
         view.source.load()
         self.assertGreater(model.candidate_calls, 0)
         self.assertEqual(view.targets.table.rowCount(), 5)
@@ -1132,45 +1151,66 @@ class RawTabTests(Base):
     def test_shows_the_config_json(self):
         self.assertEqual(json.loads(self.tab.text()), self.model.config.to_json())
         self.assertFalse(self.tab.edited())
+        self.assertFalse(self.model.dirty)
 
-    def test_invalid_json_never_replaces_the_config(self):
+    def test_there_is_one_apply_and_the_tab_only_checks(self):
+        self.assertFalse(hasattr(self.tab, "apply_button"))
+        self.assertEqual(self.tab.validate_button.text(), "Check")
+
+    def test_invalid_json_never_replaces_the_config_and_blocks_saving(self):
         before = copy.deepcopy(self.model.config)
         self.tab.set_text('{"poll_seconds": ')
-        problems = self.tab.apply()
-        self.assertTrue(problems[0].startswith("Not valid JSON"))
         self.assertEqual(self.model.config, before)
+        self.assertTrue(self.model.raw_problems[0].startswith("Not valid JSON"))
+        self.assertTrue(self.model.dirty)
         self.assertFalse(self.tab.report.isHidden())
         self.assertEqual(self.tab.report.property("kind"), "danger")
+        self.tab.reset_button.click()
+        self.assertEqual(self.model.raw_problems, [])
+        self.assertFalse(self.model.dirty)
 
     def test_invalid_values_never_replace_the_config(self):
         before = copy.deepcopy(self.model.config)
         data = self.model.config.to_json()
         data["poll_seconds"] = 0.0
+        self.tab.set_text(json.dumps(data))
+        self.assertEqual(self.model.config, before)
+        self.assertTrue(any("poll_seconds" in p for p in self.tab.validate()))
+        self.assertIn("poll_seconds", self.tab.report.label.text())
+        self.assertTrue(self.model.dirty)
+
+    def test_an_unknown_key_is_kept_and_reported_with_a_hint(self):
+        data = self.model.config.to_json()
         data["on_lauch"] = "ask"
         self.tab.set_text(json.dumps(data))
-        problems = self.tab.validate()
-        self.assertTrue(any("poll_seconds" in p for p in problems))
-        self.assertTrue(any("did you mean 'on_launch'" in p for p in problems))
-        self.assertTrue(self.tab.apply())
-        self.assertEqual(self.model.config, before)
-        self.assertIn("poll_seconds", self.tab.report.label.text())
+        self.assertEqual(self.tab.validate(), [])
+        self.assertIn("did you mean 'on_launch'", self.tab.report.label.text())
+        self.assertEqual(self.model.config.extra["on_lauch"], "ask")
 
     def test_a_non_object_is_refused(self):
         self.tab.set_text("[1, 2]")
-        self.assertTrue(self.tab.apply())
+        self.assertTrue(self.model.raw_problems)
         self.assertEqual(self.model.config.poll_seconds, 1.0)
 
-    def test_valid_text_replaces_the_working_config(self):
+    def test_valid_text_becomes_an_unsaved_change_at_once(self):
         data = self.model.config.to_json()
         data["poll_seconds"] = 2.5
         data["games"]["steam:10"] = {"name": "Counter-Strike", "action": "stop"}
         self.tab.set_text(json.dumps(data))
         self.assertEqual(self.tab.validate(), [])
-        self.assertEqual(self.tab.apply(), [])
         self.assertEqual(self.model.config.poll_seconds, 2.5)
         self.assertEqual(self.model.config.games["steam:10"].action, "stop")
-        self.assertFalse(self.tab.edited())
+        self.assertTrue(self.model.dirty)
         self.assertEqual(self.view.timing.spins["poll_seconds"].value(), 2.5)
+        self.assertEqual(self.model.apply(), [])
+        self.assertFalse(self.model.dirty)
+
+    def test_opening_and_resetting_never_marks_the_model_dirty(self):
+        self.tab.reset_button.click()
+        self.tab.refresh()
+        self.view.show_tab("Raw config")
+        self.view.show_tab("Targets")
+        self.assertFalse(self.model.dirty)
 
     def test_reset_discards_edits(self):
         self.tab.set_text("garbage")
@@ -1182,13 +1222,22 @@ class RawTabTests(Base):
         self.model.update(poll_seconds=3.0)
         self.assertEqual(json.loads(self.tab.text())["poll_seconds"], 3.0)
 
-    def test_an_edited_editor_is_kept_when_the_model_changes(self):
-        self.tab.set_text('{"poll_seconds": 9}')
+    def test_an_unusable_editor_is_kept_when_the_model_changes(self):
+        self.tab.set_text('{"poll_seconds": 9')
         self.model.update(poll_seconds=3.0)
-        self.assertEqual(self.tab.text(), '{"poll_seconds": 9}')
+        self.assertEqual(self.tab.text(), '{"poll_seconds": 9')
         self.assertIn("changed elsewhere", self.tab.report.label.text())
 
-    def test_import_loads_into_the_editor_without_applying(self):
+    def test_every_kind_of_hostile_text_is_reported_not_raised(self):
+        for text in ("[" * 200000, '{"a":' * 100000, "9" * 6000, '{"poll_seconds": ' + "9" * 6000 + "}",
+                     '{"heavy_vram_mib": 1e999}', '{"games": {"x": 1}}', "\x00", ""):
+            data, problems = raw_parse(text)
+            self.assertIsNone(data, text[:20])
+            self.assertTrue(problems, text[:20])
+            self.tab.set_text(text)
+            self.assertTrue(self.model.raw_problems, text[:20])
+
+    def test_import_puts_valid_text_into_the_editor_and_the_working_settings(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "in.json"
             data = self.model.config.to_json()
@@ -1197,10 +1246,9 @@ class RawTabTests(Base):
             self.tab.pick_open = lambda parent: str(path)
             self.tab.import_button.click()
         self.assertEqual(json.loads(self.tab.text())["heavy_vram_mib"], 1000)
-        self.assertEqual(self.model.config.heavy_vram_mib, 4096)
-        self.assertIn("press Apply", self.tab.report.label.text())
-        self.assertEqual(self.tab.apply(), [])
         self.assertEqual(self.model.config.heavy_vram_mib, 1000)
+        self.assertTrue(self.model.dirty)
+        self.assertIn("unsaved change", self.tab.report.label.text())
 
     def test_import_of_a_bad_file_reports_problems(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1245,7 +1293,7 @@ class RawTabTests(Base):
         self.assertIs(view.raw.pick_save, saver)
 
 
-@unittest.skipUnless(qt.available() and settings_model is not None, "PyQt5 or the settings model is missing")
+@unittest.skipUnless(qt.available(), "PyQt5 is not installed")
 class RealModelTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -1264,7 +1312,7 @@ class RealModelTests(unittest.TestCase):
         configmod.save(sample_config(), self.path)
         self.model = settings_model.SettingsModel(
             path=self.path, status_dir=self.root / "state", discover=lambda cfg: sample_candidates(),
-            runner=lambda argv: self.commands.append(argv) or (0, ""))
+            runner=lambda argv: self.commands.append(argv) or (0, ""), threaded=False)
         self.view = advanced.AdvancedView(self.model, which=lambda n: None, polkit_status=lambda u: None,
                                           qt_available=lambda: True, defer_discovery=False)
 
@@ -1285,13 +1333,14 @@ class RealModelTests(unittest.TestCase):
     def test_raw_apply_and_a_target_added_through_a_dialog(self):
         self.view.targets.run_dialog = fill_and_accept(label_edit="Unload", stop_edit="true", start_edit="true")
         self.view.targets.command_button.click()
-        self.assertEqual(self.model.apply(), [])
-        self.assertEqual(configmod.load(self.path).target("unload").stop, ["true"])
         data = json.loads(self.view.raw.text())
         data["dialog"] = "zenity"
         self.view.raw.set_text(json.dumps(data))
-        self.assertEqual(self.view.raw.apply(), [])
         self.assertEqual(self.model.config.dialog, "zenity")
+        self.assertEqual(self.model.apply(), [])
+        saved = configmod.load(self.path)
+        self.assertEqual(saved.target("unload").stop, ["true"])
+        self.assertEqual(saved.dialog, "zenity")
 
     def test_restart_callout_after_saving_a_runtime_change(self):
         self.view.detection.runtime_list.item(1).setCheckState(QtCore.Qt.Unchecked)
@@ -1316,6 +1365,286 @@ class RealModelTests(unittest.TestCase):
         self.assertEqual(view.targets.table.rowCount(), 0)
         self.assertEqual(view.games.table.rowCount(), 0)
         self.assertEqual(json.loads(view.raw.text()), Config().to_json())
+
+PAYLOAD = '<b>x</b><img src="file:///etc/passwd"><a href="x">y</a>'
+
+
+def key(widget, code):
+    """Press and release a key on a widget the way the keyboard would."""
+    for kind in (QtCore.QEvent.KeyPress, QtCore.QEvent.KeyRelease):
+        QtWidgets.QApplication.sendEvent(widget, QtGui.QKeyEvent(kind, code, QtCore.Qt.NoModifier))
+
+
+def literal_everywhere(testcase, root, allowed=()):
+    """Every label under `root` that looks like markup shows it as plain text, and every tooltip that holds the
+    payload is escaped."""
+    for label in root.findChildren(QtWidgets.QLabel):
+        if label in allowed:
+            continue
+        if QtCore.Qt.mightBeRichText(label.text()):
+            testcase.assertEqual(label.textFormat(), QtCore.Qt.PlainText, label.text())
+    for widget in root.findChildren(QtWidgets.QWidget):
+        tip = widget.toolTip()
+        if "<b>x</b>" in tip or "<img" in tip:
+            testcase.assertTrue(tip.startswith("<qt>") and "&lt;b&gt;" in tip, tip)
+    for table in root.findChildren(QtWidgets.QTableWidget):
+        for row in range(table.rowCount()):
+            for column in range(table.columnCount()):
+                item = table.item(row, column)
+                if item is not None and ("<b>x</b>" in item.toolTip() or "<img" in item.toolTip()):
+                    testcase.assertTrue(item.toolTip().startswith("<qt>"), item.toolTip())
+
+
+class HostileTextTests(Base):
+    def setUp(self):
+        hostile = Candidate(f"container:docker:{PAYLOAD}", "container", PAYLOAD, PAYLOAD,
+                            f"docker container, image {PAYLOAD}", 100, True, "low", None, PAYLOAD)
+        config = sample_config()
+        config.games["steam:9"] = GameRule(PAYLOAD, "ask")
+        config.runtimes = ["docker", PAYLOAD]
+        config.targets.append(TargetSpec(id="hostile", kind="process", label=PAYLOAD, match="hostile"))
+        status = sample_status(game={"id": "steam:9", "title": PAYLOAD}, config_ok=False, config_error=PAYLOAD,
+                               stopped=[{"kind": "container", "runtime": "docker", "name": PAYLOAD}])
+        events = [{"t": time.time(), "kind": PAYLOAD, "message": PAYLOAD}]
+        self.model = FakeModel(config, candidates=[hostile], status=status, events=events, recent=[("steam:9", PAYLOAD)])
+        self.view = advanced.AdvancedView(self.model, which=lambda n: None, polkit_status=lambda u: None,
+                                          qt_available=lambda: True, defer_discovery=False)
+
+    def test_activity_shows_the_markup_literally(self):
+        tab = self.view.activity
+        tab.refresh()
+        for name in ("game", "stopped", "config"):
+            label = tab.values[name]
+            self.assertEqual(label.textFormat(), QtCore.Qt.PlainText)
+            self.assertIn("<b>x</b>", label.text())
+        self.assertEqual(tab.table.item(0, 2).text(), PAYLOAD)
+        literal_everywhere(self, tab)
+
+    def test_test_run_shows_the_markup_literally(self):
+        tab = self.view.test_run
+        tab.extra_edit.setText(PAYLOAD)
+        tab.game_combo.setEditText("steam:9")
+        tab.run()
+        literal_everywhere(self, tab)
+        self.assertTrue(any(PAYLOAD in line for line in tab.result_lines))
+        labels = [label for label in tab.findChildren(QtWidgets.QLabel) if "<b>x</b>" in label.text()]
+        self.assertTrue(labels)
+        self.assertTrue(all(label.textFormat() == QtCore.Qt.PlainText for label in labels))
+
+    def test_raw_report_shows_the_markup_literally(self):
+        tab = self.view.raw
+        tab.set_text(json.dumps({"on_launch": PAYLOAD, PAYLOAD: 1}))
+        self.assertIn("<b>x</b>", tab.report.label.text())
+        self.assertEqual(tab.report.label.textFormat(), QtCore.Qt.PlainText)
+        literal_everywhere(self, tab)
+
+    def test_every_tab_is_plain(self):
+        for name in advanced.TAB_TITLES:
+            self.view.show_tab(name)
+        self.view.refresh()
+        literal_everywhere(self, self.view)
+
+    def test_the_unknown_runtime_is_listed_not_interpreted(self):
+        item = self.view.detection.runtime_list.item(1)
+        self.assertEqual(item.data(QtCore.Qt.UserRole), PAYLOAD)
+        self.assertTrue(item.toolTip().startswith("<qt>"))
+
+    def test_the_removal_question_is_plain(self):
+        seen = []
+        self.view.targets.confirm = lambda parent, text: seen.append(text) or False
+        self.view.targets.table.selectRow(self.view.targets.table.rowCount() - 1)
+        self.view.targets.remove_button.click()
+        self.assertIn(PAYLOAD, seen[0])
+        box = QtWidgets.QMessageBox()
+        box.setTextFormat(QtCore.Qt.PlainText)
+        self.assertEqual(box.textFormat(), QtCore.Qt.PlainText)
+
+
+class ReviewFixTests(Base):
+    def test_container_rows_follow_the_live_config(self):
+        table = self.view.targets.table
+        self.assertTrue(cell_switch(table, 0).isChecked())
+        self.model.update(ignore_containers=["backup-*", "ollama"])
+        self.assertFalse(cell_switch(table, 0).isChecked())
+        self.assertIn("(ignored)", table.item(0, 3).text())
+        self.model.update(ignore_containers=["backup-*"])
+        self.assertTrue(cell_switch(table, 0).isChecked())
+        self.assertNotIn("(ignored)", table.item(0, 3).text())
+        self.model.update(auto_containers=False)
+        self.assertFalse(cell_switch(table, 0).isChecked())
+        self.assertFalse(cell_switch(table, 1).isChecked())
+        self.model.update(auto_containers=True)
+        self.assertTrue(cell_switch(table, 1).isChecked())
+        self.assertIn("(ignored)", table.item(2, 3).text())
+        self.assertFalse(cell_switch(table, 2).isChecked())
+
+    def test_the_test_run_follows_the_live_config_too(self):
+        tab = self.view.test_run
+        self.assertTrue(tab.checks["container:docker:ollama"].isChecked())
+        self.model.update(ignore_containers=["ollama"])
+        self.assertIn("not managed", [label.text() for label in tab.findChildren(QtWidgets.QLabel)])
+
+    def test_a_typed_timing_value_marks_the_model_dirty_at_once(self):
+        spin = self.view.timing.spins["exit_grace_seconds"]
+        spin.lineEdit().setText("12.5")
+        self.assertEqual(self.model.config.exit_grace_seconds, 12.5)
+        self.assertTrue(self.model.dirty)
+        heavy = self.view.detection.heavy_spin
+        heavy.lineEdit().setText("2048 MiB")
+        self.assertEqual(self.model.config.heavy_vram_mib, 2048)
+
+    def test_opening_and_closing_tabs_changes_no_value(self):
+        before = copy.deepcopy(self.model.config)
+        for name in advanced.TAB_TITLES * 2:
+            self.view.show_tab(name)
+        self.view.refresh()
+        self.assertEqual(self.model.config, before)
+        self.assertFalse(self.model.dirty)
+
+    def test_the_command_timeout_accepts_one_decimal(self):
+        spec = TargetSpec(id="job", kind="command", label="Job", stop=["a"], start=["b"], timeout_seconds=2.5)
+        dialog = advanced_target_dialogs.CommandDialog(self.model.config, spec)
+        self.addCleanup(release, dialog)
+        self.assertEqual(dialog.timeout_spin.value(), 2.5)
+        self.assertEqual(dialog.spec().timeout_seconds, 2.5)
+        dialog.timeout_spin.lineEdit().setText("7.5 s")
+        self.assertEqual(dialog.spec().timeout_seconds, 7.5)
+
+    def test_editing_a_target_keeps_the_keys_this_version_does_not_know(self):
+        spec = TargetSpec(id="job", kind="command", label="Job", stop=["a"], start=["b"], extra={"future": [1, 2]})
+        dialog = advanced_target_dialogs.CommandDialog(self.model.config, spec)
+        self.addCleanup(release, dialog)
+        dialog.label_edit.setText("Job renamed")
+        edited = dialog.spec()
+        self.assertEqual(edited.label, "Job renamed")
+        self.assertEqual(edited.extra, {"future": [1, 2]})
+
+    def test_unticking_a_runtime_does_not_move_it(self):
+        tab = self.view.detection
+        self.model.update(runtimes=["docker", "podman", "service"])
+        before = [name for name, _on in tab.runtimes()]
+        tab.runtime_list.item(0).setCheckState(QtCore.Qt.Unchecked)
+        self.assertEqual([name for name, _on in tab.runtimes()], before)
+        self.assertEqual(self.model.config.runtimes, ["podman", "service"])
+        tab.runtime_list.item(0).setCheckState(QtCore.Qt.Checked)
+        self.assertEqual(self.model.config.runtimes, ["docker", "podman", "service"])
+
+    def test_an_unknown_runtime_is_shown_kept_and_not_checkable(self):
+        self.model.update(runtimes=["docker", "future-runtime"])
+        tab = self.view.detection
+        names = [name for name, _on in tab.runtimes()]
+        self.assertEqual(names[:2], ["docker", "future-runtime"])
+        item = tab.runtime_list.item(1)
+        self.assertIn("unknown", item.text())
+        self.assertFalse(item.flags() & QtCore.Qt.ItemIsUserCheckable)
+        tab.runtime_list.item(0).setCheckState(QtCore.Qt.Unchecked)
+        self.assertEqual(self.model.config.runtimes, ["future-runtime"])
+        tab.runtime_list.setCurrentRow(1)
+        tab.up_button.click()
+        self.assertEqual(self.model.config.runtimes, ["future-runtime"])
+        self.assertEqual([n for n, _o in tab.runtimes()][:2], ["future-runtime", "docker"])
+
+    def test_a_game_action_can_be_changed_with_the_keyboard_and_keeps_the_focus(self):
+        self.view.show_tab("Games")
+        self.view.show()
+        self.view.activateWindow()
+        self.app.processEvents()
+        combo = self.view.games.combos["steam:620"]
+        combo.setFocus()
+        self.assertTrue(combo.hasFocus())
+        self.assertEqual(combo.currentText(), "ask")
+        key(combo, QtCore.Qt.Key_Down)
+        self.assertEqual(self.model.config.games["steam:620"].action, "stop")
+        self.assertIs(self.view.games.combos["steam:620"], combo)
+        self.assertTrue(combo.hasFocus())
+        key(combo, QtCore.Qt.Key_Down)
+        self.assertEqual(self.model.config.games["steam:620"].action, "ignore")
+        self.assertTrue(combo.hasFocus())
+
+    def test_focus_survives_a_rebuild_of_the_games_table(self):
+        self.view.show_tab("Games")
+        self.view.show()
+        self.view.activateWindow()
+        self.app.processEvents()
+        combo = self.view.games.combos["steam:730"]
+        combo.setFocus()
+        self.model.set_game("steam:5", "Five", "ask")
+        self.assertTrue(self.view.games.combos["steam:730"].hasFocus())
+        self.assertEqual(sorted(self.view.games.combos), ["steam:1245620", "steam:5", "steam:620", "steam:730"])
+
+    def test_a_target_switch_keeps_its_focus_when_toggled(self):
+        self.view.show_tab("Targets")
+        self.view.show()
+        self.view.activateWindow()
+        self.app.processEvents()
+        table = self.view.targets.table
+        switch = cell_switch(table, 3)
+        switch.setFocus()
+        key(switch, QtCore.Qt.Key_Space)
+        self.assertFalse(self.model.config.target("ollama-svc").enabled)
+        self.assertIs(cell_switch(table, 3), switch)
+        self.assertTrue(switch.hasFocus())
+
+    def test_a_target_switch_acts_on_the_current_target_not_a_stale_copy(self):
+        table = self.view.targets.table
+        self.model.set_target(dataclasses.replace(self.model.config.target("ollama-svc"), label="Renamed"))
+        cell_switch(table, 3).setChecked(False)
+        spec = self.model.config.target("ollama-svc")
+        self.assertEqual((spec.label, spec.enabled), ("Renamed", False))
+
+    def test_accessible_names(self):
+        for key_, spin in self.view.timing.spins.items():
+            self.assertTrue(spin.accessibleName(), key_)
+        self.assertIn("Heavy", self.view.detection.heavy_spin.accessibleName())
+        combo = self.view.games.combos["steam:730"]
+        self.assertIn("Counter-Strike 2", combo.accessibleName())
+        remove = [b for b in self.view.games.table.findChildren(QtWidgets.QPushButton) if b.text() == "Remove"]
+        self.assertEqual(len(remove), 3)
+        self.assertTrue(all("steam:" in b.accessibleName() for b in remove))
+        dialog = advanced_target_dialogs.CommandDialog(self.model.config)
+        self.addCleanup(release, dialog)
+        self.assertTrue(dialog.timeout_spin.accessibleName())
+
+    def test_timing_texts_describe_what_the_guard_does(self):
+        texts = {key_: explanation for key_, _title, explanation, _d in advanced_timing.TIMINGS}
+        self.assertNotIn("Launch anyway", texts["bypass_seconds"])
+        self.assertIn("started the game again", texts["bypass_seconds"])
+        self.assertIn("same game", texts["bypass_seconds"])
+        self.assertIn("no game may be running", texts["exit_grace_seconds"])
+        self.assertIn("no game has been seen", texts["no_game_timeout_seconds"])
+
+    def test_pause_expiry_in_the_activity_tab_survives_absurd_values(self):
+        for until in (1e30, 253402300800.0 * 100):
+            self.model._status = sample_status(paused=True, paused_until=until)
+            self.view.activity.refresh()
+            self.assertEqual(self.view.activity.values["paused"].text(), "Until resumed")
+        self.assertEqual(advanced_common.clock_text(1e30), "-")
+        self.assertEqual(advanced_common.clock_text(float("nan")), "-")
+        when = time.mktime((2026, 11, 18, 15, 4, 5, 0, 0, -1))
+        self.assertEqual(advanced_common.clock_text(when, when + 5), "15:04:05")
+        self.assertEqual(advanced_common.clock_text(when - 13 * 3600, when), "Nov 18 02:04:05")
+
+    def test_a_non_ascii_label_gets_a_sensible_id(self):
+        self.assertEqual(advanced_common.slug("Caf\u00e9 R\u00e9sum\u00e9", set()), "cafe-resume")
+        generated = advanced_common.slug("\u65e5\u672c\u8a9e", set())
+        self.assertRegex(generated, r"^target-[0-9a-f]{8}$")
+        self.assertNotEqual(generated, advanced_common.slug("\u4e2d\u6587", set()))
+        self.assertEqual(generated, advanced_common.slug("\u65e5\u672c\u8a9e", set()))
+        dialog = advanced_target_dialogs.CommandDialog(self.model.config)
+        self.addCleanup(release, dialog)
+        dialog.label_edit.setText("\u65e5\u672c\u8a9e")
+        self.assertRegex(dialog.id_edit.text(), r"^target-[0-9a-f]{8}$")
+
+    def test_scanning_is_shown_while_discovery_runs(self):
+        self.model.scanning = True
+        self.view.targets.refresh()
+        self.assertIn("Scanning", self.view.targets.caption.text())
+        self.view.test_run.refresh()
+        self.assertFalse(self.view.test_run.rescan_button.isEnabled())
+        self.model.scanning = False
+        self.view.test_run.refresh()
+        self.assertTrue(self.view.test_run.rescan_button.isEnabled())
+
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@
     "stop": [
       "python3",
       "-c",
-      "import json\nimport sys\nimport urllib.request\n\nBASE = \"http://127.0.0.1:11434\"\ntry:\n    with urllib.request.urlopen(BASE + \"/api/ps\", timeout=5) as reply:\n        models = json.load(reply).get(\"models\") or []\n    for entry in models:\n        name = entry.get(\"model\") or entry.get(\"name\")\n        if not name:\n            continue\n        request = urllib.request.Request(\n            BASE + \"/api/generate\",\n            data=json.dumps({\"model\": name, \"keep_alive\": 0}).encode(),\n            headers={\"Content-Type\": \"application/json\"},\n            method=\"POST\",\n        )\n        urllib.request.urlopen(request, timeout=30).read()\nexcept Exception:\n    pass\nsys.exit(0)\n"
+      "import json\nimport sys\nimport urllib.request\n\nBASE = \"http://127.0.0.1:11434\"\nopener = urllib.request.build_opener(urllib.request.ProxyHandler({}))\ntry:\n    with opener.open(BASE + \"/api/ps\", timeout=5) as reply:\n        models = json.load(reply).get(\"models\") or []\nexcept Exception as exc:\n    sys.stderr.write(\"ollama is not reachable, nothing to unload: %s\\n\" % exc)\n    sys.exit(0)\nfailed = 0\nfor entry in models:\n    name = entry.get(\"model\") or entry.get(\"name\")\n    if not name:\n        continue\n    request = urllib.request.Request(\n        BASE + \"/api/generate\",\n        data=json.dumps({\"model\": name, \"keep_alive\": 0}).encode(),\n        headers={\"Content-Type\": \"application/json\"},\n        method=\"POST\",\n    )\n    try:\n        opener.open(request, timeout=30).read()\n        sys.stderr.write(\"unloaded %s\\n\" % name)\n    except Exception as exc:\n        failed += 1\n        sys.stderr.write(\"could not unload %s: %s\\n\" % (name, exc))\nsys.exit(1 if failed else 0)\n"
     ],
     "start": [
       "true"
@@ -20,7 +20,7 @@
     "check": [
       "python3",
       "-c",
-      "import json\nimport sys\nimport urllib.request\n\ntry:\n    with urllib.request.urlopen(\"http://127.0.0.1:11434/api/ps\", timeout=3) as reply:\n        sys.exit(0 if json.load(reply).get(\"models\") else 1)\nexcept Exception:\n    sys.exit(1)\n"
+      "import json\nimport sys\nimport urllib.request\n\nopener = urllib.request.build_opener(urllib.request.ProxyHandler({}))\ntry:\n    with opener.open(\"http://127.0.0.1:11434/api/ps\", timeout=3) as reply:\n        sys.exit(0 if json.load(reply).get(\"models\") else 1)\nexcept Exception:\n    sys.exit(1)\n"
     ],
     "timeout_seconds": 60
   }

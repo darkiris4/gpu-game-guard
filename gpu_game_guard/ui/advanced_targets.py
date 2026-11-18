@@ -9,11 +9,12 @@ from typing import Any, Callable, List, Optional, Tuple
 from ..config import TargetSpec
 from . import advanced_target_dialogs as dialogs_
 from .advanced_common import (KIND_RISK, KIND_TIP, KIND_TITLE, RISK_BADGE, BadgeDelegate, CandidateSource, TabBase,
-                              centered, make_table, mib_text, table_item)
+                              centered, focus_cell, focused_cell, make_table, mib_text, set_switch, table_item)
 from .qt import QtCore, QtWidgets
-from .theme import SPACE, Callout, ToggleSwitch, button, styled_label
+from .theme import SPACE, Callout, ToggleSwitch, button, plain_tooltip, styled_label
 
 Qt = QtCore.Qt
+IGNORED_NOTE = "Ignored through ignore_containers. "
 COLUMNS = ["On", "Name", "Type", "Details", "Memory"]
 
 
@@ -35,6 +36,7 @@ class TargetsTab(TabBase):
         self.presets_loader = presets_loader
         self.applicable = applicable
         self.rows: List[Tuple[str, Any]] = []  # ("auto", Candidate) or ("target", TargetSpec), one per table row
+        self._keys: List[Tuple[str, str]] = []  # what each table row stands for; a change means a rebuild
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(2 * SPACE, 2 * SPACE, 2 * SPACE, 2 * SPACE)
         layout.setSpacing(SPACE + 4)
@@ -49,10 +51,11 @@ class TargetsTab(TabBase):
         header.setSectionResizeMode(2, QtWidgets.QHeaderView.Fixed)
         header.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
         header.setSectionResizeMode(4, QtWidgets.QHeaderView.Fixed)
-        self.table.setColumnWidth(0, 64)
+        metrics = self.fontMetrics()
+        self.table.setColumnWidth(0, max(64, metrics.horizontalAdvance("On") + 56))
         self.table.setColumnWidth(1, 190)
-        self.table.setColumnWidth(2, 112)
-        self.table.setColumnWidth(4, 96)
+        self.table.setColumnWidth(2, max(112, metrics.horizontalAdvance("Container") + 48))
+        self.table.setColumnWidth(4, max(96, metrics.horizontalAdvance("Memory") + 48))
         self.table.setItemDelegateForColumn(2, BadgeDelegate(self.table))
         self.table.horizontalHeaderItem(4).setTextAlignment(int(Qt.AlignRight | Qt.AlignVCenter))
         layout.addWidget(self.table, 1)
@@ -60,7 +63,7 @@ class TargetsTab(TabBase):
         layout.addWidget(self.caption)
         row = QtWidgets.QHBoxLayout()
         row.setSpacing(SPACE)
-        self.preset_button = button("Add from preset")
+        self.preset_button = button("Add preset")
         self.service_button = button("Add service")
         self.command_button = button("Add command")
         self.process_button = button("Add process")
@@ -75,7 +78,7 @@ class TargetsTab(TabBase):
             self.remove_button: "Remove the selected target from the configuration.",
         }
         for widget, tip in tips.items():
-            widget.setToolTip(tip)
+            plain_tooltip(widget, tip)
         for widget in (self.preset_button, self.service_button, self.command_button, self.process_button):
             row.addWidget(widget)
         row.addStretch(1)
@@ -102,51 +105,79 @@ class TargetsTab(TabBase):
         return "-"
 
     def refresh(self) -> None:
+        config = self.model.config
         candidates = self.source.get()
         containers = [c for c in candidates if c.kind == "container"]
-        targets = list(self.model.config.targets)
+        targets = list(config.targets)
         rows: List[Tuple[str, Any]] = [("auto", c) for c in containers] + [("target", t) for t in targets]
+        keys = [("auto", c.key) if origin == "auto" else ("target", c.id) for origin, c in rows]
         selected = self.selected_id()
+        focus = focused_cell(self.table)
+        focus_key = (self._keys[focus[0]], focus[1]) if focus and focus[0] < len(self._keys) else None
         self.rows = rows
+        rebuild = keys != self._keys
         self.table.setUpdatesEnabled(False)
-        self.table.clearContents()
-        self.table.setRowCount(len(rows))
+        if rebuild:
+            self.table.clearContents()
+            self.table.setRowCount(len(rows))
+            self._keys = keys
         for index, (origin, obj) in enumerate(rows):
             if origin == "auto":
-                self._fill_container(index, obj)
+                self._fill_container(index, obj, config, rebuild)
             else:
-                self._fill_target(index, obj, candidates)
+                self._fill_target(index, obj, candidates, rebuild)
         self.table.setUpdatesEnabled(True)
-        auto_on = self.model.config.auto_containers
+        auto_on = config.auto_containers
         self.note.setVisible(True)
+        if self.source.scanning or not self.source.loaded:
+            lead = "Scanning... "
+        else:
+            lead = ""
         self.caption.setText(
-            ("Detecting containers... " if not self.source.loaded else "") +
-            f"{len(containers)} auto-detected container{'' if len(containers) == 1 else 's'}"
+            lead + f"{len(containers)} auto-detected container{'' if len(containers) == 1 else 's'}"
             f"{'' if auto_on else ' (detection is off)'}, {len(targets)} configured "
             f"target{'' if len(targets) == 1 else 's'}.")
-        if selected:
+        if selected and rebuild:
             for index, (origin, obj) in enumerate(rows):
                 if origin == "target" and obj.id == selected:
                     self.table.selectRow(index)
+        if rebuild and focus_key is not None and focus_key[0] in keys:
+            focus_cell(self.table, keys.index(focus_key[0]), focus_key[1])
         self._selection_changed()
 
-    def _fill_container(self, index: int, candidate: Any) -> None:
-        switch = ToggleSwitch(bool(candidate.managed), accessible_name=f"{candidate.label} is managed")
-        switch.setEnabled(False)
-        switch.setToolTip("Detected automatically. Exclude it under Detection, Ignored containers.")
-        self.table.setCellWidget(index, 0, centered(switch))
-        self.table.setItem(index, 1, table_item(candidate.label, candidate.note))
+    def _fill_container(self, index: int, candidate: Any, config: Any, create: bool) -> None:
+        ignored = config.is_ignored(candidate.name)
+        managed = bool(config.auto_containers) and not ignored
+        note = candidate.note
+        if note.startswith(IGNORED_NOTE):
+            note = note[len(IGNORED_NOTE):]
+        if ignored:
+            note = IGNORED_NOTE + note
+        if create:
+            switch = ToggleSwitch(managed, accessible_name=f"{candidate.label} is managed")
+            switch.setEnabled(False)
+            plain_tooltip(switch, "Detected automatically. Exclude it under Detection, Ignored containers.")
+            self.table.setCellWidget(index, 0, centered(switch))
+        else:
+            switch = self.table.cellWidget(index, 0).findChild(ToggleSwitch)
+            set_switch(switch, managed)
+        suffix = " (ignored)" if ignored else "" if config.auto_containers else " (detection is off)"
+        self.table.setItem(index, 1, table_item(candidate.label, note))
         self.table.setItem(index, 2, table_item("Container", KIND_TIP[candidate.risk] if candidate.risk in KIND_TIP
                                                 else "", kind=RISK_BADGE.get(candidate.risk, "ok")))
-        self.table.setItem(index, 3, table_item(candidate.detail + ("" if candidate.managed else " (ignored)"),
-                                                candidate.note, muted=True))
+        self.table.setItem(index, 3, table_item(candidate.detail + suffix, note, muted=True))
         self.table.setItem(index, 4, table_item(mib_text(candidate.vram_mib), align=int(Qt.AlignRight)))
 
-    def _fill_target(self, index: int, spec: TargetSpec, candidates: list) -> None:
-        switch = ToggleSwitch(spec.enabled, accessible_name=f"{spec.label or spec.id} is managed")
-        switch.setToolTip("Switch the target off to keep it configured without stopping it.")
-        switch.toggled.connect(lambda on, s=spec: self.model.set_target(dataclasses.replace(s, enabled=on)))
-        self.table.setCellWidget(index, 0, centered(switch))
+    def _fill_target(self, index: int, spec: TargetSpec, candidates: list, create: bool) -> None:
+        if create:
+            switch = ToggleSwitch(spec.enabled, accessible_name=f"{spec.label or spec.id} is managed")
+            plain_tooltip(switch, "Switch the target off to keep it configured without stopping it.")
+            switch.toggled.connect(lambda on, tid=spec.id: self._set_enabled(tid, on))
+            self.table.setCellWidget(index, 0, centered(switch))
+        else:
+            switch = self.table.cellWidget(index, 0).findChild(ToggleSwitch)
+            switch.setAccessibleName(f"{spec.label or spec.id} is managed")
+            set_switch(switch, spec.enabled)
         risk = KIND_RISK.get(spec.kind, "medium")
         self.table.setItem(index, 1, table_item(spec.label or spec.id, f"id: {spec.id}", muted=not spec.enabled))
         self.table.setItem(index, 2, table_item(KIND_TITLE.get(spec.kind, spec.kind), KIND_TIP[risk],
@@ -154,6 +185,11 @@ class TargetsTab(TabBase):
         detail = spec_detail(spec)
         self.table.setItem(index, 3, table_item(detail, detail, muted=True))
         self.table.setItem(index, 4, table_item(self._memory_of(spec, candidates), align=int(Qt.AlignRight)))
+
+    def _set_enabled(self, target_id: str, enabled: bool) -> None:
+        spec = self.model.config.target(target_id)
+        if spec is not None and spec.enabled != enabled:
+            self.model.set_target(dataclasses.replace(spec, enabled=enabled))
 
     # Selection.
     def selected_row(self) -> int:

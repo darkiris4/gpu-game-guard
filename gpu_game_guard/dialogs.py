@@ -21,7 +21,7 @@ HEAVY_VRAM_MIB = 4096  # container GPU memory at which the warning stops being t
 REMEMBER_CHOICES = True  # whether the Qt dialog offers "remember my choice"; the guard may overwrite it
 MARKUPS = ("html", "pango", "plain")
 
-LABEL_STOP = "Stop containers and launch"
+LABEL_STOP = "Stop and launch"
 LABEL_ANYWAY = "Launch anyway"
 LABEL_CANCEL = "Cancel"
 LABEL_RESTART = "Restart"
@@ -33,8 +33,13 @@ NOTIFY_EXPIRE_MS = NOTIFY_TIMEOUT_SECONDS * 1000
 INFO_TIMEOUT_SECONDS = 30  # commands that only display something and return
 
 # Characters that cannot appear in XML text or in a command line argument: C0 and C1 controls other than tab and
-# newline, lone surrogates and the two non-characters at the end of the basic plane.
-_UNSAFE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\ud800-\udfff\ufffe\uffff]")
+# newline, lone surrogates and the two non-characters at the end of the basic plane. The bidirectional override and
+# isolate characters are included because they reorder the text around them.
+_UNSAFE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\ud800-\udfff\ufffe\uffff\u202a-\u202e\u2066-\u2069"
+                     "\u200e\u200f\u061c]")
+# What a target kind is called in running text: (singular, plural), in the order a list of kinds is written.
+_KIND_NOUNS = (("container", "containers"), ("service", "services"), ("program", "programs"))
+_KIND_ALIASES = {"process": "program", "command": "program"}
 _DIALOG_ERRORS = (OSError, subprocess.SubprocessError, ValueError)
 
 
@@ -67,7 +72,7 @@ def _small(text: str, markup: str) -> str:
 
 
 def impact_sentence(targets: Sequence[Target], markup: str = "plain") -> str:
-    """What the containers could do to the game, never claiming more than the measurements show."""
+    """What the targets could do to the game, never claiming more than the measurements show."""
     if not targets:
         return ""
     measured = [t for t in targets if t.vram_mib is not None]
@@ -104,6 +109,20 @@ def impact_sentence(targets: Sequence[Target], markup: str = "plain") -> str:
             "they can claim the GPU as soon as they get work.")
 
 
+def kind_phrase(kinds: Optional[Sequence[str]] = None, joiner: str = "or") -> str:
+    """Plural nouns for the kinds of target in `kinds`, for a sentence such as "these containers or services".
+    Without kinds, the generic "programs and services"; one kind gives its noun; several give a list joined by
+    `joiner`. Containers, services and programs (processes and commands) are the only nouns used."""
+    if not kinds:
+        return "programs and services"
+    known = {singular for singular, _ in _KIND_NOUNS}
+    wanted = {_KIND_ALIASES.get(k, k) if _KIND_ALIASES.get(k, k) in known else "program" for k in kinds}
+    nouns = [plural for singular, plural in _KIND_NOUNS if singular in wanted]
+    if len(nouns) == 1:
+        return nouns[0]
+    return f"{', '.join(nouns[:-1])} {joiner} {nouns[-1]}"
+
+
 def _memory_text(target: Target) -> str:
     if target.vram_mib is None:
         return "GPU memory use unknown"
@@ -126,7 +145,8 @@ def _totals_text(totals: Optional[Tuple[int, int]]) -> str:
 def launch_message(launch: Launch, targets: Sequence[Target], totals: Optional[Tuple[int, int]],
                    markup: str = "plain") -> str:
     title = _esc(launch.title, markup)
-    intro = (f"{_bold(TITLE, markup)} ended the launch of {_bold(title, markup)} because these containers have "
+    these = f"these {kind_phrase([t.kind for t in targets])}" if targets else "these programs and services"
+    intro = (f"{_bold(TITLE, markup)} ended the launch of {_bold(title, markup)} because {these} have "
              "access to the GPU:")
     summary = _totals_text(totals)
     impact = impact_sentence(targets, markup)
@@ -148,8 +168,8 @@ def launch_message(launch: Launch, targets: Sequence[Target], totals: Optional[T
     return "\n".join(lines)
 
 
-def restart_message(names: Sequence[str], markup: str = "plain") -> str:
-    intro = f"{_bold(TITLE, markup)} stopped these containers earlier. Restart them?"
+def restart_message(names: Sequence[str], markup: str = "plain", kinds: Optional[Sequence[str]] = None) -> str:
+    intro = f"{_bold(TITLE, markup)} stopped these {kind_phrase(kinds)} earlier. Restart them?"
     if markup == "html":
         return f"<p>{intro}</p><ul>{''.join(f'<li>{_esc(n, markup)}</li>' for n in names)}</ul>"
     return "\n".join([intro, ""] + [f"• {_esc(n, markup)}" for n in names])
@@ -158,6 +178,11 @@ def restart_message(names: Sequence[str], markup: str = "plain") -> str:
 def _names(refs: Sequence[Ref]) -> List[str]:
     """The names of the refs that have one; a ref without a name has nothing to show."""
     return [n for n in (str(r.get("name") or "") for r in refs) if _clean(n).strip()]
+
+
+def _kinds(refs: Sequence[Ref]) -> List[str]:
+    """The kinds of the refs that have a name (see `_names`), "container" for a ref that does not say."""
+    return [str(r.get("kind") or "container") for r in refs if _clean(str(r.get("name") or "")).strip()]
 
 
 def _run(command: List[str], timeout: Optional[float]) -> "subprocess.CompletedProcess":
@@ -217,12 +242,12 @@ class ZenityPrompter(_Base):
         names = _names(refs)
         if not names:
             return None
-        text = restart_message(names, "pango")
+        text = restart_message(names, "pango", _kinds(refs))
         try:
             result = _run(["zenity", "--question", "--title", TITLE, "--text", text, "--ok-label", LABEL_RESTART,
                            "--cancel-label", LABEL_LATER, "--extra-button", LABEL_LEAVE], None)
         except _DIALOG_ERRORS as exc:
-            log(f"cannot show a dialog ({exc}); keeping the containers marked as stopped")
+            log(f"cannot show a dialog ({exc}); keeping them marked as stopped")
             return None
         if result.returncode == 0:
             return True
@@ -252,12 +277,12 @@ class KdialogPrompter(_Base):
         names = _names(refs)
         if not names:
             return None
-        text = restart_message(names, "html")
+        text = restart_message(names, "html", _kinds(refs))
         try:
             result = _run(["kdialog", "--title", TITLE, "--yes-label", LABEL_RESTART, "--no-label", LABEL_LEAVE,
                            "--cancel-label", LABEL_LATER, "--yesnocancel", text], None)
         except _DIALOG_ERRORS as exc:
-            log(f"cannot show a dialog ({exc}); keeping the containers marked as stopped")
+            log(f"cannot show a dialog ({exc}); keeping them marked as stopped")
             return None
         return {0: True, 1: False}.get(result.returncode)  # Esc or a closed window (2) and any failure ask later
 
@@ -304,7 +329,8 @@ class NotifyPrompter(_Base):
 
     def launch(self, launch: Launch, targets: List[Target], totals: Optional[Tuple[int, int]]) -> str:
         if not self.supports_actions():
-            self.notify(TITLE, f"Launching {launch.title} with GPU containers running; this notification cannot ask.")
+            running = kind_phrase([t.kind for t in targets] or None, "and")
+            self.notify(TITLE, f"Launching {launch.title} with GPU {running} running; this notification cannot ask.")
             return "anyway"
         body = launch_message(launch, targets, totals, "plain")
         try:
@@ -318,11 +344,11 @@ class NotifyPrompter(_Base):
         names = _names(refs)
         if not names or not self.supports_actions():
             return None
-        body = restart_message(names, "plain")
+        body = restart_message(names, "plain", _kinds(refs))
         try:
             chosen = self._ask(TITLE, body, [("restart", LABEL_RESTART), ("leave", LABEL_LEAVE)])
         except _DIALOG_ERRORS as exc:
-            log(f"cannot show a notification ({exc}); keeping the containers marked as stopped")
+            log(f"cannot show a notification ({exc}); keeping them marked as stopped")
             return None
         return {"restart": True, "leave": False}.get(chosen) if chosen else None
 

@@ -3,6 +3,7 @@ Every field is validated as it changes, against the same rules `config.validate`
 disabled until the entry is valid."""
 from __future__ import annotations
 
+import copy
 import fnmatch
 import re
 import shlex
@@ -11,9 +12,9 @@ from typing import Callable, Dict, List, Optional
 from .. import config as config_module
 from .. import discovery, polkit, presets
 from ..config import Config, TargetSpec
-from .advanced_common import (KIND_TITLE, TIMEOUT_RANGE, bold_label, error_label, mono_font, quiet, slug)
+from .advanced_common import (KIND_TITLE, TIMEOUT_RANGE, bold_label, error_label, mono_font, quiet, set_switch, slug)
 from .qt import QtCore, QtGui, QtWidgets
-from .theme import SPACE, Badge, Callout, ToggleSwitch, button, styled_label
+from .theme import SPACE, Badge, Callout, ToggleSwitch, button, safe_text, styled_label
 
 Qt = QtCore.Qt
 
@@ -195,10 +196,10 @@ class TargetDialog(QtWidgets.QDialog):
         found = self.problems()
         for name, label in self._fields.items():
             shown = found.get(name, "") if name in self._touched else ""
-            label.setText(shown)
+            label.setText(safe_text(shown))
             label.setVisible(bool(shown))
         form = found.get("form", "")
-        self.summary.setText(form)
+        self.summary.setText(safe_text(form))
         self.summary.setVisible(bool(form))
         self.save_button.setEnabled(not found)
 
@@ -211,7 +212,10 @@ class TargetDialog(QtWidgets.QDialog):
         """The target entered, or None while the entry has problems."""
         if self.problems():
             return None
-        return TargetSpec.from_json(self.entry())
+        spec = TargetSpec.from_json(self.entry())
+        if self.existing is not None:
+            spec.extra = copy.deepcopy(self.existing.extra)  # keys this version does not know stay as they were
+        return spec
 
     def accept(self) -> None:
         self._touched.update(self._fields)
@@ -333,8 +337,9 @@ class CommandDialog(TargetDialog):
         self.timeout_spin = QtWidgets.QDoubleSpinBox()
         low, high = TIMEOUT_RANGE
         self.timeout_spin.setRange(low, high)
-        self.timeout_spin.setDecimals(0)
+        self.timeout_spin.setDecimals(1)
         self.timeout_spin.setSuffix(" s")
+        self.timeout_spin.setAccessibleName("Time limit in seconds")
         self.timeout_spin.setValue(60)
         self.add_field("timeout", "Time limit", self.timeout_spin,
                        f"Each command is given up on after this long ({low} to {high} seconds).")
@@ -400,9 +405,9 @@ class ProcessDialog(TargetDialog):
         self._layout.addWidget(holder)
 
     def load(self, spec: TargetSpec) -> None:
-        with quiet(self.match_edit, self.restart_switch):
+        with quiet(self.match_edit):
             self.match_edit.setText(spec.match)
-            self.restart_switch.setChecked(spec.restart)
+        set_switch(self.restart_switch, spec.restart)
 
     def kind_entry(self) -> dict:
         return {"match": self.match_edit.text().strip(), "restart": self.restart_switch.isChecked()}

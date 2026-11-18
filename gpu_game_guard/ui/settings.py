@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from ..util import atomic_write_json, log
-from . import qt, theme
+from . import qt, singleton, theme
 from .basic import CONTENT_WIDTH, BasicView
 from .qt import QtCore, QtGui, QtWidgets
 from .settings_model import (
@@ -22,6 +22,10 @@ MIN_SIZE = (780, 600)
 DEFAULT_SIZE = (900, 760)
 POLL_MS = 2000
 PREFS_FILE = "ui.json"
+SIZE_RANGE = (200, 10000)  # the window sizes a preferences file may hold
+MAX_PROBLEMS_SHOWN = 8
+RESTART_FAILED = "Settings saved, but the service could not be restarted:"
+NOT_SAVED = "These settings were not saved:"
 _ICON_STATE = {STATE_OFF: "off", STATE_PAUSED: "paused", STATE_DISABLED: "off"}
 
 
@@ -127,18 +131,28 @@ class Segmented(QtWidgets.QFrame):
 
 
 class ActionCallout(theme.Callout):
-    """A `Callout` with a button beside its text."""
+    """A `Callout` with a button beside its text, or below it when `stacked`; `add_button` puts more beside it."""
 
-    def __init__(self, text: str, button_text: str, kind: str = "", parent: Optional[QtWidgets.QWidget] = None):
+    def __init__(self, text: str, button_text: str, kind: str = "", parent: Optional[QtWidgets.QWidget] = None,
+                 stacked: bool = False):
         super().__init__(text, kind, parent)
         layout = self.layout()
-        layout.removeWidget(self.label)
-        row = QtWidgets.QHBoxLayout()
-        row.setSpacing(2 * SPACE)
-        row.addWidget(self.label, 1)
+        self._row = QtWidgets.QHBoxLayout()
+        self._row.setSpacing(SPACE)
+        if stacked:
+            self._row.addStretch(1)
+        else:
+            layout.removeWidget(self.label)
+            self._row.setSpacing(2 * SPACE)
+            self._row.addWidget(self.label, 1)
         self.button = theme.button(button_text)
-        row.addWidget(self.button, 0, Qt.AlignVCenter)
-        layout.addLayout(row)
+        self._row.addWidget(self.button, 0, Qt.AlignVCenter)
+        layout.addLayout(self._row)
+
+    def add_button(self, text: str) -> QtWidgets.QPushButton:
+        extra = theme.button(text)
+        self._row.addWidget(extra, 0, Qt.AlignVCenter)
+        return extra
 
 
 def _ask_unsaved(window: QtWidgets.QWidget) -> str:
@@ -156,6 +170,21 @@ def _ask_unsaved(window: QtWidgets.QWidget) -> str:
     return "save" if clicked is save else "discard" if clicked is discard else "cancel"
 
 
+def _confirm_defaults(window: QtWidgets.QWidget) -> bool:
+    """Ask whether to replace an unusable settings file with the defaults."""
+    box = QtWidgets.QMessageBox(window)
+    box.setIcon(QtWidgets.QMessageBox.Warning)
+    box.setWindowTitle("Start from the defaults")
+    box.setTextFormat(Qt.PlainText)
+    box.setText("Start from the default settings? Your games and targets in the unusable file are not carried "
+                "over. Applying keeps the old file next to it as a .broken copy.")
+    start = box.addButton("Start from the defaults", QtWidgets.QMessageBox.DestructiveRole)
+    keep = box.addButton("Keep the file", QtWidgets.QMessageBox.RejectRole)
+    box.setDefaultButton(keep)
+    box.exec_()
+    return box.clickedButton() is start
+
+
 class SettingsWindow(QtWidgets.QMainWindow):
     def __init__(self, model: SettingsModel, prefs_path: Optional[Path] = None):
         super().__init__()
@@ -163,14 +192,18 @@ class SettingsWindow(QtWidgets.QMainWindow):
         self.prefs_path = Path(prefs_path) if prefs_path is not None else model.path.parent / PREFS_FILE
         self.prefs = load_prefs(self.prefs_path)
         self.confirm_unsaved: Callable[[QtWidgets.QWidget], str] = _ask_unsaved
+        self.confirm_defaults: Callable[[QtWidgets.QWidget], bool] = _confirm_defaults
+        self.notice_text = ""
+        self._shape: tuple = ()
         self.advanced: Optional[QtWidgets.QWidget] = None
         self.advanced_error = ""
         self.setWindowTitle("GPU Game Guard Settings")
         self.setWindowIcon(theme.app_icon("ok"))
         self.setMinimumSize(*MIN_SIZE)
         size = self.prefs.get("size")
-        if (isinstance(size, list) and len(size) == 2 and all(isinstance(n, int) and not isinstance(n, bool)
-                                                               for n in size)):
+        if (isinstance(size, list) and len(size) == 2
+                and all(isinstance(n, int) and not isinstance(n, bool) and SIZE_RANGE[0] <= n <= SIZE_RANGE[1]
+                        for n in size)):
             self.resize(max(size[0], MIN_SIZE[0]), max(size[1], MIN_SIZE[1]))
         else:
             self.resize(*DEFAULT_SIZE)
@@ -195,8 +228,10 @@ class SettingsWindow(QtWidgets.QMainWindow):
         notices = QtWidgets.QVBoxLayout(column)
         notices.setContentsMargins(0, 0, 0, 0)
         notices.setSpacing(SPACE)
-        self.load_callout = ActionCallout("", "Start from the defaults", "warn")
-        self.load_callout.button.clicked.connect(self.model.accept_defaults)
+        self.load_callout = ActionCallout("", "Open in Raw editor to fix", "warn", stacked=True)
+        self.load_callout.button.clicked.connect(self.show_raw)
+        self.defaults_button = self.load_callout.add_button("Start from the defaults")
+        self.defaults_button.clicked.connect(self.start_from_defaults)
         self.not_running = self._build_not_running()
         notices.addWidget(self.load_callout)
         notices.addWidget(self.not_running)
@@ -214,7 +249,7 @@ class SettingsWindow(QtWidgets.QMainWindow):
         QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+S"), self, activated=self.apply)
         self.timer = QtCore.QTimer(self)
         self.timer.setInterval(POLL_MS)
-        self.timer.timeout.connect(self.refresh)
+        self.timer.timeout.connect(self.tick)
         model.changed.connect(self.refresh)
 
         mode = self.prefs.get("mode")
@@ -252,7 +287,9 @@ class SettingsWindow(QtWidgets.QMainWindow):
                           "GPU Game Guard watches for games in the background. Run this command in a terminal; "
                           "this window notices by itself once it is running.")
         row = QtWidgets.QHBoxLayout()
-        self.command_label = QtWidgets.QLabel(START_COMMAND)
+        self.command_label = QtWidgets.QLabel()
+        self.command_label.setTextFormat(Qt.PlainText)
+        self.command_label.setText(START_COMMAND)
         self.command_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         mono = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
         mono.setFamily("monospace")
@@ -271,7 +308,9 @@ class SettingsWindow(QtWidgets.QMainWindow):
         column.setContentsMargins(3 * SPACE, SPACE + 4, 3 * SPACE, SPACE + 4)
         column.setSpacing(SPACE)
         self.problems_callout = theme.Callout("", "danger")
-        self.problems_callout.label.setTextFormat(Qt.PlainText)
+        self.notice_callout = theme.Callout("", "")
+        self.notice_callout.setVisible(False)
+        column.addWidget(self.notice_callout)
         self.restart_banner = ActionCallout("Some changes take effect after the service restarts.",
                                             "Restart service", "warn")
         self.restart_banner.button.clicked.connect(self.restart_service)
@@ -304,6 +343,7 @@ class SettingsWindow(QtWidgets.QMainWindow):
         self.stack.setCurrentWidget(self.advanced if mode == "advanced" and self.advanced is not None
                                     else self.basic)
         self.switcher.setValue(mode)
+        self.fit_minimum()
         if save:
             self.save_prefs()
 
@@ -324,6 +364,31 @@ class SettingsWindow(QtWidgets.QMainWindow):
             box.addStretch(1)
             return page
 
+    def screen_limit(self) -> Optional[QtCore.QSize]:
+        """The largest minimum size that still fits the screen, or None when there is no screen."""
+        screen = QtWidgets.QApplication.primaryScreen()
+        return screen.availableGeometry().size() if screen is not None else None
+
+    def fit_minimum(self, limit: Optional[QtCore.QSize] = None) -> None:
+        """Raise the minimum window size to what the layout needs at the current font, so that buttons and tab
+        titles are never clipped. The size never falls below `MIN_SIZE` and never exceeds `limit`, which is the
+        available screen unless given."""
+        layout = self.centralWidget().layout()
+        self.setMinimumSize(0, 0)
+        need = layout.minimumSize()
+        width, height = max(MIN_SIZE[0], need.width()), max(MIN_SIZE[1], need.height())
+        limit = limit if limit is not None else self.screen_limit()
+        if limit is not None:
+            width, height = min(width, max(MIN_SIZE[0], limit.width())), min(height, max(MIN_SIZE[1], limit.height()))
+        self.setMinimumSize(width, height)
+        if self.width() < width or self.height() < height:
+            self.resize(max(self.width(), width), max(self.height(), height))
+
+    def changeEvent(self, event: QtCore.QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() in (QtCore.QEvent.FontChange, QtCore.QEvent.StyleChange):
+            QtCore.QTimer.singleShot(0, self.fit_minimum)
+
     def refresh(self) -> None:
         """Update everything that follows the model and the service: pill, icon, notices and footer."""
         state, _until = service_state(self.model)
@@ -331,11 +396,30 @@ class SettingsWindow(QtWidgets.QMainWindow):
         self.pill.setKind(PILL_KIND[state])
         self.logo.setPixmap(theme.app_icon(_ICON_STATE.get(state, "ok")).pixmap(32, 32))
         self.not_running.setVisible(state == STATE_OFF)
-        self.load_callout.setVisible(bool(self.model.load_error))
-        if self.model.load_error:
-            self.load_callout.label.setText(f"The settings file could not be read: {self.model.load_error}. "
-                                            "It was left untouched.")
+        broken = bool(self.model.load_error)
+        self.load_callout.setVisible(broken)
+        if broken:
+            shown = list(self.model.load_problems or [self.model.load_error])
+            lines = [f"- {p}" for p in shown[:MAX_PROBLEMS_SHOWN]]
+            if len(shown) > MAX_PROBLEMS_SHOWN:
+                lines.append(f"- and {len(shown) - MAX_PROBLEMS_SHOWN} more")
+            self.load_callout.label.setText(theme.safe_text(
+                "The settings file could not be used and was left untouched:\n" + "\n".join(lines)
+                + "\nFix it in the Raw config editor, or start from the defaults, which replaces the file "
+                "and keeps the unusable one next to it as a .broken copy.", keep_newlines=True))
+            self.load_callout.button.setVisible(bool(self.model.raw_file_text))
+        notice = self.notice_text
+        if getattr(self.model, "defaults_pending", False):
+            notice = ("Applying replaces the unusable settings file with the defaults. The old file is kept next "
+                      "to it as a .broken-<time> copy.")
+        self.notice_callout.label.setText(theme.safe_text(notice, keep_newlines=True))
+        self.notice_callout.setVisible(bool(notice))
         self.restart_banner.setVisible(self.model.restart_needed())
+        shape = (self.not_running.isHidden(), self.load_callout.isHidden(), self.notice_callout.isHidden(),
+                 self.restart_banner.isHidden(), self.problems_callout.isHidden())
+        if shape != self._shape and self.isVisible():
+            self._shape = shape
+            QtCore.QTimer.singleShot(0, self.fit_minimum)
         dirty = self.model.dirty
         self.apply_button.setEnabled(dirty)
         self.revert_button.setEnabled(dirty)
@@ -345,23 +429,31 @@ class SettingsWindow(QtWidgets.QMainWindow):
             self.save_label.setText("")
         self.basic.refresh_status()
 
+    def tick(self) -> None:
+        """The periodic update: pick up a change another program made to the file, then refresh."""
+        self.model.sync_with_disk()
+        self.refresh()
+
     def apply(self) -> bool:
         problems = self.model.apply()
         if problems:
             self.show_problems(problems)
             return False
         self.problems_callout.setVisible(False)
+        self.notice_text = "\n".join(self.model.notices)
         self.save_label.setText("Saved")
         self.refresh()
         return True
 
-    def show_problems(self, problems: List[str]) -> None:
-        self.problems_callout.label.setText("These settings were not saved:\n" + "\n".join(f"- {p}" for p in problems))
+    def show_problems(self, problems: List[str], title: str = NOT_SAVED) -> None:
+        self.problems_callout.label.setText(theme.safe_text(title + "\n" + "\n".join(f"- {p}" for p in problems),
+                                                            keep_newlines=True))
         self.problems_callout.setVisible(True)
 
     def revert(self) -> None:
         self.model.revert()
         self.problems_callout.setVisible(False)
+        self.notice_text = ""
         self.save_label.setText("")
         self.refresh()
 
@@ -371,8 +463,19 @@ class SettingsWindow(QtWidgets.QMainWindow):
             self.problems_callout.setVisible(False)
             self.save_label.setText("Service restarted")
         else:
-            self.show_problems([f"The service could not be restarted: {message}"])
+            self.show_problems([message], RESTART_FAILED)
         self.refresh()
+
+    def show_raw(self) -> None:
+        """Open the Raw config tab of Advanced mode."""
+        self.set_mode("advanced")
+        show = getattr(self.advanced, "show_tab", None)
+        if callable(show):
+            show("Raw config")
+
+    def start_from_defaults(self) -> None:
+        if self.confirm_defaults(self):
+            self.model.accept_defaults()
 
     def save_prefs(self) -> None:
         self.prefs.update(mode=self.mode, size=[self.width(), self.height()])
@@ -382,6 +485,7 @@ class SettingsWindow(QtWidgets.QMainWindow):
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:
         super().showEvent(event)
+        self.fit_minimum()
         self.timer.start()
         self.refresh()
 
@@ -396,13 +500,23 @@ class SettingsWindow(QtWidgets.QMainWindow):
                 event.ignore()
                 return
         self.save_prefs()
+        self.model.shutdown()
         super().closeEvent(event)
 
 
-def run() -> int:
-    app = qt.app()
-    theme.apply_theme(app)
-    app.setWindowIcon(theme.app_icon("ok"))
-    window = SettingsWindow(SettingsModel())
-    window.show()
-    return app.exec_()
+def run(config_path: Optional[Path] = None) -> int:
+    """Open the settings window and run until it closes. `config_path` names the configuration file; the default
+    is the user's. A second window is not opened while one is already open."""
+    lock = singleton.acquire("settings")
+    if lock is None:
+        log("settings: the settings window is already open")
+        return 0
+    try:
+        app = qt.app()
+        theme.apply_theme(app)
+        app.setWindowIcon(theme.app_icon("ok"))
+        window = SettingsWindow(SettingsModel(config_path))
+        window.show()
+        return app.exec_()
+    finally:
+        lock.release()

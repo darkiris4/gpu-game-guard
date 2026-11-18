@@ -6,10 +6,10 @@ from typing import Any, Dict, List, Optional
 
 from ..guard import CONTAINER_RUNTIMES
 from ..model import Target
-from .advanced_common import (KIND_RISK, CandidateSource, KIND_TITLE, RISK_BADGE, ScrolledTab, bold_label, clear_layout, divider,
-                              first_match, mib_text, quiet, setting_row)
+from .advanced_common import (KIND_RISK, KIND_TITLE, RISK_BADGE, CandidateSource, ScrolledTab, bold_label, clear_layout,
+                              divider, first_match, managed_now, mib_text, quiet, setting_row)
 from .qt import QtCore, QtWidgets
-from .theme import SPACE, Badge, Card, Pill, button, styled_label
+from .theme import SPACE, Badge, Card, Pill, button, plain_tooltip, safe_text, styled_label
 
 Qt = QtCore.Qt
 # action -> (pill text, pill kind, what it means)
@@ -52,6 +52,7 @@ class TestRunTab(ScrolledTab):
         self.game_combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
         self.game_combo.lineEdit().setPlaceholderText("steam:730")
         self.game_combo.setMinimumWidth(260)
+        self.game_combo.setAccessibleName("Game id")
         setup.addWidget(setting_row("Game", "Pick a recent game or type an id such as steam:730 or a Steam app id.",
                                     self.game_combo, "The game id whose rules are applied."))
         setup.addWidget(divider())
@@ -61,7 +62,7 @@ class TestRunTab(ScrolledTab):
         holder.setLayout(self.running_box)
         self.running_box.setContentsMargins(0, 0, 0, 0)
         self.rescan_button = button("Rescan")
-        self.rescan_button.setToolTip("Look for GPU workloads again.")
+        plain_tooltip(self.rescan_button, "Look for GPU workloads again.")
         setup.addWidget(setting_row("Running now", "Tick the detected workloads to pretend they are running.",
                                     holder, "Candidates found on this machine. Unmanaged ones are not stopped by the "
                                     "real guard.", wide=True))
@@ -122,7 +123,12 @@ class TestRunTab(ScrolledTab):
 
     def reload_candidates(self, rescan: bool) -> None:
         candidates = self.source.get(rescan)
-        signature = [(c.key, c.managed, c.vram_mib) for c in candidates]
+        config = self.model.config
+        managed = {c.key: managed_now(c, config) for c in candidates}
+        signature = [(c.key, managed[c.key], c.vram_mib) for c in candidates]
+        scanning = self.source.scanning
+        self.rescan_button.setEnabled(not scanning)
+        self.rescan_button.setText("Scanning..." if scanning else "Rescan")
         if signature == self._candidate_signature:
             return
         self._candidate_signature = signature
@@ -132,9 +138,9 @@ class TestRunTab(ScrolledTab):
         for candidate in candidates:
             line = QtWidgets.QHBoxLayout()
             line.setSpacing(SPACE)
-            check = QtWidgets.QCheckBox(candidate.label)
-            check.setChecked(previous.get(candidate.key, candidate.managed))
-            check.setToolTip(candidate.note or candidate.detail)
+            check = QtWidgets.QCheckBox(safe_text(candidate.label).replace("&", "&&"))
+            check.setChecked(previous.get(candidate.key, managed[candidate.key]))
+            plain_tooltip(check, candidate.note or candidate.detail)
             risk = KIND_RISK.get(candidate.kind, "medium")
             line.addWidget(check, 1)
             kind_badge = Badge(KIND_TITLE.get(candidate.kind, candidate.kind), RISK_BADGE[risk])
@@ -145,9 +151,9 @@ class TestRunTab(ScrolledTab):
             memory.setFixedWidth(68)
             memory.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             line.addWidget(memory)
-            managed = styled_label("" if candidate.managed else "not managed", "small", wrap=False)
-            managed.setFixedWidth(84)
-            line.addWidget(managed)
+            note = styled_label("" if managed[candidate.key] else "not managed", "small", wrap=False)
+            note.setFixedWidth(84)
+            line.addWidget(note)
             holder = QtWidgets.QWidget()
             holder.setLayout(line)
             line.setContentsMargins(0, 0, 0, 0)
@@ -155,7 +161,8 @@ class TestRunTab(ScrolledTab):
             self.checks[candidate.key] = check
             self._candidates[candidate.key] = candidate
         if not candidates:
-            self.running_box.addWidget(styled_label("No GPU workloads were detected.", "muted"))
+            self.running_box.addWidget(styled_label("Scanning..." if scanning or not self.source.loaded
+                                                    else "No GPU workloads were detected.", "muted"))
 
     def targets(self) -> List[Target]:
         """The targets of the scenario: the ticked candidates, then the extra container names."""
@@ -181,12 +188,12 @@ class TestRunTab(ScrolledTab):
     def _show_message(self, text: str) -> None:
         clear_layout(self.result_box)
         self.result_lines = [text]
-        self.result_box.addWidget(styled_label(text, ""))
+        self.result_box.addWidget(styled_label(safe_text(text), ""))
         self.result.setVisible(True)
 
     def _line(self, text: str, role: str = "") -> None:
         self.result_lines.append(text)
-        self.result_box.addWidget(styled_label(text, role))
+        self.result_box.addWidget(styled_label(safe_text(text), role))
 
     def _target_rows(self, title: str, targets: List[Target], reasons: Optional[Dict[str, str]] = None) -> None:
         self.result_lines.append(title)
@@ -196,8 +203,10 @@ class TestRunTab(ScrolledTab):
             line.setSpacing(SPACE)
             risk = KIND_RISK.get(target.kind, "medium")
             line.addWidget(Badge(KIND_TITLE.get(target.kind, target.kind), RISK_BADGE[risk]))
-            line.addWidget(QtWidgets.QLabel(target.name), 1)
-            extra = (reasons or {}).get(target.name) or mib_text(target.vram_mib)
+            name = styled_label(safe_text(target.name), "", wrap=False)
+            name.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            line.addWidget(name, 1)
+            extra = safe_text((reasons or {}).get(target.name) or mib_text(target.vram_mib))
             line.addWidget(styled_label(extra, "small", wrap=False))
             holder = QtWidgets.QWidget()
             holder.setLayout(line)
@@ -222,13 +231,13 @@ class TestRunTab(ScrolledTab):
         head = QtWidgets.QHBoxLayout()
         head.setSpacing(SPACE)
         head.addWidget(Pill(text, kind))
-        head.addWidget(styled_label(f"for {game_id}", "muted", wrap=False))
+        head.addWidget(styled_label(safe_text(f"for {game_id}"), "muted", wrap=False))
         head.addStretch(1)
         self.result_box.addLayout(head)
         self.result_lines.append(text)
         self._line(meaning if plan.action != "ask" or plan.can_ask else
                    "No dialog can be shown, so the game starts and nothing is stopped.")
-        self.result_box.itemAt(self.result_box.count() - 1).widget().setToolTip(plan.note)
+        plain_tooltip(self.result_box.itemAt(self.result_box.count() - 1).widget(), plan.note)
         if plan.will_stop:
             total = sum(t.vram_mib or 0 for t in plan.will_stop)
             self.result_box.addWidget(divider())

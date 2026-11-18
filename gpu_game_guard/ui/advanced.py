@@ -37,6 +37,8 @@ class AdvancedView(QtWidgets.QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         self.tabs = QtWidgets.QTabWidget()
         self.tabs.setDocumentMode(True)
+        self.tabs.setUsesScrollButtons(False)  # every title stays in view; the window's minimum width follows them
+        self.tabs.tabBar().setExpanding(False)
         layout.addWidget(self.tabs)
         self.source = CandidateSource(model, defer_discovery)
         self.targets = TargetsTab(model, self.source, polkit_status)

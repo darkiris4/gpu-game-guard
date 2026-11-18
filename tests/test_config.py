@@ -4,7 +4,11 @@ import contextlib
 import io
 import json
 import os
+import re
+import stat
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -425,7 +429,7 @@ class TargetTests(unittest.TestCase):
         found = problems_for(dict(SERVICE, unit="ollama"), dict(COMMAND, id="c2", stop=[]), dict(PROCESS, id="p3", match="a/b"))
         self.assertEqual(len(found), 3)
         self.assertIn('"targets"[0] (id \'ollama\')', found[0])
-        self.assertIn('"unit" must end in ".service"', found[0])
+        self.assertIn('"unit" must be a unit name ending in ".service"', found[0])
         self.assertIn('"targets"[1] (id \'c2\')', found[1])
         self.assertIn('"stop"', found[1])
         self.assertIn("non-empty list", found[1])
@@ -439,7 +443,7 @@ class TargetTests(unittest.TestCase):
         self.assertTrue(problems_for({"kind": "process", "match": "a"}))
 
     def test_duplicate_ids(self):
-        found = problems_for(PROCESS, dict(PROCESS))
+        found = problems_for(PROCESS, dict(PROCESS, label="Other"))
         self.assertEqual(len(found), 1)
         self.assertIn('"targets"[1]', found[0])
         self.assertIn("duplicates", found[0])
@@ -547,6 +551,328 @@ class CopyTests(unittest.TestCase):
         self.assertEqual(one.games["steam:1"].action, "stop")
         with self.assertRaises(ValueError):
             base.with_game("steam:1", "One", "maybe")
+
+
+class PreservationTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        self.path = self.dir / "config.json"
+
+    def write(self, data):
+        self.path.write_text(json.dumps(data))
+
+    def test_unknown_keys_survive_load_and_save(self):
+        self.write({"future": {"a": 1}, "games": {"steam:1": {"action": "stop", "note": "x"}},
+                    "targets": [dict(PROCESS, pinned=True)]})
+        with contextlib.redirect_stderr(io.StringIO()):
+            loaded = cfg.load(self.path)
+        self.assertEqual(loaded.extra, {"future": {"a": 1}})
+        self.assertEqual(loaded.games["steam:1"].extra, {"note": "x"})
+        self.assertEqual(loaded.targets[0].extra, {"pinned": True})
+        cfg.save(loaded, self.path)
+        data = json.loads(self.path.read_text())
+        self.assertEqual(data["future"], {"a": 1})
+        self.assertEqual(data["games"]["steam:1"], {"action": "stop", "name": "", "note": "x"})
+        self.assertTrue(data["targets"][0]["pinned"])
+
+    def test_load_warns_once_naming_the_unknown_keys(self):
+        self.write({"future": 1, "games": {"steam:1": {"note": "x"}}})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            cfg.load(self.path)
+        self.assertEqual(len(err.getvalue().strip().splitlines()), 1)
+        self.assertIn("future", err.getvalue())
+        self.assertIn("steam:1.note", err.getvalue())
+
+    def test_validate_still_reports_unknown_keys(self):
+        self.assertTrue(cfg.validate({"future": 1}))
+
+    def test_known_keys_win_over_extra(self):
+        c = Config(extra={"enabled": "junk", "x": 1})
+        self.assertIs(c.to_json()["enabled"], True)
+        self.assertEqual(c.to_json()["x"], 1)
+
+    def test_with_game_keeps_the_rules_extra(self):
+        c = Config(games={"a": GameRule("A", "ask", {"k": 1})}).with_game("a", "", "stop")
+        self.assertEqual(c.games["a"], GameRule("A", "stop", {"k": 1}))
+
+    def test_extra_is_not_shared_between_copies(self):
+        c = Config(extra={"k": [1]})
+        c2 = c.with_game("a", "A", "stop")
+        c2.extra["k"].append(2)
+        self.assertEqual(c.extra, {"k": [1]})
+
+
+class UpdateFileTests(PreservationTests):
+    def test_missing_file_means_defaults(self):
+        updated = cfg.update_file(lambda c: c.with_game("a", "A", "stop"), self.path)
+        self.assertEqual(updated.games["a"].action, "stop")
+        self.assertEqual(cfg.load(self.path).games["a"].name, "A")
+
+    def test_unknown_keys_survive_an_update(self):
+        self.write({"future": 5, "on_launch": "stop"})
+        with contextlib.redirect_stderr(io.StringIO()):
+            cfg.update_file(lambda c: c.with_game("a", "A", "ignore"), self.path)
+        data = json.loads(self.path.read_text())
+        self.assertEqual((data["future"], data["on_launch"], data["games"]["a"]["action"]), (5, "stop", "ignore"))
+
+    def test_two_writers_do_not_lose_each_other(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow(c):
+            started.set()
+            release.wait(5)
+            return c.with_game("a", "A", "stop")
+
+        first = threading.Thread(target=lambda: cfg.update_file(slow, self.path))
+        first.start()
+        self.assertTrue(started.wait(5))
+        second = threading.Thread(target=lambda: cfg.update_file(lambda c: c.with_game("b", "B", "ignore"), self.path))
+        second.start()
+        time.sleep(0.2)
+        release.set()
+        first.join(10)
+        second.join(10)
+        self.assertEqual(sorted(cfg.load(self.path).games), ["a", "b"])
+
+    def test_a_settings_save_made_meanwhile_survives(self):
+        self.write({"on_launch": "ask"})
+
+        def mutate(c):
+            self.write({"on_launch": "stop", "heavy_vram_mib": 100})  # changed after the caller's own read
+            return c.with_game("a", "A", "stop")
+
+        # the mutation sees the file as it is when the lock is held, so a save made before it is kept
+        cfg.update_file(lambda c: c.with_game("a", "A", "stop"), self.path)
+        self.write(dict(json.loads(self.path.read_text()), on_launch="stop", heavy_vram_mib=100))
+        cfg.update_file(lambda c: c.with_game("b", "B", "stop"), self.path)
+        loaded = cfg.load(self.path)
+        self.assertEqual((loaded.on_launch, loaded.heavy_vram_mib, sorted(loaded.games)), ("stop", 100, ["a", "b"]))
+
+    def test_an_invalid_file_is_left_untouched(self):
+        for text in ("{not json", json.dumps({"poll_seconds": -1})):
+            self.path.write_text(text)
+            with self.assertRaises(ConfigError):
+                cfg.update_file(lambda c: c.with_game("a", "A", "stop"), self.path)
+            self.assertEqual(self.path.read_text(), text)
+        self.assertEqual([p.name for p in self.dir.iterdir() if ".broken" in p.name or p.name.endswith(".bak")], [])
+
+    def test_an_invalid_result_raises_and_writes_nothing(self):
+        self.write({"on_launch": "stop"})
+        before = self.path.read_text()
+        with self.assertRaises(ConfigError):
+            cfg.update_file(lambda c: Config(poll_seconds=-5), self.path)
+        self.assertEqual(self.path.read_text(), before)
+
+    def test_the_lock_file_is_private_and_next_to_the_config(self):
+        cfg.update_file(lambda c: c, self.path)
+        lock = self.dir / "config.json.lock"
+        self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o600)
+
+    def test_a_lock_that_cannot_be_had_is_logged_and_the_update_goes_ahead(self):
+        with mock.patch.object(cfg, "_LOCK_WAIT_SECONDS", 0.1), \
+                mock.patch.object(cfg.fcntl, "flock", side_effect=BlockingIOError(11, "busy")):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                cfg.update_file(lambda c: c.with_game("a", "A", "stop"), self.path)
+        self.assertIn("without the lock", err.getvalue())
+        self.assertIn("a", cfg.load(self.path).games)
+
+    def test_without_fcntl_the_update_goes_ahead(self):
+        err = io.StringIO()
+        with mock.patch.object(cfg, "fcntl", None), contextlib.redirect_stderr(err):
+            cfg.update_file(lambda c: c.with_game("a", "A", "stop"), self.path)
+        self.assertIn("locking is not available", err.getvalue())
+        self.assertIn("a", cfg.load(self.path).games)
+
+
+class BackupTests(PreservationTests):
+    def test_the_previous_valid_file_is_kept_as_bak(self):
+        cfg.save(Config(on_launch="stop"), self.path)
+        self.assertFalse((self.dir / "config.json.bak").exists())
+        cfg.save(Config(on_launch="ignore"), self.path)
+        self.assertEqual(json.loads((self.dir / "config.json.bak").read_text())["on_launch"], "stop")
+        cfg.save(Config(on_launch="ask"), self.path)
+        self.assertEqual(json.loads((self.dir / "config.json.bak").read_text())["on_launch"], "ignore")
+
+    def test_an_identical_save_leaves_the_backup_alone(self):
+        cfg.save(Config(on_launch="stop"), self.path)
+        cfg.save(Config(on_launch="ignore"), self.path)
+        cfg.save(Config(on_launch="ignore"), self.path)
+        self.assertEqual(json.loads((self.dir / "config.json.bak").read_text())["on_launch"], "stop")
+
+    def test_an_unusable_file_is_copied_aside_first(self):
+        self.path.write_text("{broken")
+        cfg.save(Config(), self.path)
+        copies = list(self.dir.glob("config.json.broken-*"))
+        self.assertEqual(len(copies), 1)
+        self.assertEqual(copies[0].read_text(), "{broken")
+        self.assertTrue(re.fullmatch(r"config\.json\.broken-\d{8}-\d{6}", copies[0].name))
+        self.assertFalse((self.dir / "config.json.bak").exists())
+        self.assertEqual(cfg.load(self.path), Config())
+
+    def test_a_file_with_invalid_values_counts_as_broken(self):
+        self.write({"poll_seconds": -1})
+        cfg.save(Config(), self.path)
+        self.assertEqual(len(list(self.dir.glob("config.json.broken-*"))), 1)
+
+    def test_only_the_newest_five_broken_copies_are_kept(self):
+        for day in range(1, 9):
+            (self.dir / f"config.json.broken-2020010{day}-000000").write_text("old")
+        self.path.write_text("{broken")
+        cfg.save(Config(), self.path)
+        names = sorted(p.name for p in self.dir.glob("config.json.broken-*"))
+        self.assertEqual(len(names), 5)
+        self.assertNotIn("config.json.broken-20200101-000000", names)
+
+    def test_a_symlinked_config_is_written_through(self):
+        real = self.dir / "real.json"
+        real.write_text("{}")
+        link = self.dir / "link.json"
+        link.symlink_to(real)
+        cfg.save(Config(on_launch="stop"), link)
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(json.loads(real.read_text())["on_launch"], "stop")
+
+    def test_a_failed_backup_does_not_stop_the_save(self):
+        cfg.save(Config(on_launch="stop"), self.path)
+        err = io.StringIO()
+        with mock.patch.object(cfg.shutil, "copyfile", side_effect=OSError(28, "No space left")), \
+                contextlib.redirect_stderr(err):
+            cfg.save(Config(on_launch="ignore"), self.path)
+        self.assertIn("could not back up", err.getvalue())
+        self.assertEqual(cfg.load(self.path).on_launch, "ignore")
+
+
+class Merge3Tests(unittest.TestCase):
+    def test_a_field_changed_by_ours_wins_otherwise_theirs(self):
+        base = Config()
+        merged = cfg.merge3(base, Config(on_launch="stop"), Config(on_launch="ignore", heavy_vram_mib=1))
+        self.assertEqual((merged.on_launch, merged.heavy_vram_mib), ("stop", 1))
+
+    def test_nothing_changed_by_ours_takes_theirs(self):
+        theirs = Config(dialog="zenity", protect=["x"])
+        self.assertEqual(cfg.merge3(Config(), Config(), theirs), theirs)
+
+    def test_games_merge_per_id(self):
+        base = Config(games={"a": GameRule("A", "ask"), "b": GameRule("B", "ask"), "c": GameRule("C", "ask"),
+                             "d": GameRule("D", "ask")})
+        ours = Config(games={"a": GameRule("A", "stop"), "b": GameRule("B", "ask"), "d": GameRule("D", "ask"),
+                             "n": GameRule("N", "stop")})
+        theirs = Config(games={"a": GameRule("A", "ignore"), "b": GameRule("B", "ignore"), "c": GameRule("C", "ask"),
+                               "d": GameRule("D", "ignore"), "t": GameRule("T", "stop")})
+        merged = cfg.merge3(base, ours, theirs)
+        self.assertEqual(merged.games["a"].action, "stop")  # changed on both sides: ours
+        self.assertEqual(merged.games["b"].action, "ignore")  # changed only by theirs
+        self.assertNotIn("c", merged.games)  # removed by ours, untouched by theirs
+        self.assertEqual(merged.games["d"].action, "ignore")
+        self.assertEqual((merged.games["n"].action, merged.games["t"].action), ("stop", "stop"))
+
+    def test_an_entry_removed_by_ours_but_changed_by_theirs_is_kept(self):
+        base = Config(games={"a": GameRule("A", "ask")})
+        theirs = Config(games={"a": GameRule("A", "stop")})
+        self.assertEqual(cfg.merge3(base, Config(), theirs).games["a"].action, "stop")
+
+    def test_an_entry_removed_by_theirs_stays_removed(self):
+        base = Config(games={"a": GameRule("A", "ask")})
+        self.assertEqual(cfg.merge3(base, Config(games=dict(base.games), on_launch="stop"), Config()).games, {})
+
+    def test_targets_merge_per_id(self):
+        def spec(i, **kw):
+            return TargetSpec(i, "process", i.upper(), match=i * 3, **kw)
+
+        base = Config(targets=[spec("aaa"), spec("bbb"), spec("ccc")])
+        ours = Config(targets=[spec("aaa", enabled=False), spec("ccc"), spec("ooo")])
+        theirs = Config(targets=[spec("aaa", restart=False), spec("bbb", enabled=False), spec("ccc"), spec("ttt")])
+        merged = cfg.merge3(base, ours, theirs)
+        self.assertEqual([t.id for t in merged.targets], ["aaa", "ccc", "ooo", "bbb", "ttt"])
+        self.assertFalse(merged.target("aaa").enabled)
+        self.assertTrue(merged.target("aaa").restart)  # ours replaces the whole entry
+        self.assertFalse(merged.target("bbb").enabled)  # ours removed it, but theirs changed it
+
+    def test_a_target_changed_by_theirs_survives_its_removal_by_ours(self):
+        base = Config(targets=[TargetSpec("bbb", "process", match="bbb")])
+        theirs = Config(targets=[TargetSpec("bbb", "process", match="bbb", enabled=False)])
+        merged = cfg.merge3(base, Config(on_launch="stop"), theirs)
+        self.assertFalse(merged.target("bbb").enabled)
+        merged = cfg.merge3(base, Config(targets=[]), theirs)
+        self.assertFalse(merged.target("bbb").enabled)
+
+    def test_extra_merges_per_key(self):
+        base = Config(extra={"a": 1, "b": 2})
+        merged = cfg.merge3(base, Config(extra={"a": 9}), Config(extra={"a": 1, "b": 3, "c": 4}))
+        self.assertEqual(merged.extra, {"a": 9, "b": 3, "c": 4})
+
+    def test_the_inputs_are_not_modified(self):
+        base, ours, theirs = Config(), Config(on_launch="stop"), Config(games={"a": GameRule("A", "stop")})
+        merged = cfg.merge3(base, ours, theirs)
+        merged.games["a"].action = "ignore"
+        self.assertEqual(theirs.games["a"].action, "stop")
+
+
+class FileStampTests(PreservationTests):
+    def test_stamp_changes_with_the_file(self):
+        self.assertIsNone(cfg.file_stamp(self.path))
+        self.write({})
+        first = cfg.file_stamp(self.path)
+        self.assertEqual(len(first), 3)
+        self.write({"on_launch": "stop"})
+        self.assertNotEqual(cfg.file_stamp(self.path), first)
+
+
+class WatcherResetTests(PreservationTests):
+    def test_the_error_resets_when_the_file_is_deleted(self):
+        watcher = ConfigWatcher(self.path)
+        self.path.write_text("{bad")
+        with contextlib.redirect_stderr(io.StringIO()):
+            watcher.current()
+        self.assertTrue(watcher.error)
+        self.path.unlink()
+        with contextlib.redirect_stderr(io.StringIO()):
+            watcher.current()
+        self.assertEqual(watcher.error, "")
+
+
+class StricterValidationTests(unittest.TestCase):
+    def test_process_match_length_and_literals(self):
+        for bad in ("ab", "x" * 16, "***", "a*?", "[a]*"):
+            found = problems_for(dict(PROCESS, match=bad))
+            self.assertEqual(len(found), 1, bad)
+            self.assertIn('"match"', found[0])
+        self.assertIn("15", problems_for(dict(PROCESS, match="x" * 16))[0])
+        self.assertIn("kernel", problems_for(dict(PROCESS, match="x" * 16))[0])
+        self.assertIn("glob", problems_for(dict(PROCESS, match="ab*"))[0])
+        for good in ("obs", "x" * 15, "obs*", "*obs*", "firefox*"):
+            self.assertEqual(problems_for(dict(PROCESS, match=good)), [], good)
+
+    def test_service_unit_rules(self):
+        for bad in ("-x.service", "a*.service", "a[1].service", "a?.service", "a b.service", "a/b.service",
+                    ".service.sh", "a.service\n", "\u00e9.service"):
+            found = problems_for(dict(SERVICE, unit=bad))
+            self.assertEqual(len(found), 1, repr(bad))
+        self.assertIn("must not start with", problems_for(dict(SERVICE, unit="-x.service"))[0])
+        self.assertIn("not a glob", problems_for(dict(SERVICE, unit="a*.service"))[0])
+        for good in ("ollama.service", "user@1000.service", "dev-sda.service", "a:b_c.d@e.service"):
+            self.assertEqual(problems_for(dict(SERVICE, unit=good)), [], good)
+
+    def test_labels_must_be_unique_ignoring_case(self):
+        found = problems_for(dict(PROCESS, label="Media"), dict(PROCESS, id="other", label="media"))
+        self.assertEqual(len(found), 1)
+        self.assertIn('"targets"[1]', found[0])
+        self.assertIn("labels must differ", found[0])
+        self.assertIn('"targets"[0]', found[0])
+
+    def test_a_missing_label_counts_as_the_id(self):
+        found = problems_for(dict(PROCESS, id="obs"), dict(COMMAND, id="x", label="OBS"))
+        self.assertEqual(len(found), 1)
+        with self.assertRaises(ConfigError):
+            Config.from_json({"targets": [dict(PROCESS, id="obs"), dict(COMMAND, id="x", label="OBS")]})
+
+    def test_distinct_labels_are_fine(self):
+        self.assertEqual(problems_for(dict(PROCESS, label="A"), dict(PROCESS, id="b", label="B")), [])
 
 
 if __name__ == "__main__":

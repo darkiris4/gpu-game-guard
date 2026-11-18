@@ -105,7 +105,7 @@ date_line="$(LC_ALL=C date -u -d "@$epoch" '+%a, %d %b %Y %H:%M:%S +0000')"
       /^- /{ if (line != "") print line; line = $0; sub(/^- /, "  * ", line); next }
       /^  [^ ]/ && line != "" { sub(/^ +/, " "); line = line $0; next }
       /^### /{ if (line != "") print line; line = "" }
-      END { if (line != "") print line }' "$root/CHANGELOG.md" | head -n 25)"
+      END { if (line != "") print line }' "$root/CHANGELOG.md" | sed -n '1,25p')"
   fi
   if [ -n "$bullets" ]; then printf '%s\n' "$bullets"; else printf '  * Release %s.\n' "$version"; fi
   printf '\n -- %s <%s>  %s\n' "$maintainer_name" "$maintainer_email" "$date_line"

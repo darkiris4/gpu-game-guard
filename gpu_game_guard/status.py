@@ -4,20 +4,19 @@ from __future__ import annotations
 
 import json
 import math
-import os
-import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .model import Ref
-from .util import atomic_write_json, xdg_state_home
+from .util import atomic_write_json, atomic_write_text, xdg_state_home
 
 STATUS_FILE = "status.json"
 EVENTS_FILE = "events.jsonl"
 PAUSE_FILE = "pause.json"
 MAX_EVENTS = 300  # lines kept in the events file
+MAX_VALID_FOR = 3600.0  # the longest validity a reader honours, whatever the file claims
 
 
 @dataclass
@@ -37,6 +36,7 @@ class Status:
     dialog: str = ""  # name of the dialog backend
     can_ask: bool = True  # whether that backend can ask
     targets: int = 0  # configured targets
+    valid_for: float = 15.0  # seconds after `updated` for which a reader may take this status as current
 
 
 def status_dir(directory: Optional[Path] = None) -> Path:
@@ -56,14 +56,15 @@ def write_status(status: Status, directory: Optional[Path] = None) -> None:
         "paused_until": status.paused_until if status.paused_until is not None and math.isfinite(status.paused_until) else None,
         "game": status.game, "stopped": list(status.stopped), "config_ok": status.config_ok,
         "config_error": status.config_error, "dialog": status.dialog, "can_ask": status.can_ask,
-        "targets": status.targets,
+        "targets": status.targets, "valid_for": status.valid_for,
     }
-    atomic_write_json(status_dir(directory) / STATUS_FILE, data)
+    atomic_write_json(status_dir(directory) / STATUS_FILE, data, private=True)
 
 
 def read_status(directory: Optional[Path] = None, max_age: float = 15.0) -> Optional[Status]:
     """The status last written, or None when there is none, it cannot be read, or it is older than `max_age`
-    seconds (the guard is then taken to be not running)."""
+    seconds, or than the status's own `valid_for` when that is longer (the guard is then taken to be not running).
+    A guard that blocks on a dialog publishes a long `valid_for` so it is not mistaken for a stopped one."""
     try:
         data = json.loads((status_dir(directory) / STATUS_FILE).read_text(encoding="utf-8"))
     except (OSError, ValueError, RecursionError):
@@ -71,7 +72,8 @@ def read_status(directory: Optional[Path] = None, max_age: float = 15.0) -> Opti
     if not isinstance(data, dict):
         return None
     updated = _number(data.get("updated"), 0.0)
-    if time.time() - updated > max_age:
+    valid_for = min(max(_number(data.get("valid_for"), 15.0), 0.0), MAX_VALID_FOR)
+    if time.time() - updated > max(max_age, valid_for):
         return None
     paused = data.get("paused") is True
     until = data.get("paused_until")
@@ -88,7 +90,7 @@ def read_status(directory: Optional[Path] = None, max_age: float = 15.0) -> Opti
         stopped=[ref for ref in stopped if isinstance(ref, dict)] if isinstance(stopped, list) else [],
         config_ok=data.get("config_ok") is not False, config_error=error if isinstance(error, str) else None,
         dialog=str(data.get("dialog", "")), can_ask=data.get("can_ask") is not False,
-        targets=int(_number(data.get("targets"), 0)))
+        targets=int(_number(data.get("targets"), 0)), valid_for=valid_for)
 
 
 def append_event(kind: str, message: str, directory: Optional[Path] = None, **fields: Any) -> None:
@@ -97,30 +99,12 @@ def append_event(kind: str, message: str, directory: Optional[Path] = None, **fi
     entry: Dict[str, Any] = dict(fields)
     entry.update(t=time.time(), kind=kind, message=message)
     line = json.dumps(entry, sort_keys=True, default=str)
-    path.parent.mkdir(parents=True, exist_ok=True)
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         lines = []
     lines.append(line)
-    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as tmp:
-            tmp.write("\n".join(lines[-MAX_EVENTS:]) + "\n")
-        os.chmod(tmp_name, 0o644 & ~_umask())
-        os.replace(tmp_name, path)
-    except BaseException:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
-
-
-def _umask() -> int:
-    mask = os.umask(0)
-    os.umask(mask)
-    return mask
+    atomic_write_text(path, "\n".join(lines[-MAX_EVENTS:]) + "\n", private=True)
 
 
 def read_events(limit: int = 100, directory: Optional[Path] = None) -> List[dict]:
@@ -147,7 +131,7 @@ def pause(seconds: Optional[float] = None, directory: Optional[Path] = None) -> 
     until: Optional[float] = None
     if seconds is not None and math.isfinite(seconds):
         until = time.time() + max(float(seconds), 0.0)
-    atomic_write_json(status_dir(directory) / PAUSE_FILE, {"until": until})
+    atomic_write_json(status_dir(directory) / PAUSE_FILE, {"until": until}, private=True)
 
 
 def resume(directory: Optional[Path] = None) -> None:

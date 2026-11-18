@@ -2,6 +2,7 @@
 start what was stopped once the game has closed."""
 from __future__ import annotations
 
+import dataclasses
 import math
 import os
 import time
@@ -10,13 +11,15 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from . import __version__, status as statusmod
-from .config import Config, save as save_config
+from .config import Config, ConfigError, update_file
 from .model import Launch, Ref, Runtime, Target, Trigger
-from .state import State
+from .state import State, ref_key
 from .util import log
 
 LaunchKey = Tuple[str, Tuple[Any, ...]]  # (trigger name, Launch.key)
 CONTAINER_RUNTIMES = ("docker", "podman")  # runtimes that `auto_containers` switches off
+STATUS_REWRITE_SECONDS = 5.0  # an unchanged status is rewritten at most this often, to show the guard is alive
+LONG_VALIDITY_SECONDS = 900.0  # how long a status stays current while a dialog blocks or a restart is pending
 
 
 @dataclass
@@ -72,6 +75,8 @@ class Guard:
         self.config_error: Optional[str] = None
         self.last_config: Config = Config()
         self._channel_failed = False  # a status write failure is logged once
+        self._last_status: Optional[Dict[str, Any]] = None  # what the last successful write held, less `updated`
+        self._status_written_at: Optional[float] = None  # `clock()` of the last write attempt
         self.seen: Set[LaunchKey] = set()  # launches already looked at; those running at startup are left alone
         self.ended: Set[LaunchKey] = set()  # launches the guard ended; their processes may linger for a moment
         self.bypass: Dict[str, float] = {}  # game id -> time until which a launch is let through
@@ -170,14 +175,26 @@ class Guard:
         return "watching"
 
     def _publish(self) -> None:
-        """Write the status file; a failure is logged once and never stops the guard."""
+        """Write the status file when anything but `updated` changed, otherwise at most every
+        STATUS_REWRITE_SECONDS. A failure is logged once and never stops the guard."""
+        state = self._state_name()
+        current = statusmod.Status(
+            version=__version__, pid=os.getpid(), updated=0.0, state=state,
+            paused_until=self.paused_until, paused=self.paused_until is not None, game=self.current_game,
+            stopped=[dict(ref) for ref in self.state.stopped], config_ok=self.config_error is None,
+            config_error=self.config_error, dialog=self.dialog_name, can_ask=self._can_ask,
+            targets=len(self.last_config.targets),
+            valid_for=LONG_VALIDITY_SECONDS if state in ("asking", "restart-pending") else 15.0)
+        fingerprint = dataclasses.asdict(current)
+        now = self.clock()
+        if (fingerprint == self._last_status and self._status_written_at is not None
+                and now - self._status_written_at < STATUS_REWRITE_SECONDS):
+            return
+        self._status_written_at = now
+        current.updated = self.wall()
         try:
-            statusmod.write_status(statusmod.Status(
-                version=__version__, pid=os.getpid(), updated=self.wall(), state=self._state_name(),
-                paused_until=self.paused_until, paused=self.paused_until is not None, game=self.current_game,
-                stopped=[dict(ref) for ref in self.state.stopped], config_ok=self.config_error is None,
-                config_error=self.config_error, dialog=self.dialog_name, can_ask=self._can_ask,
-                targets=len(self.last_config.targets)), self.status_dir)
+            statusmod.write_status(current, self.status_dir)
+            self._last_status = fingerprint
         except Exception as exc:
             self._channel_error(exc)
 
@@ -263,6 +280,7 @@ class Guard:
                 choice = "anyway"
             finally:
                 self.asking = False
+                self._publish()
             if choice not in ("stop", "cancel"):
                 choice = "anyway"  # fail safe: an unknown or missing answer lets the game start
             self._remember(launch, choice, config)
@@ -303,10 +321,12 @@ class Guard:
                 path = getattr(getattr(self.watcher, "watcher", None), "path", None)
             if path is None:
                 return  # the watcher has no file to write back to
-            save_config(config.with_game(launch.game_id, launch.title, action), path)
+            update_file(lambda current: current.with_game(launch.game_id, launch.title, action), path)
             log(f"remembered: {launch.game_id} -> {action}")
             self._event("remember", f"{launch.title or launch.game_id} will always {action}",
                         game=launch.game_id, action=action)
+        except ConfigError as exc:
+            log(f"could not remember the choice for {launch.game_id}; the config file is left as it is: {exc}")
         except Exception as exc:
             log(f"could not remember the choice for {launch.game_id}: {exc!r}")
 
@@ -315,7 +335,7 @@ class Guard:
         refs = [t.ref for t in targets]
         self._each_runtime(refs, "stop")
         still = self._running_keys()
-        stopped = [ref for ref in refs if (ref["kind"], ref["runtime"], ref["name"]) not in still]
+        stopped = [ref for ref in refs if ref_key(ref) not in still]
         survivors = [ref["name"] for ref in refs if ref not in stopped]
         if survivors:
             log(f"still running after the stop: {', '.join(survivors)}")
@@ -333,26 +353,38 @@ class Guard:
         keys = set()
         for runtime in self.runtimes:
             try:
-                keys.update((t.kind, t.runtime, t.name) for t in runtime.running_gpu_targets())
+                keys.update(ref_key(t.ref) for t in runtime.running_gpu_targets())
             except Exception as exc:
                 log(f"runtime {runtime.name} failed: {exc!r}")
         return keys
 
-    def _start(self, refs: List[Ref]) -> None:
-        self._each_runtime(refs, "start")
+    def _start(self, refs: List[Ref]) -> List[Ref]:
+        """Start the targets through their providers; returns the refs that could not be started."""
+        return self._each_runtime(refs, "start")
 
-    def _each_runtime(self, refs: List[Ref], verb: str) -> None:
+    def _each_runtime(self, refs: List[Ref], verb: str) -> List[Ref]:
+        """Hand each provider its refs. For `start`, returns the refs that failed: those the provider reported,
+        all of a provider's refs when it raised, and those whose provider is missing."""
+        failed: List[Ref] = []
         for name in dict.fromkeys(ref["runtime"] for ref in refs):
             mine = [ref for ref in refs if ref["runtime"] == name]
             runtime = next((r for r in self.runtimes if r.name == name), None)
             if runtime is None:
                 log(f"cannot {verb} {', '.join(r['name'] for r in mine)}: runtime {name} is not available")
+                failed.extend(mine)
                 continue
             try:
-                getattr(runtime, verb)(mine)
+                result = getattr(runtime, verb)(mine)
             except Exception as exc:
                 log(f"{verb} through {name} failed: {exc!r}")
                 self._event("failure", f"{verb} through {name} failed")
+                failed.extend(mine)
+                continue
+            if verb == "start" and result:
+                reported = {ref_key(item) for item in result if isinstance(item, dict) and "kind" in item
+                            and "runtime" in item and "name" in item}
+                failed.extend(ref for ref in mine if ref_key(ref) in reported)
+        return failed if verb == "start" else []
 
     def _notify(self, title: str, body: str) -> None:
         try:
@@ -378,10 +410,8 @@ class Guard:
             log(f"leaving stopped: {names}")
             self._event("leave", f"left stopped: {names}")
         elif after_game == "restart":
-            log(f"restarting {names}")
-            self._start(refs)
-            self._event("restart", f"started {names} again")
-            self._notify("GPU Game Guard", f"Started {names} again.")
+            if not self._restart(refs, config, now, notify_success=True):
+                return
         else:
             self.asking = True
             self._publish()
@@ -393,13 +423,13 @@ class Guard:
                 answer = None
             finally:
                 self.asking = False
+                self._publish()
             if answer is None:
                 self.retry_at = now + config.dialog_retry_seconds
                 return
             if answer:
-                log(f"restarting {names}")
-                self._start(refs)
-                self._event("restart", f"started {names} again")
+                if not self._restart(refs, config, now, notify_success=False):
+                    return
             else:
                 log("leaving containers stopped")
                 self._event("leave", f"left stopped: {names}")
@@ -409,6 +439,35 @@ class Guard:
             log(f"could not clear the state file: {exc!r}")
         self.baseline.clear()
         self.last_active = self.clock()
+
+    def _restart(self, refs: List[Ref], config: Config, now: float, notify_success: bool) -> bool:
+        """Start the recorded targets. Returns True when all started. Targets that could not be started stay
+        in the state and are tried again after `dialog_retry_seconds`; only those that started are forgotten."""
+        log(f"restarting {', '.join(ref['name'] for ref in refs)}")
+        failed = self._start(refs)
+        failed_keys = {ref_key(ref) for ref in failed}
+        started = [ref["name"] for ref in refs if ref_key(ref) not in failed_keys]
+        missed = [ref["name"] for ref in refs if ref_key(ref) in failed_keys]
+        if started:
+            message = f"started {', '.join(started)} again"
+            if missed:
+                message += f"; could not start {', '.join(missed)}"
+        else:
+            message = f"could not start {', '.join(missed)}"
+        self._event("restart", message)
+        if missed:
+            log(message)
+            self._notify("GPU Game Guard", message[0].upper() + message[1:] + ".")
+            self.state.remove([ref for ref in refs if ref_key(ref) not in failed_keys])
+            try:
+                self.state.save()
+            except Exception as exc:
+                log(f"could not save the state: {exc!r}")
+            self.retry_at = now + config.dialog_retry_seconds
+            return False
+        if notify_success:
+            self._notify("GPU Game Guard", f"Started {', '.join(started)} again.")
+        return True
 
     def _poll_delay(self) -> float:
         """The configured poll interval limited to a range `time.sleep` accepts and a sensible one."""

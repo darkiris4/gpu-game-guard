@@ -19,9 +19,11 @@ from __future__ import annotations
 import functools
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, TextIO, Tuple
 
 from .. import dialogs
@@ -34,24 +36,63 @@ LAUNCH_CHOICES = ("stop", "anyway", "cancel")
 RESTART_CHOICES = ("restart", "later", "leave")
 KIND_LABELS = {"container": "Container", "service": "Service", "command": "Command", "process": "Process"}
 HEADLINE_TITLE_LIMIT = 120
+MAX_WIDTH = 640  # widest the dialog gets at the base font size, in pixels
+MIN_WIDTH = 520
+HEIGHT_FRACTION = 0.8  # the most of the screen's height the dialog may take
+MIN_LIST_HEIGHT = 76  # the target list always shows at least one card
+ENTER_GUARD_MS = 700  # Enter and Return are ignored for this long after the window appears
+HEADLESS_PLATFORMS = ("offscreen", "minimal", "minimalegl", "vnc", "linuxfb")
+LAUNCH_LABELS = {"stop": "&Stop and launch", "anyway": "Launch &anyway", "cancel": "&Cancel"}
+RESTART_LABELS = {"restart": "&Restart", "later": "Ask me &later", "leave": "Leave &stopped"}
+REMEMBER_LABEL = "&Remember my choice for this game"
+test_platform: Optional[str] = None  # test hook: applied to QT_QPA_PLATFORM after the platform choice, e.g. "offscreen"
 
 
 def self_command(main: Any = None, argv: Optional[Sequence[str]] = None, executable: Optional[str] = None) -> List[str]:
     """The command line that starts this program again, without its subcommand. Running as `python -m
     gpu_game_guard` gives `[python, "-m", "gpu_game_guard"]`; running from a zipapp (no module spec, or the
-    spec of a bare `__main__`) gives `[python, <path of the zipapp>]`."""
+    spec of a bare `__main__`) gives `[python, <path of the zipapp>]`. Without a script path (`python -c`, standard
+    input or an empty `sys.argv`) the module form is used."""
     main = sys.modules.get("__main__") if main is None else main
     argv = list(sys.argv if argv is None else argv)
     executable = executable or sys.executable
     spec = getattr(main, "__spec__", None)
     name = getattr(spec, "name", None)
-    if name in (None, "__main__") and argv and argv[0] and argv[0] != "-m":
+    if name in (None, "__main__") and argv and argv[0] and argv[0] not in ("-m", "-c", "-"):
         return [executable, os.path.abspath(argv[0])]
     return [executable, "-m", "gpu_game_guard"]
 
 
 def display_available(environ: Mapping[str, str]) -> bool:
     return bool(environ.get("DISPLAY") or environ.get("WAYLAND_DISPLAY"))
+
+
+def platform_changes(environ: Mapping[str, str]) -> Dict[str, Optional[str]]:
+    """The change to `QT_QPA_PLATFORM` the dialog process makes before Qt starts: `{"QT_QPA_PLATFORM": value}` to set
+    it, a value of None to remove it, an empty dict to leave it. An inherited headless platform (offscreen, minimal
+    and the like) would show nothing, so it is removed; with no platform chosen, a Wayland session gets
+    `wayland;xcb`, which falls back to X11 when the Wayland connection fails."""
+    changes: Dict[str, Optional[str]] = {}
+    current = environ.get("QT_QPA_PLATFORM") or ""
+    if current and re.split(r"[;:]", current)[0].strip().lower() in HEADLESS_PLATFORMS:
+        changes["QT_QPA_PLATFORM"] = None
+        current = ""
+    if not current and environ.get("WAYLAND_DISPLAY"):
+        changes["QT_QPA_PLATFORM"] = "wayland;xcb"
+    return changes
+
+
+def effective_environment(environ: Mapping[str, str]) -> Dict[str, str]:
+    """`environ` with `platform_changes` (and the `test_platform` hook) applied."""
+    result = dict(environ)
+    for key, value in platform_changes(environ).items():
+        if value is None:
+            result.pop(key, None)
+        else:
+            result[key] = value
+    if test_platform:
+        result["QT_QPA_PLATFORM"] = test_platform
+    return result
 
 
 def target_payload(target: Target) -> Dict[str, Any]:
@@ -163,34 +204,50 @@ def dialog_class() -> type:
     """The dialog widget class, built on first use so importing this module does not load Qt."""
     from . import theme
 
-    QtCore, QtWidgets = qt.QtCore, qt.QtWidgets
+    QtCore, QtGui, QtWidgets = qt.QtCore, qt.QtGui, qt.QtWidgets
     Qt = QtCore.Qt
 
     class PromptDialog(QtWidgets.QDialog):
         """The launch or restart question. `choice` holds the answer; it starts as the answer for a dismissed window
-        (cancel for a launch, later for a restart) and only a button changes it."""
+        (cancel for a launch, later for a restart) and only a button changes it. Enter and Return are ignored for
+        `ENTER_GUARD_MS` after the window appears, so a key press meant for the game cannot answer the question."""
 
-        def __init__(self, payload: Mapping[str, Any]):
+        def __init__(self, payload: Mapping[str, Any], clock: Callable[[], float] = time.monotonic):
             super().__init__()
             self.payload = payload
+            self._clock = clock
+            self._shown_at: Optional[float] = None
             self.kind = "restart" if payload.get("kind") == "restart" else "launch"
             self.choice = "cancel" if self.kind == "launch" else "later"
             self.buttons: Dict[str, Any] = {}
             self.remember_box: Optional[Any] = None
+            self.list_area: Optional[Any] = None
             self.targets = [self._target(t) for t in payload.get("targets") or [] if isinstance(t, dict)]
+            scale = theme.font_scale()
+            self.max_width = int(MAX_WIDTH * scale)
             self.setWindowTitle(dialogs.TITLE)
             self.setWindowIcon(theme.app_icon("ok"))
             self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-            self.setMinimumWidth(520)
+            self.setMinimumWidth(int(MIN_WIDTH * scale))
+            self.setMaximumWidth(self.max_width)
             self._build()
+            self.fit_height(None)
+            for widget in [self, *self.findChildren(QtWidgets.QWidget)]:
+                widget.installEventFilter(self)
+            self.buttons[self.default_choice].setFocus(Qt.OtherFocusReason)
+
+        @property
+        def default_choice(self) -> str:
+            return "stop" if self.kind == "launch" else "restart"
 
         @staticmethod
         def _target(item: Mapping[str, Any]) -> Tuple[Target, str]:
             vram = item.get("vram_mib")
             vram = vram if isinstance(vram, int) and not isinstance(vram, bool) and vram >= 0 else None
-            target = Target(str(item.get("kind") or "container"), "", dialogs._clean(item.get("name") or ""),
-                            dialogs._clean(item.get("image") or ""), vram)
-            return target, dialogs._clean(item.get("label") or "")
+            target = Target(theme.safe_text(item.get("kind") or "container").strip() or "container", "",
+                            theme.safe_text(item.get("name") or "").strip(),
+                            theme.safe_text(item.get("image") or "").strip(), vram)
+            return target, theme.safe_text(item.get("label") or "").strip()
 
         def _build(self) -> None:
             space = theme.SPACE
@@ -198,46 +255,65 @@ def dialog_class() -> type:
             root.setContentsMargins(3 * space, 3 * space, 3 * space, 3 * space)
             root.setSpacing(2 * space)
             root.addLayout(self._header())
-            holder = QtWidgets.QVBoxLayout()
-            holder.setSpacing(space)
-            for target, label in self.targets:
-                holder.addWidget(self._target_card(target, label))
-            if len(self.targets) > 4:
+            if self.targets:
                 area = QtWidgets.QScrollArea()
+                area.setObjectName("TargetList")
                 area.setWidgetResizable(True)
+                area.setFrameShape(QtWidgets.QFrame.NoFrame)
+                area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
                 inner = QtWidgets.QWidget()
-                inner.setLayout(holder)
+                inner.setObjectName("TargetListContents")
+                holder = QtWidgets.QVBoxLayout(inner)
+                holder.setSpacing(space)
                 holder.setContentsMargins(0, 0, space, 0)
+                for target, label in self.targets:
+                    holder.addWidget(self._target_card(target, label))
                 area.setWidget(inner)
-                area.setMinimumHeight(4 * 76)
+                self.list_area = area
                 root.addWidget(area, 1)
-            else:
-                root.addLayout(holder)
             if self.kind == "launch":
                 self._launch_details(root)
             root.addLayout(self._buttons())
+
+        def _title_text(self, headline: Any) -> str:
+            """The game title cut to fit the headline: very long titles are shortened, and a word wider than the
+            line is elided so an unbreakable title cannot widen the dialog."""
+            title = theme.safe_text(self.payload.get("title") or "").strip() or "this game"
+            if len(title) > HEADLINE_TITLE_LIMIT:
+                title = title[:HEADLINE_TITLE_LIMIT - 1] + "…"
+            space = theme.SPACE
+            line = self.max_width - 6 * space - 48 - 2 * space
+            headline.ensurePolished()
+            metrics = headline.fontMetrics()
+            words = [metrics.elidedText(w, Qt.ElideMiddle, line) if metrics.horizontalAdvance(w) > line else w
+                     for w in title.split(" ")]
+            return " ".join(words)
 
         def _header(self) -> Any:
             row = QtWidgets.QHBoxLayout()
             row.setSpacing(2 * theme.SPACE)
             icon = QtWidgets.QLabel()
+            icon.setTextFormat(Qt.PlainText)
             icon.setPixmap(theme.app_icon("ok").pixmap(48, 48))
             icon.setAlignment(Qt.AlignTop)
             texts = QtWidgets.QVBoxLayout()
             texts.setSpacing(4)
+            headline = theme.styled_label("", "headline")
+            headline.setObjectName("Headline")
+            headline.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
             if self.kind == "launch":
-                title = dialogs._clean(self.payload.get("title") or "this game")
-                if len(title) > HEADLINE_TITLE_LIMIT:
-                    title = title[:HEADLINE_TITLE_LIMIT - 1] + "…"
+                full = theme.safe_text(self.payload.get("title") or "").strip() or "this game"
+                title = self._title_text(headline)
                 count = len(self.targets)
                 head = f"Launching {title}"
                 sub = (f"GPU Game Guard paused this launch because {count} "
                        f"{'program is' if count == 1 else 'programs are'} using the GPU.")
+                if title != full:
+                    theme.plain_tooltip(headline, f"Launching {full}")
             else:
                 head = "Restart what was stopped?"
                 sub = "These were stopped for a game and are still stopped."
-            headline = theme.styled_label(head, "headline")
-            headline.setObjectName("Headline")
+            headline.setText(head)
             texts.addWidget(headline)
             texts.addWidget(theme.styled_label(sub, "muted"))
             row.addWidget(icon)
@@ -287,20 +363,20 @@ def dialog_class() -> type:
                 text = dialogs._totals_text((totals[0], totals[1]))
                 root.addWidget(theme.styled_label(text, "small"))
             if self.payload.get("remember") is True:
-                self.remember_box = QtWidgets.QCheckBox("Remember my choice for this game")
+                self.remember_box = QtWidgets.QCheckBox(REMEMBER_LABEL)
                 root.addWidget(self.remember_box)
 
         def _buttons(self) -> Any:
             row = QtWidgets.QHBoxLayout()
             row.setSpacing(theme.SPACE)
             if self.kind == "launch":
-                spec = [("cancel", dialogs.LABEL_CANCEL, "secondary"), ("anyway", dialogs.LABEL_ANYWAY, "secondary"),
-                        ("stop", "Stop and launch", "primary")]
+                spec = [("cancel", "secondary"), ("anyway", "secondary"), ("stop", "primary")]
+                labels = LAUNCH_LABELS
             else:
-                spec = [("leave", dialogs.LABEL_LEAVE, "secondary"), ("later", dialogs.LABEL_LATER, "secondary"),
-                        ("restart", dialogs.LABEL_RESTART, "primary")]
-            for index, (choice, text, role) in enumerate(spec):
-                widget = theme.button(text, role)
+                spec = [("leave", "secondary"), ("later", "secondary"), ("restart", "primary")]
+                labels = RESTART_LABELS
+            for index, (choice, role) in enumerate(spec):
+                widget = theme.button(labels[choice], role)
                 widget.setObjectName(f"button_{choice}")
                 widget.clicked.connect(functools.partial(self.answer, choice))
                 self.buttons[choice] = widget
@@ -324,12 +400,76 @@ def dialog_class() -> type:
                 remember = {"stop": "stop", "anyway": "ignore"}.get(self.choice)
             return {"choice": self.choice, "remember": remember}
 
-        def showEvent(self, event: Any) -> None:
+        def enter_allowed(self) -> bool:
+            """False until `ENTER_GUARD_MS` have passed since the window was shown."""
+            return self._shown_at is not None and (self._clock() - self._shown_at) * 1000.0 >= ENTER_GUARD_MS
+
+        def eventFilter(self, obj: Any, event: Any) -> bool:  # noqa: N802 (Qt naming)
+            if (event.type() in (QtCore.QEvent.KeyPress, QtCore.QEvent.KeyRelease)
+                    and event.key() in (Qt.Key_Return, Qt.Key_Enter) and not self.enter_allowed()):
+                return True
+            return super().eventFilter(obj, event)
+
+        def target_screen(self) -> Any:
+            """The screen under the pointer, or the primary screen."""
+            screen = QtWidgets.QApplication.screenAt(QtGui.QCursor.pos())
+            return screen if screen is not None else QtWidgets.QApplication.primaryScreen()
+
+        def _height_for(self, width: int) -> int:
+            height = self.layout().totalHeightForWidth(width)
+            return height if height >= 0 else self.sizeHint().height()
+
+        def fit_height(self, available: Optional[int]) -> None:
+            """Size the target list to its contents, or, when `available` (the screen's usable height) is given, so
+            that the dialog takes at most `HEIGHT_FRACTION` of it; the list scrolls when it does not fit."""
+            area = self.list_area
+            if area is None:
+                return
+            self.ensurePolished()
+            inner = area.widget()
+            content = inner.sizeHint().height() if inner is not None else MIN_LIST_HEIGHT
+            area.setFixedHeight(content)
+            self.layout().invalidate()
+            self.layout().activate()
+            if available is None:
+                return
+            floor = min(content, int(MIN_LIST_HEIGHT * theme.font_scale()))
+            limit = int(available * HEIGHT_FRACTION)
+            least = self.layout().minimumSize().height() - content + floor  # with the list at its smallest
+            if limit < least:  # a very small screen: use all of it before clipping
+                limit = min(available, least)
+            width = min(max(self.sizeHint().width(), self.minimumWidth()), self.maximumWidth())
+            total = self._height_for(width)
+            if total > limit:
+                area.setFixedHeight(max(floor, content - (total - limit)))
+                self.layout().invalidate()
+                self.layout().activate()
+            self.setMaximumHeight(max(limit, 1))
+
+        def place_in(self, available: Any) -> None:
+            """Size the dialog for the screen area `available` (a QRect) and centre it there, kept fully inside."""
+            width_cap = int(available.width() * 0.95)
+            self.setMaximumWidth(min(self.max_width, width_cap))
+            self.setMinimumWidth(min(self.minimumWidth(), width_cap))
+            self.fit_height(available.height())
+            width = min(max(self.sizeHint().width(), self.minimumWidth()), self.maximumWidth())
+            height = min(self._height_for(width), self.maximumHeight())
+            self.resize(width, height)
+            frame = self.frameGeometry()
+            full_w, full_h = max(frame.width(), width), max(frame.height(), height)
+            x = available.left() + (available.width() - full_w) // 2
+            y = available.top() + (available.height() - full_h) // 2
+            x = max(available.left(), min(x, available.left() + available.width() - full_w))
+            y = max(available.top(), min(y, available.top() + available.height() - full_h))
+            self.move(x, y)
+
+        def showEvent(self, event: Any) -> None:  # noqa: N802 (Qt naming)
             super().showEvent(event)
-            screen = QtWidgets.QApplication.primaryScreen()
+            self._shown_at = self._clock()
+            screen = self.target_screen()
             if screen is not None:
-                area = screen.availableGeometry()
-                self.move(area.center() - self.rect().center())
+                self.place_in(screen.availableGeometry())
+            self.buttons[self.default_choice].setFocus(Qt.OtherFocusReason)
             QtCore.QTimer.singleShot(0, self.activateWindow)
 
     return PromptDialog
@@ -339,9 +479,9 @@ def _int(value: Any, default: int) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else default
 
 
-def build_dialog(payload: Mapping[str, Any]) -> Any:
+def build_dialog(payload: Mapping[str, Any], clock: Callable[[], float] = time.monotonic) -> Any:
     """A themed, not yet shown dialog for `payload` (needs a QApplication)."""
-    return dialog_class()(payload)
+    return dialog_class()(payload, clock)
 
 
 def _default_execute(dialog: Any) -> None:
@@ -352,7 +492,9 @@ def run_prompt(argv: Sequence[str], stdin: TextIO, stdout: TextIO,
                execute: Callable[[Any], None] = _default_execute, environ: Mapping[str, str] = os.environ) -> int:
     """The child process: read the payload, show the dialog, print the answer. `argv` is `["launch"]` or
     `["restart"]`. Returns 0 after printing an answer and non-zero when nothing could be shown, which the
-    parent treats as a failure. `execute(dialog)` runs the dialog's event loop; tests replace it."""
+    parent treats as a failure. `execute(dialog)` runs the dialog's event loop; tests replace it.
+
+    The Qt platform is chosen first (see `platform_changes`) and written to `os.environ` when `environ` is it."""
     kind = argv[0] if argv else ""
     if kind not in ("launch", "restart"):
         log("usage: prompt launch|restart")
@@ -360,9 +502,18 @@ def run_prompt(argv: Sequence[str], stdin: TextIO, stdout: TextIO,
     if not qt.available():
         log("PyQt5 is not installed")
         return 1
-    if not (display_available(environ) or environ.get("QT_QPA_PLATFORM")):
+    effective = effective_environment(environ)
+    if not (display_available(effective) or effective.get("QT_QPA_PLATFORM")):
         log("no display is available for the dialog")
         return 1
+    if environ is os.environ:
+        for key, value in platform_changes(environ).items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        if test_platform:
+            os.environ["QT_QPA_PLATFORM"] = test_platform
     try:
         payload = json.loads(stdin.read())
         if not isinstance(payload, dict):

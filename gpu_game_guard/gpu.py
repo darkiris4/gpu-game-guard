@@ -6,10 +6,14 @@ tool or files are missing; nothing here raises.
 """
 from __future__ import annotations
 
+import hashlib
+import os
 import re
+import signal
 import subprocess
+import tempfile
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 from . import util
 
@@ -33,12 +37,32 @@ _UNIT_TO_KIB = {"kib": 1, "mib": 1024, "gib": 1024 * 1024}
 
 
 _MAX_FAILURE_KEYS = 64
+_MAX_LOGGED = 200  # characters of command text or detail in one log line
+_MAX_OUTPUT = 1024 * 1024  # bytes read back from each of a command's output streams
+_KILL_GRACE = 2.0  # seconds between SIGTERM and SIGKILL for a command that timed out
 _last_failure: Dict[str, str] = {}
+
+_UNIT = re.compile(r"[A-Za-z0-9:_.@\-]+\.service")
+
+
+def valid_unit(unit: object) -> bool:
+    """True for a systemd service unit name that is safe to hand to systemctl: letters, digits and `: _ . @ -`,
+    ending in `.service`, never starting with a dash and never containing a glob character."""
+    return isinstance(unit, str) and not unit.startswith("-") and _UNIT.fullmatch(unit) is not None
 
 
 def _command_key(args: Sequence[str]) -> str:
-    """The command and its subcommand, which is what a failure is tracked against."""
-    return " ".join(str(arg) for arg in list(args)[:2])
+    """What a failure is tracked against: the first two arguments, which name a command and its subcommand. For an
+    interpreter given `-c` or `-m` the second argument is not a subcommand but the program, so the key is the
+    interpreter and a short hash of that program (the third argument)."""
+    argv = [str(arg) for arg in args]
+    if len(argv) >= 3 and argv[1] in ("-c", "-m") and os.path.basename(argv[0]).startswith("python"):
+        return f"{argv[0]} {hashlib.sha1(argv[2].encode('utf-8', 'replace')).hexdigest()[:8]}"
+    return " ".join(argv[:2])
+
+
+def _clip(text: str) -> str:
+    return text if len(text) <= _MAX_LOGGED else text[:_MAX_LOGGED - 3] + "..."
 
 
 def _report_failure(command: str, message: str) -> None:
@@ -47,7 +71,7 @@ def _report_failure(command: str, message: str) -> None:
         if command not in _last_failure and len(_last_failure) >= _MAX_FAILURE_KEYS:
             _last_failure.clear()
         _last_failure[command] = message
-        util.log(f"{command}: {message}")
+        util.log(f"{_clip(command)}: {_clip(message)}")
 
 
 def log_once(key: str, message: str) -> None:
@@ -66,6 +90,46 @@ class CommandResult(NamedTuple):
     stderr: str
 
 
+def _kill_group(child: "subprocess.Popen[bytes]") -> None:
+    """End a timed-out command and everything it started: SIGTERM to its process group, SIGKILL after a grace period."""
+    try:
+        os.killpg(child.pid, signal.SIGTERM)
+    except OSError:
+        pass
+    try:
+        child.wait(timeout=_KILL_GRACE)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(child.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        child.wait(timeout=_KILL_GRACE)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _read_head(handle: Any) -> str:
+    handle.seek(0)
+    return handle.read(_MAX_OUTPUT).decode("utf-8", errors="replace")
+
+
+def _execute(args: Sequence[str], timeout: float) -> CommandResult:
+    """Run a command in its own session with output going to temporary files, wait for the direct child only and
+    read back at most 1 MiB of each stream. A background process that inherited the output files cannot hold the
+    call up; on a timeout the whole process group is ended. Raises OSError, ValueError or
+    subprocess.TimeoutExpired."""
+    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        child = subprocess.Popen(list(args), stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
+        try:
+            child.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_group(child)
+            raise
+        return CommandResult(child.returncode, _read_head(out), _read_head(err))
+
+
 def run_process(args: Sequence[str], timeout: float = DEFAULT_TIMEOUT) -> Optional[CommandResult]:
     """Run a command without a shell and return its exit status and output whatever the status is.
 
@@ -74,7 +138,7 @@ def run_process(args: Sequence[str], timeout: float = DEFAULT_TIMEOUT) -> Option
     """
     command = _command_key(args)
     try:
-        done = subprocess.run(list(args), capture_output=True, text=True, errors="replace", timeout=timeout)
+        done = _execute(args, timeout)
     except OSError as exc:
         _report_failure(command, f"cannot run ({exc})")
         return None
@@ -85,7 +149,7 @@ def run_process(args: Sequence[str], timeout: float = DEFAULT_TIMEOUT) -> Option
         _report_failure(command, f"cannot run ({exc})")
         return None
     _last_failure.pop(command, None)
-    return CommandResult(done.returncode, done.stdout or "", done.stderr or "")
+    return done
 
 
 def run_command(args: Sequence[str], timeout: float = DEFAULT_TIMEOUT, keep_output: bool = False) -> Optional[str]:
@@ -96,7 +160,7 @@ def run_command(args: Sequence[str], timeout: float = DEFAULT_TIMEOUT, keep_outp
     """
     command = _command_key(args)
     try:
-        done = subprocess.run(list(args), capture_output=True, text=True, errors="replace", timeout=timeout)
+        done = _execute(args, timeout)
     except OSError as exc:
         _report_failure(command, f"cannot run ({exc})")
         return None
@@ -107,9 +171,9 @@ def run_command(args: Sequence[str], timeout: float = DEFAULT_TIMEOUT, keep_outp
         _report_failure(command, f"cannot run ({exc})")
         return None
     if done.returncode != 0:
-        detail = (done.stderr or "").strip().splitlines()
+        detail = done.stderr.strip().splitlines()
         _report_failure(command, f"exited with status {done.returncode}" + (f" ({detail[-1]})" if detail else ""))
-        return done.stdout if keep_output and (done.stdout or "").strip() else None
+        return done.stdout if keep_output and done.stdout.strip() else None
     _last_failure.pop(command, None)
     return done.stdout
 
@@ -169,9 +233,22 @@ def totals(run: Optional[Runner] = None, drm: Path = DRM) -> Optional[Tuple[int,
 class Measurement(Dict[str, int]):
     """Container id -> MiB of GPU memory. `authoritative` is True when a container missing from it is known to
     hold none (nvidia-smi lists every compute process) and False when the source could not see every
-    process (fdinfo of other users' processes is unreadable), so a missing container is unknown."""
+    process (fdinfo of other users' processes is unreadable), so a missing container is unknown. `unknown` holds
+    the containers with a process whose memory the source could not report; they are never given a figure."""
 
     authoritative = True
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self.unknown: Set[str] = set()
+
+
+def _mib(text: str) -> Optional[int]:
+    """A memory column as whole MiB, or None when it is not a number (nvidia-smi prints "[N/A]")."""
+    try:
+        return int(float(text))
+    except (ValueError, OverflowError):
+        return None
 
 
 def _nvidia_by_container(run: Runner, proc: Path) -> Optional[Dict[str, int]]:
@@ -182,11 +259,16 @@ def _nvidia_by_container(run: Runner, proc: Path) -> Optional[Dict[str, int]]:
     used = Measurement()
     for row in rows:
         try:
-            pid, mib = row[0], int(float(row[1]))
+            pid = row[0]
             container = container_id_from_cgroup((proc / pid / "cgroup").read_text())
-        except (IndexError, ValueError, OverflowError, OSError):
+            mib = _mib(row[1])
+        except (IndexError, OSError):
             continue
-        if container:
+        if mib is None:  # "[N/A]" or another figure that is not a number: the reading is incomplete
+            used.authoritative = False
+            if container:
+                used.unknown.add(container)
+        elif container:
             used[container] = used.get(container, 0) + mib
     return used
 
@@ -284,9 +366,14 @@ def vram_by_container(proc: Path = PROC, run: Optional[Runner] = None) -> Option
 
 class PidMeasurement(Dict[int, int]):
     """pid -> MiB of GPU memory. `authoritative` is True when a pid missing from it is known to hold none and
-    False when the source could not see every process."""
+    False when the source could not see every process. `unknown` holds the pids whose memory the source listed
+    without a figure; they are never counted as zero."""
 
     authoritative = True
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self.unknown: Set[int] = set()
 
 
 def _nvidia_by_pid(run: Runner) -> Optional[Dict[int, int]]:
@@ -297,10 +384,14 @@ def _nvidia_by_pid(run: Runner) -> Optional[Dict[int, int]]:
     used = PidMeasurement()
     for row in rows:
         try:
-            pid, mib = int(row[0]), int(float(row[1]))
-        except (IndexError, ValueError, OverflowError):
+            pid, mib = int(row[0]), _mib(row[1])
+        except (IndexError, ValueError):
             continue
-        used[pid] = used.get(pid, 0) + mib
+        if mib is None:
+            used.authoritative = False
+            used.unknown.add(pid)
+        else:
+            used[pid] = used.get(pid, 0) + mib
     return used
 
 
@@ -330,6 +421,8 @@ def memory_for_pids(by_pid: Optional[Dict[int, int]], pids: Iterable[int]) -> Op
     if by_pid is None:
         return None
     wanted: Set[int] = set(pids)
+    if wanted & getattr(by_pid, "unknown", set()):
+        return None
     listed = [by_pid[pid] for pid in wanted if pid in by_pid]
     if not listed and not getattr(by_pid, "authoritative", True):
         return None
@@ -352,6 +445,15 @@ def cgroup_path(text: str) -> str:
 def cgroup_in_unit(text: str, unit: str) -> bool:
     """True when the process's control group path has `unit` as one of its components."""
     return unit in cgroup_path(text).split("/")
+
+
+def user_manager_uid(text: str) -> Optional[int]:
+    """The uid of the `user@<uid>.service` manager a /proc/<pid>/cgroup file places the process under, or None."""
+    for part in cgroup_path(text).split("/"):
+        match = re.fullmatch(r"user@(\d+)\.service", part)
+        if match:
+            return int(match.group(1))
+    return None
 
 
 def service_from_cgroup(text: str) -> Optional[Tuple[str, str]]:
@@ -382,7 +484,7 @@ def _spec_problem(kind: str, spec: object) -> Optional[str]:
         return "has no id"
     if kind == "service":
         unit = getattr(spec, "unit", None)
-        if not isinstance(unit, str) or not unit.endswith(".service") or "/" in unit or " " in unit:
+        if not valid_unit(unit):
             return "has no valid unit"
         if getattr(spec, "scope", None) not in (None, "system", "user"):
             return "has an unknown scope"
@@ -399,9 +501,10 @@ def _spec_problem(kind: str, spec: object) -> Optional[str]:
     return None
 
 
-def usable_specs(get_config: Callable[[], object], kind: str) -> List[object]:
-    """The enabled, valid targets of one kind in the live config. A missing or empty list, an unreadable config
-    and each invalid spec are logged once; one invalid spec never hides the others."""
+def usable_specs(get_config: Callable[[], object], kind: str, include_disabled: bool = False) -> List[object]:
+    """The valid targets of one kind in the live config, the enabled ones unless `include_disabled`. An unreadable
+    config and each invalid spec are logged once; one invalid spec never hides the others. An empty list is
+    ordinary and not logged."""
     try:
         targets = getattr(get_config(), "targets", None)
     except Exception as exc:
@@ -412,7 +515,7 @@ def usable_specs(get_config: Callable[[], object], kind: str) -> List[object]:
         return []
     found = []
     for spec in targets:
-        if getattr(spec, "kind", None) != kind or getattr(spec, "enabled", True) is False:
+        if getattr(spec, "kind", None) != kind or (getattr(spec, "enabled", True) is False and not include_disabled):
             continue
         problem = _spec_problem(kind, spec)
         if problem:
@@ -420,17 +523,14 @@ def usable_specs(get_config: Callable[[], object], kind: str) -> List[object]:
             log_once(f"{kind} spec {spec_id}", f"{kind} target {spec_id!r} {problem}")
             continue
         found.append(spec)
-    if found:
-        clear_failure(f"{kind} targets")
-    else:
-        log_once(f"{kind} targets", f"{kind}: no enabled targets configured")
+    clear_failure(f"{kind} targets")
     return found
 
 
-def find_spec(get_config: Callable[[], object], kind: str, ref: object) -> Optional[object]:
+def find_spec(get_config: Callable[[], object], kind: str, ref: object, include_disabled: bool = False) -> Optional[object]:
     """The usable spec a ref of this provider points at (by its id), or None after logging that it is gone."""
     ref_id = ref.get("id") if isinstance(ref, dict) else None
-    for spec in usable_specs(get_config, kind):
+    for spec in usable_specs(get_config, kind, include_disabled):
         if getattr(spec, "id") == ref_id:
             return spec
     name = ref.get("name") if isinstance(ref, dict) else ref

@@ -12,13 +12,15 @@ from . import gpu, util
 from .model import Runtime
 
 # Names that are never offered and never stopped: display servers and compositors, audio and session plumbing,
-# login managers, Steam and its helpers, terminals and shells, file managers, and the guard itself.
+# login managers, session daemons, Steam and its helpers, terminals and shells, file managers, and the guard itself.
 BUILTIN_PROTECT: Tuple[str, ...] = (
     "Xorg*", "X", "Xwayland*", "Xvfb", "kwin*", "plasmashell", "plasma*", "gnome-shell*", "gnome-session*", "mutter*",
     "cosmic-*", "sway*", "Hyprland", "hyprland*", "weston*", "labwc", "wayfire", "river", "niri", "picom", "xfwm4",
     "xfce4-*", "openbox", "i3", "cinnamon*", "muffin", "budgie-*", "marco", "mate-*", "lxqt-*",
     "pipewire*", "wireplumber", "pulseaudio", "pulse*", "jackd", "systemd*", "init", "dbus*", "polkit*", "udisks*",
-    "upowerd", "NetworkManager", "wpa_supplicant", "bluetoothd", "logind", "elogind*", "agetty", "login",
+    "upower*", "NetworkManager*", "wpa_supplicant", "bluetoothd", "logind", "elogind*", "agetty", "login",
+    "gnome-keyring*", "xdg-desktop-portal*", "org.gnome.Shell*", "ibus*", "fcitx*", "at-spi*", "gvfs*", "cups*",
+    "accounts-daemon", "colord", "rtkit*", "gamescope*",
     "gdm*", "sddm*", "lightdm*", "greetd", "ly", "lxdm", "display-manager*",
     "steam*", "reaper", "pressure-vessel*", "srt-*", "steamwebhelper",
     "bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh", "ssh*", "sshd*", "tmux*", "screen", "konsole",
@@ -32,6 +34,8 @@ _PYTHON = re.compile(r"python[0-9.]*")
 _GLOB_CHARS = re.compile(r"[*?\[\]/]")
 _ID_CHARS = re.compile(r"[^a-z0-9_-]+")
 
+MIN_MATCH = 3  # a process name shorter than this cannot be managed (see processes.MIN_LITERAL)
+
 RISK_LOW, RISK_MEDIUM, RISK_HIGH = "low", "medium", "high"
 
 
@@ -44,6 +48,25 @@ def matches_any(name: str, patterns: Sequence[str]) -> bool:
     """True when `name` matches one of the globs, ignoring case."""
     lowered = name.lower()
     return any(fnmatch.fnmatchcase(lowered, str(pattern).lower()) for pattern in patterns)
+
+
+def _protect_names(unit: str) -> List[str]:
+    """The names a service unit is checked under: the unit, its stem and, for a desktop-launched application
+    (`app-<name>@<instance>.service`), the bare application name without the `app-` prefix and the instance."""
+    stem = unit[:-len(".service")] if unit.endswith(".service") else unit
+    names = [unit, stem]
+    if stem.startswith("app-"):
+        names.append(stem[len("app-"):].partition("@")[0])
+    return names
+
+
+def stable_stem(unit: str) -> str:
+    """The unit's name without `.service` and, for `app-<name>@<instance>`, without the prefix and the random
+    instance, so that an id made from it is the same on every launch."""
+    stem = unit[:-len(".service")] if unit.endswith(".service") else unit
+    if stem.startswith("app-") and "@" in stem:
+        return stem[len("app-"):].partition("@")[0] or stem
+    return stem
 
 
 def is_protected(config: Any, name: str, cmdline: Optional[Sequence[str]] = None) -> bool:
@@ -127,9 +150,22 @@ def _managed_specs(config: Any) -> List[Any]:
     return list(targets) if isinstance(targets, (list, tuple)) else []
 
 
-def discover(config: Any, runtimes: Sequence[Runtime], proc: Path = gpu.PROC, run: Optional[gpu.Runner] = None) -> List[Candidate]:
+def _owner(proc: Path, pid: int) -> Optional[int]:
+    """The real uid of a process from its /proc status file, or None when unreadable."""
+    for line in (_read(proc / str(pid) / "status") or "").splitlines():
+        if line.startswith("Uid:"):
+            fields = line.split()
+            if len(fields) > 1 and fields[1].isdigit():
+                return int(fields[1])
+    return None
+
+
+def discover(config: Any, runtimes: Sequence[Runtime], proc: Path = gpu.PROC, run: Optional[gpu.Runner] = None,
+             uid: Optional[int] = None) -> List[Candidate]:
     """What could be paused, safest first: auto containers, then services, then processes. Protected names are
-    left out; what a configured target already manages is marked `managed` rather than omitted."""
+    left out, for a service also when one of its GPU processes has a protected name; what a configured target
+    already manages is marked `managed` rather than omitted. Only the current user's processes and user services
+    are offered, together with system services."""
     candidates = _containers(config, runtimes)
     try:
         by_pid = gpu.vram_by_pid(proc, run)
@@ -141,7 +177,10 @@ def discover(config: Any, runtimes: Sequence[Runtime], proc: Path = gpu.PROC, ru
     specs = _managed_specs(config)
     taken = {str(getattr(spec, "id", "")) for spec in specs}
     own_pid = os.getpid()
+    own_uid = os.getuid() if uid is None else uid
     units: Dict[Tuple[str, str], List[int]] = {}
+    unit_comms: Dict[Tuple[str, str], Set[str]] = {}
+    unit_cmdlines: Dict[Tuple[str, str], List[List[str]]] = {}
     processes: Dict[str, List[int]] = {}
     for pid in sorted(by_pid):
         if pid == own_pid:
@@ -153,19 +192,26 @@ def discover(config: Any, runtimes: Sequence[Runtime], proc: Path = gpu.PROC, ru
         cmdline = _cmdline(proc, pid)
         service = gpu.service_from_cgroup(cgroup)
         if service:
-            scope, unit = service
-            if is_protected(config, unit, cmdline) or is_protected(config, unit[:-len(".service")], cmdline):
+            manager = gpu.user_manager_uid(cgroup)
+            if manager is not None and manager != own_uid:
                 continue
             units.setdefault(service, []).append(pid)
-        elif comm and not is_protected(config, comm, cmdline) and not _GLOB_CHARS.search(comm):
+            unit_comms.setdefault(service, set()).add(comm)
+            unit_cmdlines.setdefault(service, []).append(cmdline)
+        elif (comm and len(comm) >= MIN_MATCH and _owner(proc, pid) == own_uid and not is_protected(config, comm, cmdline)
+              and not _GLOB_CHARS.search(comm)):
             processes.setdefault(comm, []).append(pid)
+    for service in list(units):
+        names = _protect_names(service[1]) + sorted(unit_comms[service])
+        if any(is_protected(config, name, cmdline) for name in names for cmdline in unit_cmdlines[service]):
+            del units[service]
 
     def total(pids: List[int]) -> int:
         return sum(by_pid.get(pid, 0) for pid in pids)
 
     services = []
     for (scope, unit), pids in units.items():
-        stem = unit[:-len(".service")]
+        stem = stable_stem(unit)
         managed = any(getattr(spec, "kind", None) == "service" and getattr(spec, "unit", None) == unit
                       and (getattr(spec, "scope", None) or "system") == scope for spec in specs)
         spec_dict = {"id": _slug(stem, taken), "kind": "service", "label": stem, "unit": unit, "scope": scope}

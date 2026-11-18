@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import contextlib
 import fnmatch
+import hashlib
+import html
 import time
+import unicodedata
 from typing import Any, Callable, Iterator, List, Optional
 
 from .. import config as config_module
 from .qt import QtCore, QtGui, QtWidgets
-from .theme import SPACE, Callout, button, current_colors, kind_color, styled_label
+from .theme import SPACE, Callout, button, current_colors, kind_color, plain_tooltip, safe_text, styled_label
 
 Qt = QtCore.Qt
 
@@ -35,10 +38,14 @@ def run_dialog(dialog: "QtWidgets.QDialog") -> bool:
 
 def confirm(parent: "QtWidgets.QWidget", text: str) -> bool:
     """Ask a yes or no question; tabs call this through an attribute that tests replace."""
-    answer = QtWidgets.QMessageBox.question(parent, "GPU Game Guard", text,
-                                            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
-                                            QtWidgets.QMessageBox.Cancel)
-    return answer == QtWidgets.QMessageBox.Yes
+    box = QtWidgets.QMessageBox(parent)
+    box.setIcon(QtWidgets.QMessageBox.Question)
+    box.setWindowTitle("GPU Game Guard")
+    box.setTextFormat(Qt.PlainText)
+    box.setText(safe_text(text, keep_newlines=True))
+    box.setStandardButtons(QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel)
+    box.setDefaultButton(QtWidgets.QMessageBox.Cancel)
+    return box.exec_() == QtWidgets.QMessageBox.Yes
 
 
 def pick_open_file(parent: "QtWidgets.QWidget") -> str:
@@ -63,6 +70,14 @@ def quiet(*widgets: "QtCore.QObject") -> Iterator[None]:
             widget.blockSignals(state)
 
 
+def set_switch(switch: "QtWidgets.QAbstractButton", checked: bool) -> None:
+    """Show a toggle switch as `checked` without emitting `toggled`, knob position included."""
+    with quiet(switch):
+        switch.setChecked(checked)
+    switch.setProperty("offset", 1.0 if checked else 0.0)
+    switch.update()
+
+
 def mono_font() -> "QtGui.QFont":
     font = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
     if not QtGui.QFontInfo(font).fixedPitch():
@@ -73,13 +88,23 @@ def mono_font() -> "QtGui.QFont":
 
 
 def bold_label(text: str, tooltip: str = "") -> "QtWidgets.QLabel":
-    label = QtWidgets.QLabel(text)
+    """A semi-bold label that shows `text` literally."""
+    label = QtWidgets.QLabel()
+    label.setTextFormat(Qt.PlainText)
+    label.setText(safe_text(text))
     font = label.font()
     font.setWeight(QtGui.QFont.DemiBold)
     label.setFont(font)
     if tooltip:
-        label.setToolTip(tooltip)
+        plain_tooltip(label, tooltip)
     return label
+
+
+def plain_tip(text: str) -> str:
+    """Tooltip text for an item of a table or list that Qt shows literally: item tooltips are read as rich text
+    when they look like markup, so the text is escaped and wrapped in `<qt>`."""
+    text = safe_text(text, keep_newlines=True)
+    return f"<qt>{html.escape(text, quote=False).replace(chr(10), '<br>')}</qt>" if text else ""
 
 
 def divider() -> "QtWidgets.QFrame":
@@ -92,6 +117,7 @@ def divider() -> "QtWidgets.QFrame":
 def error_label() -> "QtWidgets.QLabel":
     """A hidden, word-wrapped message in the danger colour, for a field's validation problem."""
     label = QtWidgets.QLabel()
+    label.setTextFormat(Qt.PlainText)
     label.setProperty("badge", "danger")
     label.setStyleSheet("padding: 0px; font-weight: normal;")
     label.setWordWrap(True)
@@ -144,6 +170,7 @@ def clear_layout(layout: "QtWidgets.QLayout") -> None:
     while layout.count():
         item = layout.takeAt(0)
         if item.widget() is not None:
+            item.widget().hide()
             item.widget().deleteLater()
         elif item.layout() is not None:
             clear_layout(item.layout())
@@ -158,18 +185,47 @@ def mib_text(mib: Optional[int]) -> str:
     return f"{mib / 1024:.1f} GiB" if mib >= 1024 else f"{mib} MiB"
 
 
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
 def clock_text(when: float, now: Optional[float] = None) -> str:
-    """A wall time as HH:MM:SS, with the date when it is more than twelve hours old."""
-    moment = time.localtime(when)
-    if (time.time() if now is None else now) - when > 12 * 3600:
-        return time.strftime("%b %d %H:%M:%S", moment)
-    return time.strftime("%H:%M:%S", moment)
+    """A wall time as HH:MM:SS (24 hours, whatever the locale), with the date when it is more than twelve hours
+    old. A value that is not a representable time gives "-"."""
+    try:
+        moment = time.localtime(when)
+        reference = time.time() if now is None else now
+    except (OverflowError, OSError, ValueError, TypeError):
+        return "-"
+    if moment.tm_year > 9999:
+        return "-"
+    if reference - when > 12 * 3600:
+        return f"{_MONTHS[moment.tm_mon - 1]} {moment.tm_mday:02d} {moment.tm_hour:02d}:{moment.tm_min:02d}:{moment.tm_sec:02d}"
+    return f"{moment.tm_hour:02d}:{moment.tm_min:02d}:{moment.tm_sec:02d}"
+
+
+def managed_now(candidate: Any, config: "config_module.Config") -> bool:
+    """Whether the guard would manage `candidate` under `config` as it is now, not as it was when found."""
+    if candidate.kind == "container":
+        return bool(config.auto_containers) and not config.is_ignored(candidate.name)
+    scope = (candidate.spec or {}).get("scope", "system")
+    for spec in config.targets:
+        if not spec.enabled or spec.kind != candidate.kind:
+            continue
+        if candidate.kind == "service" and spec.unit == candidate.name and spec.scope == scope:
+            return True
+        if candidate.kind == "process" and fnmatch.fnmatchcase(candidate.name, spec.match):
+            return True
+    return False
 
 
 def slug(text: str, taken: "set[str]") -> str:
-    """A target id derived from a label, made unique against `taken`."""
-    base = "".join(c if c.isalnum() and c.isascii() else "-" for c in text.lower())
-    base = "-".join(part for part in base.split("-") if part)[:40].strip("-_") or "target"
+    """A target id derived from a label, made unique against `taken`. Accented letters become their plain
+    letters; a label with no usable letters at all gets an id made from a hash of it."""
+    plain = "".join(c for c in unicodedata.normalize("NFKD", text.lower()) if not unicodedata.combining(c))
+    base = "".join(c if c.isalnum() and c.isascii() else "-" for c in plain)
+    base = "-".join(part for part in base.split("-") if part)[:40].strip("-_")
+    if not base:
+        base = "target-" + hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()[:8] if text.strip() else "target"
     candidate, number = base, 1
     while candidate in taken:
         number += 1
@@ -247,9 +303,9 @@ def make_table(headers: List[str], row_height: int = 40) -> "QtWidgets.QTableWid
 
 def table_item(text: str, tooltip: str = "", muted: bool = False, align: int = 0,
                kind: str = "") -> "QtWidgets.QTableWidgetItem":
-    item = QtWidgets.QTableWidgetItem(text)
+    item = QtWidgets.QTableWidgetItem(safe_text(text))
     if tooltip:
-        item.setToolTip(tooltip)
+        item.setToolTip(plain_tip(tooltip))
     if muted:
         item.setForeground(QtGui.QColor(current_colors().muted))
     if align:
@@ -257,6 +313,27 @@ def table_item(text: str, tooltip: str = "", muted: bool = False, align: int = 0
     if kind:
         item.setData(KIND_ROLE, kind)
     return item
+
+
+def focused_cell(table: "QtWidgets.QTableWidget") -> Optional[tuple]:
+    """(row, column) of the cell whose widget holds the keyboard focus, or None."""
+    widget = QtWidgets.QApplication.focusWidget()
+    while widget is not None and widget is not table:
+        if widget.parentWidget() is table.viewport():
+            index = table.indexAt(widget.pos())
+            return (index.row(), index.column()) if index.isValid() else None
+        widget = widget.parentWidget()
+    return None
+
+
+def focus_cell(table: "QtWidgets.QTableWidget", row: int, column: int) -> None:
+    """Give the keyboard focus to the widget in a cell, when it has one."""
+    holder = table.cellWidget(row, column)
+    if holder is None:
+        return
+    inner = holder if holder.focusPolicy() != Qt.NoFocus else holder.findChild(QtWidgets.QAbstractButton)
+    if inner is not None:
+        inner.setFocus()
 
 
 class ScrollPage(QtWidgets.QScrollArea):
@@ -375,7 +452,7 @@ class RestartNote(Callout):
 
     def restart(self) -> None:
         ok, message = self.model.restart_service()
-        self.result.setText(message or ("Restarted." if ok else "The restart failed."))
+        self.result.setText(safe_text(message) or ("Restarted." if ok else "The restart failed."))
         self.result.setVisible(True)
         self.refresh()
 
@@ -410,20 +487,30 @@ class ScrolledTab(TabBase):
 
 
 class CandidateSource:
-    """Hands the tabs the model's discovered candidates. Discovery can take a while, so while `deferred` the tabs
-    see an empty list until `load()` runs (the view schedules it right after the window is built)."""
+    """Hands the tabs the model's discovered candidates. Discovery can take a while, so it runs in the model's
+    worker thread: while `deferred` the tabs see an empty list until `load()` runs (the view schedules it right
+    after the window is built), and afterwards until the scan finishes."""
 
     def __init__(self, model: Any, deferred: bool = False):
         self.model = model
-        self.loaded = not deferred
+        self._deferred = deferred
+
+    @property
+    def loaded(self) -> bool:
+        """True once a scan has delivered a result."""
+        return bool(self.model.candidates_loaded)
+
+    @property
+    def scanning(self) -> bool:
+        return bool(self.model.scanning)
 
     def get(self, refresh: bool = False) -> list:
-        if not self.loaded and not refresh:
-            return []
-        self.loaded = True
-        return list(self.model.candidates(refresh))
+        if refresh:
+            self.model.scan(True)
+        elif not self._deferred and not self.model.candidates_loaded:
+            self.model.scan(False)
+        return list(self.model.cached_candidates())
 
     def load(self) -> None:
-        if not self.loaded:
-            self.loaded = True
-            self.model.candidates()
+        self._deferred = False
+        self.model.scan(False)

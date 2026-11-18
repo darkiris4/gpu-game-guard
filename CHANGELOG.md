@@ -8,6 +8,42 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Host targets next to containers: systemd services (system or user scope), commands (a stop command, a
+  start command and an optional running check) and processes (matched by name, ended with SIGTERM, started
+  again with the same command line). They are configured under `targets` and offered for stopping before a
+  game like containers are. Processes are never killed with SIGKILL.
+- A built-in protect list (display servers, compositors, audio, session managers, login managers, Steam,
+  terminals, shells, file managers and the guard itself) plus the `protect` key. Protected names are never
+  offered and a process target refuses to stop them.
+- Discovery of what could be managed (`gpu-game-guard discover`): containers, then services and processes
+  that hold GPU memory, safest first, each with the target entry that would manage it.
+- Presets for Ollama as a system service, a user service and an unload-only command
+  (`gpu-game-guard presets list|add`).
+- A polkit rule for system services (`gpu-game-guard polkit allow|revoke|status UNIT...`), limited to the
+  named units and user.
+- A status channel under the state directory (`status.json`, `events.jsonl`, `pause.json`) and
+  `gpu-game-guard status [--json]`.
+- Pause and resume: `gpu-game-guard pause [--for 30m|2h|1d]`, `resume`, the tray and the settings window.
+  A paused guard lets games start untouched.
+- The configuration keys `enabled` (a master switch), `auto_containers`, `remember_choices`, `protect`,
+  `targets`, and the `service`, `command` and `process` entries of `runtimes`, with validation of every
+  target by index and id.
+- "Remember my choice for this game": the Qt launch dialog can save a `stop` or `ignore` rule for the game.
+- A Qt launch and restart dialog with a card per workload, shown from a separate process so a failure in Qt
+  cannot affect the watcher; chosen automatically when PyQt5 and a display exist, or with `"dialog": "qt"`.
+- A tray icon that shows the guard's state and offers Pause for 1 hour, Pause until resumed, Resume, Open
+  settings and Quit (`gpu-game-guard tray`, started at login).
+- A settings window (`gpu-game-guard settings`) with a Basic page and an Advanced mode of eight tabs
+  (Targets, Games, Detection, Timing, Dialogs, Activity, Test run, Raw config). Changes are applied on
+  request, and a banner offers to restart the service when a setting that is read only at start-up changed.
+- `gpu-game-guard targets list|enable|disable|remove`, and `check` now also lists configured targets and the
+  state of the running service.
+- A Debian package, built with `scripts/build-deb.sh`, that installs the program, the user unit, the Settings
+  and tray entries and the icon, and enables the service for every user.
+- The installer also installs the Settings entry, the tray autostart entry and the icon, and removes them on
+  `--uninstall`.
+- CI jobs for the Qt interface (offscreen) and for the Debian package, including an install and purge in
+  Debian 12, Ubuntu 22.04 and Ubuntu 24.04 containers.
 - Vendor-neutral GPU detection: NVIDIA through `nvidia-smi`, AMD and Intel through kernel interfaces
   (`/sys/class/drm` and `/proc/<pid>/fdinfo`). The AMD and Intel paths are covered by unit tests with
   fixtures and have not been run on real hardware.
@@ -44,6 +80,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- The automatic dialog choice prefers the Qt dialog when it can be shown, then kdialog or zenity, then
+  notifications. `dialog` also accepts `qt`.
+- `runtimes` defaults to `["docker", "podman", "service", "command", "process"]`.
+- `config validate` also reports unknown keys inside game rules and targets, and checks the targets.
+- The state file keeps the optional `scope`, `unit`, `id`, `cmdline` and `cwd` of each stopped target, so
+  services and processes can be started again.
 - The single script `gpu_game_guard.py` is replaced by the `gpu_game_guard` package.
 - The settings that were constants at the top of the script are now configuration keys.
 - `kdialog` is no longer required; any one of the dialog backends will do.
