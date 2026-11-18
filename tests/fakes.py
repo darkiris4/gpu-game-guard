@@ -67,8 +67,11 @@ class FakeRuntime:
 
 
 class FakePrompter:
-    def __init__(self, launch: Optional[str] = "stop", restart: Optional[bool] = True, can_ask: bool = True):
+    def __init__(self, launch: Optional[str] = "stop", restart: Optional[bool] = True, can_ask: bool = True,
+                 remember: Optional[str] = None):
         self.name = "fake"
+        self.remember = remember  # what `consume_remember` returns once after a launch dialog
+        self.remember_asked = 0
         self.can_ask = can_ask
         self.launch_answer, self.restart_answer = launch, restart
         self.launch_asked: List[List[str]] = []
@@ -91,12 +94,19 @@ class FakePrompter:
     def notify(self, title: str, body: str) -> None:
         self.notifications.append((title, body))
 
+    def consume_remember(self) -> Optional[str]:
+        self.remember_asked += 1
+        value, self.remember = self.remember, None
+        return value
+
 
 class FakeWatcher:
     """Holds a Config that a test may replace or mutate between steps."""
 
-    def __init__(self, config: Optional[Config] = None):
+    def __init__(self, config: Optional[Config] = None, path=None):
         self.config = config if config is not None else Config()
+        self.path = path  # where a remembered choice is written; None means nowhere
+        self.error = ""  # the problem a real watcher reports with the file
 
     def current(self) -> Config:
         return self.config

@@ -26,7 +26,8 @@ class Rig:
         self.prompter = FakePrompter(**answers)
         self.state_path = Path(self.tmp.name) / "state.json"
         self.guard = Guard(ConfigWatcher(self.config_path), [self.trigger], [self.runtime], self.prompter,
-                           State(self.state_path), clock=lambda: self.now, wall=lambda: self.now)
+                           State(self.state_path), clock=lambda: self.now, wall=lambda: self.now,
+                           status_dir=Path(self.tmp.name) / "status", dialog_name="fake")
 
     def write(self, config):
         self.config_path.write_text(json.dumps(config))
@@ -106,7 +107,8 @@ class IntegrationTests(unittest.TestCase):
         rig = Rig(self)
         rig.trigger.launches = [make_launch(10)]
         restarted = Guard(ConfigWatcher(rig.config_path), [rig.trigger], [rig.runtime], rig.prompter,
-                          State(rig.state_path), clock=lambda: rig.now, wall=lambda: rig.now)
+                          State(rig.state_path), clock=lambda: rig.now, wall=lambda: rig.now,
+                          status_dir=Path(rig.tmp.name) / "status")
         restarted.step()
         self.assertEqual((rig.prompter.launch_asked, rig.trigger.ended), ([], []))
 

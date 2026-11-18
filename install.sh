@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# Installs GPU Game Guard for the current user: a single executable goes to ~/.local/bin and a systemd
-# user service runs it.
+# Installs GPU Game Guard for the current user: a single executable goes to ~/.local/bin, a systemd user
+# service runs it, and a settings entry, a tray autostart entry and an icon go under the XDG directories.
 #
 #   install.sh                 install or update, then start the service
 #   install.sh --uninstall     stop the service and remove the files (add --purge to drop the saved state)
 #   --no-systemd               only copy files; never touch systemd (for packaging and tests)
 #
 # Environment: GPU_GAME_GUARD_REF (git ref to download, default main), GPU_GAME_GUARD_SRC (a local
-# checkout to install from instead of downloading), GPU_GAME_GUARD_BIN_DIR (default ~/.local/bin).
+# checkout to install from instead of downloading), GPU_GAME_GUARD_BIN_DIR (default ~/.local/bin). The
+# entries and the icon follow XDG_DATA_HOME (applications, icons) and XDG_CONFIG_HOME (autostart, systemd).
 set -euo pipefail
 
 REPO="darkiris4/gpu-game-guard"
@@ -16,19 +17,24 @@ SRC="${GPU_GAME_GUARD_SRC:-}"
 BIN_DIR="${GPU_GAME_GUARD_BIN_DIR:-$HOME/.local/bin}"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/gpu-game-guard"
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+APP_DIR="$DATA_HOME/applications"
+AUTOSTART_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
+ICON_DIR="$DATA_HOME/icons/hicolor/scalable/apps"
 NAME="gpu-game-guard"
 
 usage() {
   cat <<'USAGE'
-Installs GPU Game Guard for the current user: a single executable goes to ~/.local/bin and a systemd
-user service runs it.
+Installs GPU Game Guard for the current user: a single executable goes to ~/.local/bin, a systemd user
+service runs it, and a settings entry, a tray autostart entry and an icon go under the XDG directories.
 
   install.sh                 install or update, then start the service
   install.sh --uninstall     stop the service and remove the files (add --purge to drop the saved state)
   --no-systemd               only copy files; never touch systemd (for packaging and tests)
 
 Environment: GPU_GAME_GUARD_REF (git ref to download, default main), GPU_GAME_GUARD_SRC (a local
-checkout to install from instead of downloading), GPU_GAME_GUARD_BIN_DIR (default ~/.local/bin).
+checkout to install from instead of downloading), GPU_GAME_GUARD_BIN_DIR (default ~/.local/bin). The
+entries and the icon follow XDG_DATA_HOME (applications, icons) and XDG_CONFIG_HOME (autostart, systemd).
 USAGE
 }
 
@@ -46,11 +52,24 @@ done
 say() { printf '%s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
+# Refreshes the desktop and icon caches when the tools exist. They only speed up discovery, so nothing here
+# can fail the installation, and systemd-free runs (packaging, tests) leave them alone.
+refresh_caches() {
+  [ "$systemd" = 1 ] || return 0
+  if command -v update-desktop-database >/dev/null; then update-desktop-database "$APP_DIR" >/dev/null 2>&1 || true; fi
+  if command -v gtk-update-icon-cache >/dev/null && [ -f "$DATA_HOME/icons/hicolor/index.theme" ]; then
+    gtk-update-icon-cache -q -t "$DATA_HOME/icons/hicolor" >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
 if [ "$uninstall" = 1 ]; then
   if [ "$systemd" = 1 ] && command -v systemctl >/dev/null; then
     systemctl --user disable --now "$NAME.service" 2>/dev/null || true
   fi
-  rm -f "$UNIT_DIR/$NAME.service" "$BIN_DIR/$NAME"
+  rm -f "$UNIT_DIR/$NAME.service" "$BIN_DIR/$NAME" "$APP_DIR/$NAME.desktop" "$AUTOSTART_DIR/$NAME-tray.desktop" \
+    "$ICON_DIR/$NAME.svg"
+  refresh_caches
   [ "$systemd" = 1 ] && command -v systemctl >/dev/null && systemctl --user daemon-reload 2>/dev/null || true
   if [ "$purge" = 1 ]; then
     rm -rf "$STATE_DIR"
@@ -95,6 +114,9 @@ else
 fi
 [ -f "$tree/scripts/build-zipapp.sh" ] || die "the source has no scripts/build-zipapp.sh"
 [ -f "$tree/$NAME.service" ] || die "the source has no $NAME.service"
+for f in "$NAME.desktop" "$NAME-tray.desktop" "$NAME.svg"; do
+  [ -f "$tree/packaging/$f" ] || die "the source has no packaging/$f"
+done
 
 bash "$tree/scripts/build-zipapp.sh" "$tmp/$NAME" || die "could not build $NAME"
 head -n 1 "$tmp/$NAME" | grep -q '^#!.*python3' || die "the built file does not look like the program"
@@ -110,26 +132,61 @@ unit_quote() {
   printf '"%s"' "$text"
 }
 
-install -d "$BIN_DIR" "$UNIT_DIR"
+# Quotes the program path for the Exec key of a desktop entry: double-quoted, with the characters the entry
+# format treats specially escaped (each backslash is doubled again for the string level), and a percent sign
+# doubled so it is not read as a field code.
+desktop_quote() {
+  local text="$1"
+  text="${text//\\/\\\\\\\\}"
+  text="${text//\"/\\\\\"}"
+  text="${text//\`/\\\\\`}"
+  text="${text//\$/\\\\\$}"
+  text="${text//%/%%}"
+  printf '"%s"' "$text"
+}
+
+# Copies a desktop entry with the program in its Exec line replaced by the installed path; the arguments stay.
+write_entry() {  # write_entry SOURCE
+  local line rest
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      Exec=*)
+        rest="${line#Exec=}"
+        case "$rest" in *" "*) rest=" ${rest#* }" ;; *) rest="" ;; esac
+        printf 'Exec=%s%s\n' "$(desktop_quote "$BIN_DIR/$NAME")" "$rest" ;;
+      *) printf '%s\n' "$line" ;;
+    esac
+  done < "$1"
+}
+
 unit="$UNIT_DIR/$NAME.service"
+app_entry="$APP_DIR/$NAME.desktop"
+tray_entry="$AUTOSTART_DIR/$NAME-tray.desktop"
+icon="$ICON_DIR/$NAME.svg"
+# Every installed file, in installation order; its previous content is kept under $backup/<index>.
+installed=("$BIN_DIR/$NAME" "$unit" "$app_entry" "$tray_entry" "$icon")
+mkdir -p "$BIN_DIR" "$UNIT_DIR" "$APP_DIR" "$AUTOSTART_DIR" "$ICON_DIR"
 backup="$tmp/previous"
 mkdir "$backup"
-had_bin=0 had_unit=0
-if [ -e "$BIN_DIR/$NAME" ]; then cp -p "$BIN_DIR/$NAME" "$backup/bin" && had_bin=1; fi
-if [ -e "$unit" ] || [ -L "$unit" ]; then cp -P "$unit" "$backup/unit" && had_unit=1; fi
+had=()
+for i in "${!installed[@]}"; do
+  had[i]=0
+  if [ -e "${installed[$i]}" ] || [ -L "${installed[$i]}" ]; then cp -pP "${installed[$i]}" "$backup/$i" && had[i]=1; fi
+done
+had_bin="${had[0]}" had_unit="${had[1]}"
 
-# Puts the previous program and unit back, or removes the new ones when nothing was installed before.
+# Puts the previous files back, or removes the new ones when nothing was installed before.
 restore() {
-  if [ "$had_bin" = 1 ]; then
-    cp -p "$backup/bin" "$BIN_DIR/.$NAME.old.$$" && mv -f "$BIN_DIR/.$NAME.old.$$" "$BIN_DIR/$NAME"
-  else
-    rm -f "$BIN_DIR/$NAME"
-  fi
-  if [ "$had_unit" = 1 ]; then
-    cp -P "$backup/unit" "$UNIT_DIR/.$NAME.service.old.$$" && mv -f "$UNIT_DIR/.$NAME.service.old.$$" "$unit"
-  else
-    rm -f "$unit"
-  fi
+  local i dest dir base
+  for i in "${!installed[@]}"; do
+    dest="${installed[$i]}"
+    dir="${dest%/*}" base="${dest##*/}"
+    if [ "${had[$i]}" = 1 ]; then
+      cp -pP "$backup/$i" "$dir/.$base.old.$$" && mv -f "$dir/.$base.old.$$" "$dest"
+    else
+      rm -f "$dest"
+    fi
+  done
   if [ "$systemd" = 1 ]; then
     [ "$had_unit" = 1 ] || systemctl --user disable "$NAME.service" >/dev/null 2>&1 || true
     systemctl --user daemon-reload || true
@@ -139,7 +196,14 @@ restore() {
 
 # Each file is written under a temporary name in its own directory and renamed into place, so a reader
 # never sees a partial file and a symlink at the final name is replaced rather than written through.
-trap 'rm -rf "$tmp"; rm -f "$BIN_DIR/.$NAME.new.$$" "$BIN_DIR/.$NAME.old.$$" "$UNIT_DIR/.$NAME.service.new.$$" "$UNIT_DIR/.$NAME.service.old.$$"' EXIT
+cleanup() {
+  local dest
+  for dest in "${installed[@]}"; do
+    rm -f "${dest%/*}/.${dest##*/}.new.$$" "${dest%/*}/.${dest##*/}.old.$$"
+  done
+  rm -rf "$tmp"
+}
+trap cleanup EXIT
 exec_line="ExecStart=$(unit_quote "$BIN_DIR/$NAME") run"
 if ! { install -m 0755 "$tmp/$NAME" "$BIN_DIR/.$NAME.new.$$" && mv -f "$BIN_DIR/.$NAME.new.$$" "$BIN_DIR/$NAME"; }; then
   restore
@@ -154,6 +218,19 @@ if ! { while IFS= read -r line || [ -n "$line" ]; do
        && mv -f "$UNIT_DIR/.$NAME.service.new.$$" "$unit"; }; then
   restore
   die "could not write $unit; the previous installation was restored"
+fi
+if ! { write_entry "$tree/packaging/$NAME.desktop" > "$APP_DIR/.$NAME.desktop.new.$$" \
+       && chmod 0644 "$APP_DIR/.$NAME.desktop.new.$$" && mv -f "$APP_DIR/.$NAME.desktop.new.$$" "$app_entry" \
+       && write_entry "$tree/packaging/$NAME-tray.desktop" > "$AUTOSTART_DIR/.$NAME-tray.desktop.new.$$" \
+       && chmod 0644 "$AUTOSTART_DIR/.$NAME-tray.desktop.new.$$" \
+       && mv -f "$AUTOSTART_DIR/.$NAME-tray.desktop.new.$$" "$tray_entry"; }; then
+  restore
+  die "could not write the desktop entries; the previous installation was restored"
+fi
+if ! { install -m 0644 "$tree/packaging/$NAME.svg" "$ICON_DIR/.$NAME.svg.new.$$" \
+       && mv -f "$ICON_DIR/.$NAME.svg.new.$$" "$icon"; }; then
+  restore
+  die "could not install $icon; the previous installation was restored"
 fi
 
 if [ "$systemd" = 1 ]; then
@@ -177,11 +254,13 @@ if [ "$systemd" = 1 ]; then
     fi
     die "the service did not start; the new files were removed: journalctl --user -u $NAME"
   fi
+  refresh_caches
   say "GPU Game Guard installed and running"
 else
   say "GPU Game Guard files installed (systemd untouched)"
 fi
 say "  program: $BIN_DIR/$NAME"
 say "  service: $UNIT_DIR/$NAME.service"
+say "  entries: $app_entry, $tray_entry (the tray starts at the next login)"
 say "  config:  $NAME config init   (optional; defaults apply without a file)"
 say "  logs:    journalctl --user -u $NAME -f"

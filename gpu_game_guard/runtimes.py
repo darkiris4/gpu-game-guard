@@ -7,10 +7,14 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from . import gpu, util
+from .commands import CommandRuntime
 from .model import Ref, Runtime, Target
+from .processes import ProcessRuntime
+from .services import ServiceRuntime
 
 CHANGE_TIMEOUT = 120.0  # stopping a container waits for its own grace period first
 KNOWN = ("docker", "podman")
+HOST = ("service", "command", "process")  # providers of configured host targets; they need the live config
 
 
 def _has_gpu_name(value: Any) -> bool:
@@ -170,11 +174,19 @@ class DockerLikeRuntime:
             self._change("start", name)
 
 
-def build(names: Sequence[str]) -> List[Runtime]:
+def build(names: Sequence[str], get_config: Optional[Callable[[], Any]] = None) -> List[Runtime]:
+    """The runtimes named, in order. The host providers (`service`, `command`, `process`) read the live
+    config through `get_config` and are skipped, with one log line, when it is not given."""
+    host = {"service": ServiceRuntime, "command": CommandRuntime, "process": ProcessRuntime}
     runtimes: List[Runtime] = []
     for name in names:
         if name in KNOWN:
             runtimes.append(DockerLikeRuntime(name))
+        elif name in HOST:
+            if get_config is None:
+                gpu.log_once(f"runtime {name}", f"runtime '{name}' needs the configuration and was skipped")
+            else:
+                runtimes.append(host[name](get_config))
         else:
             util.log(f"unknown runtime '{name}' skipped")
     return runtimes

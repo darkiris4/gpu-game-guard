@@ -18,6 +18,7 @@ from .util import log
 
 TITLE = "GPU Game Guard"
 HEAVY_VRAM_MIB = 4096  # container GPU memory at which the warning stops being tentative; the guard may overwrite it
+REMEMBER_CHOICES = True  # whether the Qt dialog offers "remember my choice"; the guard may overwrite it
 MARKUPS = ("html", "pango", "plain")
 
 LABEL_STOP = "Stop containers and launch"
@@ -352,10 +353,27 @@ def _is_kde(environ: Mapping[str, str]) -> bool:
     return "KDE" in (environ.get("XDG_CURRENT_DESKTOP") or "").upper() or bool(environ.get("KDE_FULL_SESSION"))
 
 
+def _qt_prompter(environ: Mapping[str, str], which: Callable[[str], Optional[str]]):
+    """The Qt prompter when it can be used here, otherwise None. Any import problem means unavailable."""
+    try:
+        from .ui.prompt import QtPrompter
+
+        prompter = QtPrompter(environ=environ, which=which)
+        return prompter if prompter.available() else None
+    except Exception:  # a broken Qt installation must never stop the watcher
+        return None
+
+
 def choose(preference: str = "auto", environ: Mapping[str, str] = os.environ,
            which: Callable[[str], Optional[str]] = shutil.which):
-    """Pick a Prompter. An explicit preference that is unavailable falls back to the automatic order."""
-    if preference in _BY_NAME:
+    """Pick a Prompter. An explicit preference that is unavailable falls back to the automatic order, which
+    prefers the Qt dialog when it can be shown."""
+    if preference == "qt":
+        prompter = _qt_prompter(environ, which)
+        if prompter is not None:
+            return prompter
+        log("dialog backend qt is not available; choosing automatically")
+    elif preference in _BY_NAME:
         prompter = _BY_NAME[preference](which)
         if prompter.available():
             return prompter
@@ -364,6 +382,9 @@ def choose(preference: str = "auto", environ: Mapping[str, str] = os.environ,
         return NullPrompter()
     elif preference != "auto":
         log(f"unknown dialog backend {preference!r}; choosing automatically")
+    qt_prompter = _qt_prompter(environ, which)
+    if qt_prompter is not None:
+        return qt_prompter
     order = ["kdialog", "zenity"] if _is_kde(environ) else ["zenity", "kdialog"]
     for name in order + ["notify"]:
         prompter = _BY_NAME[name](which)

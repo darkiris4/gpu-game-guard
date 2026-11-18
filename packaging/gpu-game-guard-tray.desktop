@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=GPU Game Guard Tray
+Comment=Shows the state of GPU Game Guard in the system tray
+Exec=gpu-game-guard tray
+Icon=gpu-game-guard
+Terminal=false
+NoDisplay=true
+Categories=System;
+X-GNOME-Autostart-enabled=true

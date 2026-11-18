@@ -1,0 +1,16 @@
+{
+  "id": "ollama-user-service",
+  "label": "Ollama (user service)",
+  "description": "Stops the ollama.service user service, which frees the models it keeps in GPU memory.",
+  "detect": {
+    "unit": "ollama.service",
+    "scope": "user"
+  },
+  "spec": {
+    "id": "ollama-user",
+    "kind": "service",
+    "label": "Ollama (user)",
+    "unit": "ollama.service",
+    "scope": "user"
+  }
+}

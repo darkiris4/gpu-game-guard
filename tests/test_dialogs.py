@@ -544,6 +544,47 @@ class ChooseTests(unittest.TestCase):
             self.assertEqual(self.name(["zenity"], self.KDE, "kdialog"), "zenity")
         self.assertEqual(log.call_count, 1)
 
+    def fake_qt(self, available=True):
+        fake = mock.Mock()
+        fake.return_value.available.return_value = available
+        fake.return_value.name = "qt"
+        return mock.patch("gpu_game_guard.ui.prompt.QtPrompter", fake), fake
+
+    def test_auto_prefers_qt_on_every_desktop(self):
+        patch, fake = self.fake_qt()
+        with patch:
+            for env in (self.KDE, self.GNOME, {}):
+                self.assertEqual(self.name(["kdialog", "zenity", "notify-send"], env), "qt")
+            self.assertEqual(self.name([], {}), "qt")
+        self.assertEqual(fake.call_args[1]["environ"], {})
+
+    def test_unavailable_qt_keeps_the_existing_order(self):
+        patch, _ = self.fake_qt(False)
+        with patch:
+            self.assertEqual(self.name(["kdialog", "zenity"], self.KDE), "kdialog")
+            self.assertEqual(self.name(["kdialog", "zenity"], self.GNOME), "zenity")
+            self.assertEqual(self.name([], {}), "none")
+
+    def test_qt_import_error_means_unavailable(self):
+        with mock.patch.dict("sys.modules", {"gpu_game_guard.ui.prompt": None}):
+            self.assertEqual(self.name(["zenity"], self.GNOME), "zenity")
+
+    def test_qt_constructor_error_means_unavailable(self):
+        with mock.patch("gpu_game_guard.ui.prompt.QtPrompter", side_effect=RuntimeError("x")):
+            self.assertEqual(self.name(["zenity"], self.GNOME), "zenity")
+
+    def test_explicit_qt_preference(self):
+        patch, _ = self.fake_qt()
+        with patch:
+            self.assertEqual(self.name(["zenity"], self.GNOME, "qt"), "qt")
+        patch, _ = self.fake_qt(False)
+        with patch, mock.patch("gpu_game_guard.dialogs.log") as log:
+            self.assertEqual(self.name(["zenity"], self.GNOME, "qt"), "zenity")
+        self.assertEqual(log.call_count, 1)
+
+    def test_real_qt_prompter_needs_a_display(self):
+        self.assertNotEqual(self.name(["zenity"], {}), "qt")
+
     def test_never_calls_the_real_system(self):
         with patched(FakeRun(error=AssertionError("must not run"))):
             dialogs.choose("auto", {}, which_of("zenity", "kdialog", "notify-send"))

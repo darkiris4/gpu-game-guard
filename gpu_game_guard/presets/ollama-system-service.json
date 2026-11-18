@@ -1,0 +1,16 @@
+{
+  "id": "ollama-system-service",
+  "label": "Ollama (system service)",
+  "description": "Stops the ollama.service system service, which frees the models it keeps in GPU memory. Needs a polkit rule or root: run 'sudo gpu-game-guard polkit allow ollama.service'.",
+  "detect": {
+    "unit": "ollama.service",
+    "scope": "system"
+  },
+  "spec": {
+    "id": "ollama",
+    "kind": "service",
+    "label": "Ollama",
+    "unit": "ollama.service",
+    "scope": "system"
+  }
+}

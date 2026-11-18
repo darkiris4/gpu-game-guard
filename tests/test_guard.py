@@ -8,8 +8,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from gpu_game_guard.config import GameRule
-from gpu_game_guard.guard import Guard
+from gpu_game_guard import config as configmod, status
+from gpu_game_guard.config import Config, GameRule
+from gpu_game_guard.guard import Guard, Plan, plan
+from gpu_game_guard.model import Target
 from gpu_game_guard.state import State
 
 from .fakes import FakePrompter, FakeRuntime, FakeTrigger, FakeWatcher, make_launch
@@ -30,11 +32,13 @@ class Env:
         self.prompter = FakePrompter(launch, restart, can_ask)
         self.watcher = FakeWatcher(config)
         self.state = State(Path(self.tmp.name) / "state.json")
+        self.status_dir = Path(self.tmp.name) / "status"
         self.guard = self.make_guard()
 
     def make_guard(self):
         return Guard(self.watcher, [self.trigger], self.runtimes, self.prompter, self.state,
-                     gpu_totals=lambda: (5120, 16311), clock=lambda: self.now, wall=lambda: self.now)
+                     gpu_totals=lambda: (5120, 16311), clock=lambda: self.now, wall=lambda: self.now,
+                     status_dir=self.status_dir, dialog_name="fake")
 
     @property
     def config(self):
@@ -573,7 +577,7 @@ class AdoptionTests(GuardCase):
         other.launches = [make_launch(20, 5, trigger="other")]
         other.fail_scan = True
         env.guard = Guard(env.watcher, [env.trigger, other], env.runtimes, env.prompter, env.state,
-                          clock=lambda: env.now, wall=lambda: env.now)
+                          clock=lambda: env.now, wall=lambda: env.now, status_dir=env.status_dir)
         other.fail_scan = False
         env.advance(1)
         self.assertEqual(env.prompter.launch_asked, [])
@@ -705,6 +709,294 @@ class CanAskTests(GuardCase):
         self.assertEqual(env.docker.started, ["ollama"])
         self.assertEqual(env.state.stopped, [])
         self.assertEqual(len(env.prompter.notifications), 2)
+
+
+def container(name, runtime="docker"):
+    return Target("container", runtime, name, "image:1", None, name)
+
+
+def host(name, kind="service", runtime="service"):
+    return Target(kind, runtime, name)
+
+
+class PlanTests(unittest.TestCase):
+    def test_ask_and_stop(self):
+        targets = [container("a"), host("svc")]
+        asked = plan(Config(), "steam:1", targets, True)
+        self.assertEqual((asked.action, asked.will_stop, asked.ignored, asked.can_ask), ("ask", targets, [], True))
+        stopped = plan(Config(on_launch="stop"), "steam:1", targets, False)
+        self.assertEqual((stopped.action, stopped.will_stop, stopped.can_ask), ("stop", targets, False))
+
+    def test_a_game_rule_overrides_on_launch(self):
+        c = Config(on_launch="stop", games={"steam:1": GameRule("One", "ignore")})
+        result = plan(c, "steam:1", [container("a")], True)
+        self.assertEqual((result.action, result.will_stop), ("ignore", []))
+        self.assertEqual(plan(c, "steam:2", [container("a")], True).action, "stop")
+
+    def test_ignored_targets_are_listed_and_not_stopped(self):
+        c = Config(ignore_containers=["plex*"])
+        result = plan(c, "steam:1", [container("plex-1"), container("ollama")], True)
+        self.assertEqual(([t.name for t in result.will_stop], [t.name for t in result.ignored]), (["ollama"], ["plex-1"]))
+
+    def test_nothing_running(self):
+        self.assertEqual(plan(Config(), "steam:1", [], True).action, "nothing-running")
+        only_ignored = plan(Config(ignore_containers=["a"]), "steam:1", [container("a")], True)
+        self.assertEqual((only_ignored.action, len(only_ignored.ignored)), ("nothing-running", 1))
+
+    def test_paused_and_disabled_stop_nothing(self):
+        targets = [container("a")]
+        paused = plan(Config(), "steam:1", targets, True, paused=True)
+        disabled = plan(Config(enabled=False), "steam:1", targets, True)
+        self.assertEqual((paused.action, paused.will_stop, disabled.action, disabled.will_stop),
+                         ("paused", [], "disabled", []))
+        self.assertEqual(plan(Config(enabled=False), "steam:1", targets, True, paused=True).action, "disabled")
+
+    def test_asking_without_a_dialog_stops_nothing(self):
+        result = plan(Config(), "steam:1", [container("a")], False)
+        self.assertEqual((result.action, result.will_stop, result.can_ask), ("ask", [], False))
+        self.assertIn("no dialog", result.note)
+
+    def test_auto_containers_off_leaves_containers_out(self):
+        c = Config(auto_containers=False)
+        result = plan(c, "steam:1", [container("a"), container("b", "podman"), host("svc")], True)
+        self.assertEqual([t.name for t in result.will_stop], ["svc"])
+        self.assertEqual(plan(c, "steam:1", [container("a")], True).action, "nothing-running")
+
+    def test_plan_is_pure(self):
+        targets = [container("a")]
+        c = Config()
+        before = c.to_json()
+        self.assertIsInstance(plan(c, "steam:1", targets, True), Plan)
+        self.assertEqual((c.to_json(), targets), (before, [container("a")]))
+
+
+class WatchOnlyTests(GuardCase):
+    def test_paused_adopts_launches_and_leaves_them_alone(self):
+        env = self.env()
+        status.pause(None, env.status_dir)
+        env.trigger.launches = [make_launch(10)]
+        env.advance(1)
+        self.assertEqual((env.prompter.launch_asked, env.trigger.ended, env.docker.stopped), ([], [], []))
+        written = status.read_status(env.status_dir, max_age=1e12)
+        self.assertEqual((written.state, written.paused), ("paused", True))
+        status.resume(env.status_dir)
+        env.advance(1)
+        self.assertEqual(env.prompter.launch_asked, [], "the adopted launch is not asked about after the resume")
+        env.trigger.launches.append(make_launch(11, 440))
+        env.advance(1)
+        self.assertEqual(env.prompter.launch_asked, [["ollama"]])
+
+    def test_a_timed_pause_ends(self):
+        env = self.env()
+        with mock.patch.object(status.time, "time", return_value=env.now):
+            status.pause(30, env.status_dir)
+        env.trigger.launches = [make_launch(10)]
+        env.advance(1)
+        self.assertEqual(env.prompter.launch_asked, [])
+        env.advance(60)
+        env.trigger.launches.append(make_launch(11, 440))
+        env.advance(1)
+        self.assertEqual(env.prompter.launch_asked, [["ollama"]])
+
+    def test_disabled_config_adopts_and_reports_disabled(self):
+        env = self.env(config=Config(enabled=False))
+        env.trigger.launches = [make_launch(10)]
+        env.advance(1)
+        self.assertEqual((env.prompter.launch_asked, env.trigger.ended), ([], []))
+        self.assertEqual(status.read_status(env.status_dir, max_age=1e12).state, "disabled")
+
+    def test_a_pending_restart_is_still_asked_while_paused(self):
+        env = self.env()
+        env.trigger.launches = [make_launch(10)]
+        env.advance(1)
+        env.trigger.launches = [make_launch(11, 440)]
+        env.advance(1)
+        status.pause(None, env.status_dir)
+        env.trigger.launches = []
+        env.advance(30)
+        self.assertEqual(env.prompter.restart_asked, [["ollama"]])
+        self.assertEqual(env.docker.started, ["ollama"])
+
+    def test_auto_containers_false_skips_container_runtimes(self):
+        env = self.env(config=Config(auto_containers=False), podman=["p"])
+        env.trigger.launches = [make_launch(10)]
+        env.advance(1)
+        self.assertEqual(env.prompter.launch_asked, [])
+
+    def test_auto_containers_false_keeps_host_runtimes(self):
+        env = self.env(config=Config(auto_containers=False), running=())
+        host_runtime = FakeRuntime("service", ())
+        host_runtime.running = ["svc"]
+        env.runtimes.append(host_runtime)
+        env.guard = env.make_guard()
+        env.trigger.launches = [make_launch(10)]
+        env.advance(1)
+        self.assertEqual(len(env.prompter.launch_asked), 1)
+
+
+class RememberTests(GuardCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = Path(tmp.name) / "config.json"
+
+    def env_with(self, remember, config=None, **options):
+        env = self.env(**options)
+        env.prompter.remember = remember
+        env.watcher.path = self.path
+        if config is not None:
+            env.watcher.config = config
+        return env
+
+    def test_remembered_stop_is_saved(self):
+        env = self.env_with("stop")
+        env.trigger.launches = [make_launch(10)]
+        env.advance(1)
+        saved = configmod.load(self.path)
+        self.assertEqual(saved.games["steam:730"], GameRule("Game 730", "stop"))
+
+    def test_remembered_ignore_is_saved_with_launch_anyway(self):
+        env = self.env_with("ignore", launch="anyway")
+        env.trigger.launches = [make_launch(10)]
+        env.advance(1)
+        self.assertEqual(configmod.load(self.path).games["steam:730"].action, "ignore")
+        self.assertEqual(env.docker.stopped, [])
+
+    def test_nothing_remembered_writes_nothing(self):
+        env = self.env_with(None)
+        env.trigger.launches = [make_launch(10)]
+        env.advance(1)
+        self.assertFalse(self.path.exists())
+
+    def test_disabled_by_config(self):
+        env = self.env_with("stop", config=Config(remember_choices=False))
+        env.trigger.launches = [make_launch(10)]
+        env.advance(1)
+        self.assertFalse(self.path.exists())
+        self.assertEqual(env.prompter.remember_asked, 0)
+
+    def test_a_save_failure_is_logged_and_never_raised(self):
+        env = self.env_with("stop")
+        env.trigger.launches = [make_launch(10)]
+        with mock.patch("gpu_game_guard.guard.save_config", side_effect=OSError("disk full")):
+            out = env.advance(1)
+        self.assertIn("could not remember", out)
+        self.assertEqual(env.docker.stopped, ["ollama"])
+
+    def test_a_prompter_without_the_method_is_fine(self):
+        env = self.env_with("stop")
+        env.prompter = type("P", (), {"name": "p", "can_ask": True, "launch": lambda s, *a: "stop",
+                                      "restart": lambda s, r: True, "notify": lambda s, *a: None})()
+        env.guard = env.make_guard()
+        env.trigger.launches = [make_launch(10)]
+        env.advance(1)
+        self.assertFalse(self.path.exists())
+
+    def test_the_automatic_stop_action_does_not_ask_to_remember(self):
+        env = self.env_with("stop", config=Config(on_launch="stop"))
+        env.trigger.launches = [make_launch(10)]
+        env.advance(1)
+        self.assertFalse(self.path.exists())
+
+
+class StatusChannelTests(GuardCase):
+    def read(self, env):
+        return status.read_status(env.status_dir, max_age=1e12)
+
+    def test_status_after_a_pass(self):
+        env = self.env(config=Config(targets=[configmod.TargetSpec("o", "process", match="o")]))
+        env.advance(1)
+        got = self.read(env)
+        self.assertEqual((got.state, got.pid > 0, got.dialog, got.can_ask, got.targets, got.config_ok),
+                         ("watching", True, "fake", True, 1, True))
+        self.assertEqual(got.updated, env.now)
+
+    def test_game_running_and_restart_pending(self):
+        env = self.env()
+        env.trigger.launches = [make_launch(10)]
+        env.advance(1)
+        self.assertEqual(self.read(env).state, "restart-pending", "the intercepted launch was ended")
+        env.trigger.launches = [make_launch(11)]
+        env.advance(1)
+        got = self.read(env)
+        self.assertEqual(got.state, "game-running")
+        self.assertEqual(got.game, {"id": "steam:730", "title": "Game 730"})
+        self.assertEqual([r["name"] for r in got.stopped], ["ollama"])
+        env.trigger.launches = []
+        env.prompter.restart_answer = None
+        env.advance(2)
+        env.trigger.launches = [make_launch(11, 440)]
+        env.advance(1)
+        env.trigger.launches = []
+        env.advance(30)
+        self.assertEqual(self.read(env).state, "restart-pending")
+
+    def test_the_state_is_asking_while_the_dialog_is_open(self):
+        env = self.env()
+        seen = []
+        original = env.prompter.launch
+
+        def launch(*args):
+            seen.append(self.read(env))
+            return original(*args)
+        env.prompter.launch = launch
+        env.trigger.launches = [make_launch(10)]
+        env.advance(1)
+        self.assertEqual((seen[0].state, seen[0].game["id"]), ("asking", "steam:730"))
+
+    def test_events_for_the_whole_story(self):
+        env = self.env()
+        env.trigger.launches = [make_launch(10)]
+        env.advance(1)
+        env.trigger.launches = [make_launch(11, 440)]
+        env.advance(1)
+        env.trigger.launches = []
+        env.advance(30)
+        kinds = [e["kind"] for e in status.read_events(directory=env.status_dir)]
+        self.assertEqual(kinds, ["intercept", "answer", "stop", "restart"])
+
+    def test_failures_become_events(self):
+        env = self.env(launch="stop")
+        env.docker.refuse_stop = ["ollama"]
+        env.trigger.launches = [make_launch(10)]
+        env.advance(1)
+        self.assertIn("failure", [e["kind"] for e in status.read_events(directory=env.status_dir)])
+
+    def test_a_config_problem_is_reported_once_and_recovery_too(self):
+        env = self.env()
+        env.watcher.error = "poll_seconds is wrong"
+        env.advance(1)
+        env.advance(1)
+        got = self.read(env)
+        self.assertEqual((got.config_ok, got.config_error), (False, "poll_seconds is wrong"))
+        env.watcher.error = ""
+        env.advance(1)
+        self.assertTrue(self.read(env).config_ok)
+        messages = [e["message"] for e in status.read_events(directory=env.status_dir) if e["kind"] == "config"]
+        self.assertEqual(len(messages), 2)
+
+    def test_a_failing_status_write_is_logged_once_and_does_not_stop_the_guard(self):
+        env = self.env()
+        env.trigger.launches = [make_launch(10)]
+        with mock.patch.object(status, "write_status", side_effect=OSError("read-only")), \
+                mock.patch.object(status, "append_event", side_effect=OSError("read-only")):
+            first = env.advance(1)
+            second = env.advance(1)
+        self.assertEqual(env.docker.stopped, ["ollama"])
+        self.assertEqual(first.count("cannot write the status files"), 1)
+        self.assertNotIn("cannot write the status files", second)
+
+    def test_a_status_directory_that_is_a_file_does_not_stop_the_guard(self):
+        env = self.env()
+        env.status_dir.write_text("not a directory")
+        env.trigger.launches = [make_launch(10)]
+        env.advance(1)
+        self.assertEqual(env.docker.stopped, ["ollama"])
+
+    def test_cannot_ask_is_reported(self):
+        env = self.env(can_ask=False)
+        env.advance(1)
+        self.assertFalse(self.read(env).can_ask)
 
 
 if __name__ == "__main__":

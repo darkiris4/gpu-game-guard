@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from gpu_game_guard import config as cfg
-from gpu_game_guard.config import Config, ConfigError, ConfigWatcher, GameRule
+from gpu_game_guard.config import Config, ConfigError, ConfigWatcher, GameRule, TargetSpec
 
 
 class DefaultsTests(unittest.TestCase):
@@ -19,19 +19,22 @@ class DefaultsTests(unittest.TestCase):
         self.assertEqual((c.on_launch, c.after_game, c.dialog), ("ask", "ask", "auto"))
         self.assertEqual((c.poll_seconds, c.exit_grace_seconds, c.no_game_timeout_seconds), (1.0, 8.0, 180.0))
         self.assertEqual((c.bypass_seconds, c.dialog_retry_seconds, c.heavy_vram_mib), (120.0, 300.0, 4096))
-        self.assertEqual((c.runtimes, c.triggers, c.ignore_containers, c.games), (["docker", "podman"], ["steam"], [], {}))
+        self.assertEqual((c.runtimes, c.triggers, c.ignore_containers, c.games),
+                         (["docker", "podman", "service", "command", "process"], ["steam"], [], {}))
+        self.assertEqual((c.enabled, c.auto_containers, c.remember_choices, c.protect, c.targets), (True, True, True, [], []))
         self.assertEqual(cfg.validate(c.to_json()), [])
 
     def test_instances_do_not_share_lists(self):
         a, b = Config(), Config()
         a.runtimes.append("x")
-        self.assertEqual(b.runtimes, ["docker", "podman"])
+        self.assertEqual(b.runtimes, ["docker", "podman", "service", "command", "process"])
 
     def test_to_json_has_every_key(self):
         keys = set(Config().to_json())
         self.assertEqual(keys, {"on_launch", "after_game", "poll_seconds", "exit_grace_seconds", "no_game_timeout_seconds",
                                 "bypass_seconds", "dialog_retry_seconds", "heavy_vram_mib", "ignore_containers", "runtimes",
-                                "triggers", "dialog", "games"})
+                                "triggers", "dialog", "games", "enabled", "auto_containers", "remember_choices", "protect",
+                                "targets"})
 
     def test_round_trip(self):
         c = Config(on_launch="stop", after_game="leave", poll_seconds=0.5, heavy_vram_mib=1000, ignore_containers=["a*"],
@@ -70,7 +73,7 @@ class ValidateTests(unittest.TestCase):
 
     def test_unknown_enum_values_name_the_key_and_choices(self):
         for key, allowed in (("on_launch", "ask, stop, ignore"), ("after_game", "ask, restart, leave"),
-                             ("dialog", "auto, zenity, kdialog, notify, none")):
+                             ("dialog", "auto, qt, zenity, kdialog, notify, none")):
             (problem,) = self.problems(**{key: "bogus"})
             self.assertIn(f'"{key}"', problem)
             self.assertIn(allowed, problem)
@@ -373,6 +376,177 @@ class WatcherTests(unittest.TestCase):
         c, out = self.logged(ConfigWatcher(self.path))
         self.assertEqual(c, Config())
         self.assertIn("poll_seconds", out)
+
+
+SERVICE = {"id": "ollama", "kind": "service", "unit": "ollama.service"}
+COMMAND = {"id": "unload", "kind": "command", "stop": ["a"], "start": ["b"]}
+PROCESS = {"id": "obs", "kind": "process", "match": "obs"}
+
+
+def problems_for(*targets):
+    return cfg.validate({"targets": list(targets)})
+
+
+class TargetTests(unittest.TestCase):
+    def test_valid_targets_of_every_kind(self):
+        self.assertEqual(problems_for(SERVICE, COMMAND, PROCESS), [])
+
+    def test_defaults_are_filled_in(self):
+        c = Config.from_json({"targets": [SERVICE, COMMAND, PROCESS]})
+        service, command, process = c.targets
+        self.assertEqual((service.label, service.enabled, service.scope), ("ollama", True, "system"))
+        self.assertEqual((command.check, command.timeout_seconds), (None, 60.0))
+        self.assertEqual((process.restart, process.enabled), (True, True))
+
+    def test_round_trip_is_exact(self):
+        c = Config(
+            enabled=False, auto_containers=False, remember_choices=False, protect=["x*"],
+            targets=[TargetSpec("ollama", "service", "Ollama", False, unit="ollama.service", scope="user"),
+                     TargetSpec("unload", "command", "Unload", True, stop=["s", "1"], start=["true"], check=["true"],
+                                timeout_seconds=12.5),
+                     TargetSpec("obs", "process", "OBS", True, match="obs", restart=False)])
+        again = Config.from_json(json.loads(json.dumps(c.to_json())))
+        self.assertEqual(again, c)
+        self.assertEqual(again.to_json(), c.to_json())
+
+    def test_a_spec_writes_only_the_keys_of_its_kind(self):
+        service = TargetSpec("a", "service", unit="a.service", stop=["x"], match="m").to_json()
+        self.assertEqual(set(service), {"id", "kind", "label", "enabled", "unit", "scope"})
+        command = TargetSpec("a", "command", stop=["x"], start=["y"], unit="u.service").to_json()
+        self.assertEqual(set(command), {"id", "kind", "label", "enabled", "stop", "start", "timeout_seconds"})
+        process = TargetSpec("a", "process", match="m", unit="u.service").to_json()
+        self.assertEqual(set(process), {"id", "kind", "label", "enabled", "match", "restart"})
+
+    def test_old_config_files_load_unchanged(self):
+        c = Config.from_json({"on_launch": "stop", "runtimes": ["docker"], "games": {"steam:1": {"action": "ignore"}}})
+        self.assertEqual((c.on_launch, c.runtimes, c.targets, c.enabled), ("stop", ["docker"], [], True))
+
+    def test_messages_name_the_target_key_and_rule(self):
+        found = problems_for(dict(SERVICE, unit="ollama"), dict(COMMAND, id="c2", stop=[]), dict(PROCESS, id="p3", match="a/b"))
+        self.assertEqual(len(found), 3)
+        self.assertIn('"targets"[0] (id \'ollama\')', found[0])
+        self.assertIn('"unit" must end in ".service"', found[0])
+        self.assertIn('"targets"[1] (id \'c2\')', found[1])
+        self.assertIn('"stop"', found[1])
+        self.assertIn("non-empty list", found[1])
+        self.assertIn('"targets"[2] (id \'p3\')', found[2])
+        self.assertIn('must not contain "/"', found[2])
+
+    def test_id_rules(self):
+        for bad in ("", "Obs", "-a", "a b", "x" * 41, 5, None):
+            self.assertTrue(problems_for(dict(PROCESS, id=bad)), bad)
+        self.assertEqual(problems_for(dict(PROCESS, id="x" * 40), dict(PROCESS, id="a_b-1")), [])
+        self.assertTrue(problems_for({"kind": "process", "match": "a"}))
+
+    def test_duplicate_ids(self):
+        found = problems_for(PROCESS, dict(PROCESS))
+        self.assertEqual(len(found), 1)
+        self.assertIn('"targets"[1]', found[0])
+        self.assertIn("duplicates", found[0])
+
+    def test_kind_and_common_keys(self):
+        self.assertIn('"kind" must be one of', problems_for(dict(PROCESS, kind="docker"))[0])
+        self.assertIn('"kind"', problems_for({"id": "a"})[0])
+        self.assertIn('"label" must be a string', problems_for(dict(PROCESS, label=3))[0])
+        self.assertIn('"enabled" must be true or false', problems_for(dict(PROCESS, enabled="yes"))[0])
+        self.assertIn("must be an object", problems_for("x")[0])
+        self.assertIn('"targets" must be a list', cfg.validate({"targets": {}})[0])
+
+    def test_service_rules(self):
+        for unit in ("a.timer", "a b.service", "../a.service", "", 4):
+            self.assertTrue(problems_for(dict(SERVICE, unit=unit)), unit)
+        self.assertTrue(problems_for({"id": "a", "kind": "service"}))
+        self.assertTrue(problems_for(dict(SERVICE, scope="global")))
+        self.assertEqual(problems_for(dict(SERVICE, scope="user")), [])
+
+    def test_command_rules(self):
+        self.assertTrue(problems_for({"id": "a", "kind": "command", "stop": ["a"]}))
+        self.assertTrue(problems_for(dict(COMMAND, start="true")))
+        self.assertTrue(problems_for(dict(COMMAND, stop=["a", 3])))
+        self.assertTrue(problems_for(dict(COMMAND, check=[])))
+        self.assertEqual(problems_for(dict(COMMAND, check=["true"])), [])
+        for bad in (0, 601, "5", True, float("nan")):
+            self.assertTrue(problems_for(dict(COMMAND, timeout_seconds=bad)), bad)
+        for good in (1, 600, 2.5):
+            self.assertEqual(problems_for(dict(COMMAND, timeout_seconds=good)), [])
+
+    def test_process_rules(self):
+        self.assertTrue(problems_for({"id": "a", "kind": "process"}))
+        self.assertTrue(problems_for(dict(PROCESS, match="")))
+        self.assertTrue(problems_for(dict(PROCESS, restart="no")))
+
+    def test_unknown_target_keys_get_a_hint(self):
+        found = problems_for(dict(PROCESS, restrat=True))
+        self.assertEqual(len(found), 1)
+        self.assertIn("unknown key 'restrat'", found[0])
+        self.assertIn("did you mean 'restart'", found[0])
+        self.assertIn('"targets"[0] (id \'obs\')', found[0])
+
+    def test_a_key_of_another_kind_is_unknown(self):
+        found = problems_for(dict(PROCESS, unit="a.service"))
+        self.assertIn("unknown key 'unit'", found[0])
+
+    def test_load_accepts_unknown_target_keys_with_a_warning(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            c = Config.from_json({"targets": [dict(PROCESS, extra=1)]})
+        self.assertEqual(len(c.targets), 1)
+        self.assertIn("targets[0].extra", err.getvalue())
+
+    def test_invalid_target_makes_load_fail(self):
+        with self.assertRaises(ConfigError) as ctx:
+            Config.from_json({"targets": [dict(PROCESS, match="")]})
+        self.assertIn("targets", ctx.exception.reason)
+
+
+class NewKeyTests(unittest.TestCase):
+    def test_booleans_must_be_booleans(self):
+        for key in ("enabled", "auto_containers", "remember_choices"):
+            self.assertIn(f'"{key}" must be true or false', cfg.validate({key: 1})[0])
+            self.assertEqual(cfg.validate({key: False}), [])
+            self.assertFalse(getattr(Config.from_json({key: False}), key))
+
+    def test_protect_is_a_list_of_strings(self):
+        self.assertTrue(cfg.validate({"protect": "a"}))
+        self.assertEqual(Config.from_json({"protect": ["a*"]}).protect, ["a*"])
+
+    def test_is_protected_is_case_insensitive_glob(self):
+        c = Config(protect=["My-Editor*", "obs"])
+        self.assertTrue(c.is_protected("my-editor-2"))
+        self.assertTrue(c.is_protected("OBS"))
+        self.assertFalse(c.is_protected("obs-studio"))
+        self.assertFalse(Config().is_protected("anything"))
+
+    def test_typo_in_a_new_key_gets_a_hint(self):
+        self.assertIn("did you mean 'auto_containers'", cfg.validate({"auto_container": True})[0])
+
+
+class CopyTests(unittest.TestCase):
+    def test_with_target_appends_and_replaces_without_mutating(self):
+        base = Config()
+        one = base.with_target(TargetSpec("a", "process", match="a"))
+        self.assertEqual((base.targets, [t.id for t in one.targets]), ([], ["a"]))
+        two = one.with_target(TargetSpec("a", "process", match="b", enabled=False))
+        self.assertEqual([(t.match, t.enabled) for t in two.targets], [("b", False)])
+        self.assertEqual(one.targets[0].match, "a")
+        self.assertEqual(one.target("a").id, "a")
+        self.assertIsNone(one.target("zz"))
+
+    def test_without_target(self):
+        base = Config(targets=[TargetSpec("a", "process", match="a"), TargetSpec("b", "process", match="b")])
+        less = base.without_target("a")
+        self.assertEqual(([t.id for t in base.targets], [t.id for t in less.targets]), (["a", "b"], ["b"]))
+        self.assertEqual(base.without_target("zz"), base)
+
+    def test_with_game_sets_and_keeps_the_name(self):
+        base = Config()
+        one = base.with_game("steam:1", "One", "stop")
+        self.assertEqual((base.games, one.games["steam:1"]), ({}, GameRule("One", "stop")))
+        two = one.with_game("steam:1", "", "ignore")
+        self.assertEqual(two.games["steam:1"], GameRule("One", "ignore"))
+        self.assertEqual(one.games["steam:1"].action, "stop")
+        with self.assertRaises(ValueError):
+            base.with_game("steam:1", "One", "maybe")
 
 
 if __name__ == "__main__":

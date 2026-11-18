@@ -1,0 +1,13 @@
+#!/bin/sh
+# Disables the globally enabled user service before the program is removed or replaced by a removal.
+set -e
+
+case "$1" in
+  remove)
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl --global disable gpu-game-guard.service >/dev/null 2>&1 || true
+    fi
+    ;;
+esac
+
+exit 0

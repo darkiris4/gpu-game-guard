@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Tests install.sh against throwaway directories. The real user service and ~/.local/bin are never
-# touched: every run uses --no-systemd with GPU_GAME_GUARD_BIN_DIR, XDG_CONFIG_HOME and XDG_STATE_HOME
-# pointing into a temporary directory.
+# touched: every run uses --no-systemd with GPU_GAME_GUARD_BIN_DIR, XDG_CONFIG_HOME, XDG_DATA_HOME and
+# XDG_STATE_HOME pointing into a temporary directory.
 #
 #   bash tests/test_installer.sh
 #
@@ -33,7 +33,7 @@ tools="sleep touch python3 mktemp rm mv install cat head grep sed dirname cp fin
 
 run_installer() {  # run_installer PATH_DIR HOME_DIR args...
   local path_dir="$1" home="$2"; shift 2
-  env -i PATH="$path_dir" HOME="$home" XDG_CONFIG_HOME="$home/config" XDG_STATE_HOME="$home/state" \
+  env -i PATH="$path_dir" HOME="$home" XDG_CONFIG_HOME="$home/config" XDG_DATA_HOME="$home/data" XDG_STATE_HOME="$home/state" \
       GPU_GAME_GUARD_SRC="$src" GPU_GAME_GUARD_BIN_DIR="$home/bin" \
       "$(command -v bash)" "$repo/install.sh" --no-systemd "$@"
 }
@@ -102,6 +102,37 @@ case_install_cycle() {
   grep -qxF "ExecStart=\"$home/bin/gpu-game-guard\" run" "$unit" 2>/dev/null \
     && pass "unit runs '<bin>/gpu-game-guard run'" || fail "unit runs '<bin>/gpu-game-guard run'" "$(cat "$unit" 2>/dev/null)"
 
+  local app="$home/data/applications/gpu-game-guard.desktop" tray="$home/config/autostart/gpu-game-guard-tray.desktop"
+  local icon="$home/data/icons/hicolor/scalable/apps/gpu-game-guard.svg"
+  [ -f "$app" ] && [ -f "$tray" ] && [ -f "$icon" ] && pass "settings entry, tray entry and icon installed under the XDG directories" \
+    || fail "settings entry, tray entry and icon installed under the XDG directories"
+  grep -qxF "Exec=\"$home/bin/gpu-game-guard\" settings" "$app" 2>/dev/null \
+    && pass "settings entry runs '<bin>/gpu-game-guard settings'" || fail "settings entry runs '<bin>/gpu-game-guard settings'" "$(grep Exec "$app" 2>/dev/null)"
+  grep -qxF "Exec=\"$home/bin/gpu-game-guard\" tray" "$tray" 2>/dev/null \
+    && pass "tray entry runs '<bin>/gpu-game-guard tray'" || fail "tray entry runs '<bin>/gpu-game-guard tray'" "$(grep Exec "$tray" 2>/dev/null)"
+  grep -qx 'NoDisplay=true' "$tray" && grep -qx 'X-GNOME-Autostart-enabled=true' "$tray" && ! grep -q '^OnlyShowIn' "$tray" \
+    && pass "tray entry is hidden, autostarted and not limited to a desktop" || fail "tray entry is hidden, autostarted and not limited to a desktop"
+  cmp -s "$icon" "$repo/packaging/gpu-game-guard.svg" && pass "icon is the packaged SVG" || fail "icon is the packaged SVG"
+  if [ "$(stat -c %a "$app" "$tray" "$icon" | sort -u)" = 644 ]; then pass "entries and icon are mode 0644"; else fail "entries and icon are mode 0644"; fi
+  if command -v desktop-file-validate >/dev/null; then
+    desktop-file-validate "$app" "$tray" >/dev/null 2>&1 && pass "installed desktop entries validate" || fail "installed desktop entries validate" "$(desktop-file-validate "$app" "$tray" 2>&1)"
+  else
+    skip "installed desktop entries validate (desktop-file-validate not installed)"
+  fi
+
+  # Re-install replaces edited and symlinked entries without writing through them.
+  echo "precious" > "$work/precious-entry"
+  echo "stale" > "$app"; rm -f "$tray"; ln -s "$work/precious-entry" "$tray"
+  out="$(run_installer "$work/path-docker" "$home" 2>&1)"; status=$?
+  if [ "$status" -eq 0 ] && [ ! -L "$tray" ] && [ "$(cat "$work/precious-entry")" = precious ] \
+     && grep -q '^Name=GPU Game Guard$' "$app" && grep -q '^Exec=' "$tray"; then
+    pass "re-install replaces a stale entry and a symlinked entry without writing through"
+  else
+    fail "re-install replaces a stale entry and a symlinked entry without writing through" "status=$status" "$out"
+  fi
+  [ -z "$(find "$home" -name '.*.new.*' -o -name '.*.old.*')" ] && pass "re-install leaves no temporary files" \
+    || fail "re-install leaves no temporary files" "$(find "$home" -name '.*.new.*' -o -name '.*.old.*')"
+
   # Re-install over a unit that is a symlink to a file that must stay untouched.
   echo "precious" > "$work/precious"
   rm -f "$unit"; ln -s "$work/precious" "$unit"
@@ -131,6 +162,11 @@ case_install_cycle() {
   else
     fail "uninstall removes program and unit, keeps state" "status=$status" "$out"
   fi
+  if [ ! -e "$app" ] && [ ! -e "$tray" ] && [ ! -L "$tray" ] && [ ! -e "$icon" ]; then
+    pass "uninstall removes the entries and the icon"
+  else
+    fail "uninstall removes the entries and the icon"
+  fi
   out="$(run_installer "$work/path-docker" "$home" --uninstall --purge 2>&1)"; status=$?
   [ "$status" -eq 0 ] && [ ! -e "$home/state/gpu-game-guard" ] && pass "uninstall --purge drops the state" || fail "uninstall --purge drops the state" "$out"
   mkdir -p "$home/config/gpu-game-guard"; echo '{}' > "$home/config/gpu-game-guard/config.json"
@@ -153,7 +189,7 @@ case_unit_quoting() {
   fake_tool "$work/path-quote" docker
   local bindir="$home/my bin %h \$X"
   local out status
-  out="$(env -i PATH="$work/path-quote" HOME="$home" XDG_CONFIG_HOME="$home/config" XDG_STATE_HOME="$home/state" \
+  out="$(env -i PATH="$work/path-quote" HOME="$home" XDG_CONFIG_HOME="$home/config" XDG_DATA_HOME="$home/data" XDG_STATE_HOME="$home/state" \
       GPU_GAME_GUARD_SRC="$src" GPU_GAME_GUARD_BIN_DIR="$bindir" \
       "$(command -v bash)" "$repo/install.sh" --no-systemd 2>&1)"; status=$?
   local unit="$home/config/systemd/user/gpu-game-guard.service"
@@ -163,6 +199,18 @@ case_unit_quoting() {
     pass "unit ExecStart is quoted and escaped for spaces, %, \$ and quotes"
   else
     fail "unit ExecStart is quoted and escaped for spaces, %, \$ and quotes" "status=$status" "want: $expected" "$(grep ExecStart "$unit" 2>/dev/null)" "$out"
+  fi
+  # the desktop entry format needs its own quoting: a dollar sign is escaped, twice over, and a percent sign doubled
+  local app="$home/data/applications/gpu-game-guard.desktop"
+  local expected_exec="Exec=\"$home/my bin %%h \\\\\$X/gpu-game-guard\" settings"
+  if grep -qxF "$expected_exec" "$app" 2>/dev/null; then
+    pass "desktop entry Exec is quoted and escaped for spaces, % and \$"
+  else
+    fail "desktop entry Exec is quoted and escaped for spaces, % and \$" "want: $expected_exec" "$(grep Exec "$app" 2>/dev/null)"
+  fi
+  if command -v desktop-file-validate >/dev/null; then
+    desktop-file-validate "$app" >/dev/null 2>&1 && pass "the quoted desktop entry validates" \
+      || fail "the quoted desktop entry validates" "$(desktop-file-validate "$app" 2>&1)"
   fi
   # systemd rejects quotes and backslashes in a program path, so the installer refuses them up front.
   out="$(env -i PATH="$work/path-quote" HOME="$home" XDG_CONFIG_HOME="$home/config" GPU_GAME_GUARD_SRC="$src" \
@@ -220,16 +268,21 @@ case_rollback() {
   printf '#!/bin/sh\ncase "$*" in *is-active*) exit 3 ;; esac\nexit 0\n' > "$work/path-rb/systemctl"; chmod +x "$work/path-rb/systemctl"
   printf '#!/bin/sh\necho previous\n' > "$home/bin/gpu-game-guard"; chmod +x "$home/bin/gpu-game-guard"
   echo "previous unit" > "$home/config/systemd/user/gpu-game-guard.service"
+  mkdir -p "$home/data/applications" "$home/config/autostart"
+  echo "previous entry" > "$home/data/applications/gpu-game-guard.desktop"
   local out status
   out="$(env -i PATH="$work/path-rb" HOME="$home" XDG_CONFIG_HOME="$home/config" XDG_STATE_HOME="$home/state" \
       GPU_GAME_GUARD_SRC="$src" GPU_GAME_GUARD_BIN_DIR="$home/bin" "$(command -v bash)" "$repo/install.sh" 2>&1)"; status=$?
   if [ "$status" -ne 0 ] && grep -q 'previous version was restored' <<<"$out" \
      && [ "$("$home/bin/gpu-game-guard")" = previous ] \
      && [ "$(cat "$home/config/systemd/user/gpu-game-guard.service")" = "previous unit" ] \
-     && [ -z "$(find "$home/bin" "$home/config/systemd/user" -name '.*' -type f)" ]; then
-    pass "a service that fails to start restores the previous program and unit"
+     && [ "$(cat "$home/data/applications/gpu-game-guard.desktop")" = "previous entry" ] \
+     && [ ! -e "$home/config/autostart/gpu-game-guard-tray.desktop" ] \
+     && [ ! -e "$home/data/icons/hicolor/scalable/apps/gpu-game-guard.svg" ] \
+     && [ -z "$(find "$home" -name '.*.new.*' -o -name '.*.old.*')" ]; then
+    pass "a service that fails to start restores the previous program, unit and entries"
   else
-    fail "a service that fails to start restores the previous program and unit" "status=$status" "$out"
+    fail "a service that fails to start restores the previous program, unit and entries" "status=$status" "$out"
   fi
 }
 
@@ -263,7 +316,9 @@ case_transactions() {
   out="$(env -i PATH="$work/path-tx2" HOME="$home" XDG_CONFIG_HOME="$home/config" XDG_STATE_HOME="$home/state" \
       GPU_GAME_GUARD_SRC="$src" GPU_GAME_GUARD_BIN_DIR="$home/bin" "$(command -v bash)" "$repo/install.sh" 2>&1)"; status=$?
   if [ "$status" -ne 0 ] && grep -q 'new files were removed' <<<"$out" && [ ! -e "$home/bin/gpu-game-guard" ] \
-     && [ ! -e "$home/config/systemd/user/gpu-game-guard.service" ]; then
+     && [ ! -e "$home/config/systemd/user/gpu-game-guard.service" ] \
+     && [ ! -e "$home/data/applications/gpu-game-guard.desktop" ] && [ ! -e "$home/config/autostart/gpu-game-guard-tray.desktop" ] \
+     && [ ! -e "$home/data/icons/hicolor/scalable/apps/gpu-game-guard.svg" ]; then
     pass "a first install whose service does not start removes the new files"
   else
     fail "a first install whose service does not start removes the new files" "status=$status" "$out"
@@ -290,7 +345,34 @@ case_transactions() {
   fi
 }
 
+# An applications directory that cannot be written makes the entry step fail: nothing stays installed.
+case_entry_failure() {
+  if [ ! -f "$src/gpu_game_guard/cli.py" ]; then
+    skip "a failing entry write rolls the whole installation back"
+    return
+  fi
+  if [ "$(id -u)" = 0 ]; then
+    skip "a failing entry write rolls the whole installation back (root ignores directory permissions)"
+    return
+  fi
+  local home="$work/entryfail"; mkdir -p "$home/data/applications"
+  chmod 555 "$home/data/applications"
+  make_path "$work/path-ef" $tools
+  fake_tool "$work/path-ef" docker
+  local out status
+  out="$(run_installer "$work/path-ef" "$home" 2>&1)"; status=$?
+  chmod 755 "$home/data/applications"
+  if [ "$status" -ne 0 ] && grep -q 'desktop entries' <<<"$out" && [ ! -e "$home/bin/gpu-game-guard" ] \
+     && [ ! -e "$home/config/systemd/user/gpu-game-guard.service" ] && [ ! -e "$home/config/autostart/gpu-game-guard-tray.desktop" ] \
+     && [ -z "$(find "$home" -type f)" ]; then
+    pass "a failing entry write rolls the whole installation back"
+  else
+    fail "a failing entry write rolls the whole installation back" "status=$status" "$out" "$(find "$home" -type f)"
+  fi
+}
+
 case_missing_runtime
+case_entry_failure
 case_rollback
 case_transactions
 case_missing_python

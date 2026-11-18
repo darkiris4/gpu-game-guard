@@ -269,6 +269,27 @@ class BuildTests(unittest.TestCase):
     def test_empty(self):
         self.assertEqual(runtimes.build([]), [])
 
+    def test_host_providers_need_the_config(self):
+        names = ["docker", "service", "command", "process"]
+        with mock.patch("gpu_game_guard.util.log") as log:
+            built = runtimes.build(names)
+            runtimes.build(names)
+        self.assertEqual([r.name for r in built], ["docker"])
+        self.assertEqual(log.call_count, 3)  # one line per host name, once
+
+    def test_host_providers_are_built_with_a_config(self):
+        built = runtimes.build(["process", "docker", "service", "command"], lambda: None)
+        self.assertEqual([r.name for r in built], ["process", "docker", "service", "command"])
+
+    def test_every_runtime_has_installed_and_available(self):
+        for runtime in runtimes.build(["docker", "podman", "service", "command", "process"], lambda: None):
+            with self.subTest(runtime.name):
+                self.assertIsInstance(runtime.installed(), bool)
+                self.assertIsInstance(runtime.available(), bool)
+        for runtime in runtimes.build(["command", "process", "service"], lambda: None):
+            self.assertTrue(runtime.installed())
+        self.assertTrue(runtimes.build(["command"], lambda: None)[0].available())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,27 @@
+{
+  "id": "ollama-unload",
+  "label": "Ollama models (unload only)",
+  "description": "Unloads every model Ollama holds in GPU memory and leaves the server running. Works for Ollama run by hand, in a container or as a service.",
+  "detect": {
+    "command": "ollama"
+  },
+  "spec": {
+    "id": "ollama-unload",
+    "kind": "command",
+    "label": "Ollama models",
+    "stop": [
+      "python3",
+      "-c",
+      "import json\nimport sys\nimport urllib.request\n\nBASE = \"http://127.0.0.1:11434\"\ntry:\n    with urllib.request.urlopen(BASE + \"/api/ps\", timeout=5) as reply:\n        models = json.load(reply).get(\"models\") or []\n    for entry in models:\n        name = entry.get(\"model\") or entry.get(\"name\")\n        if not name:\n            continue\n        request = urllib.request.Request(\n            BASE + \"/api/generate\",\n            data=json.dumps({\"model\": name, \"keep_alive\": 0}).encode(),\n            headers={\"Content-Type\": \"application/json\"},\n            method=\"POST\",\n        )\n        urllib.request.urlopen(request, timeout=30).read()\nexcept Exception:\n    pass\nsys.exit(0)\n"
+    ],
+    "start": [
+      "true"
+    ],
+    "check": [
+      "python3",
+      "-c",
+      "import json\nimport sys\nimport urllib.request\n\ntry:\n    with urllib.request.urlopen(\"http://127.0.0.1:11434/api/ps\", timeout=3) as reply:\n        sys.exit(0 if json.load(reply).get(\"models\") else 1)\nexcept Exception:\n    sys.exit(1)\n"
+    ],
+    "timeout_seconds": 60
+  }
+}

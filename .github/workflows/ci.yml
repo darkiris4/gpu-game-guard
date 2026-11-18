@@ -48,15 +48,19 @@ jobs:
       - name: Syntax check
         run: |
           set -e
-          for f in install.sh scripts/*.sh; do
+          for f in install.sh scripts/*.sh tests/*.sh; do
             echo "bash -n $f"
             bash -n "$f"
+          done
+          for f in packaging/debian/postinst packaging/debian/prerm packaging/debian/postrm; do
+            echo "sh -n $f"
+            sh -n "$f"
           done
       - name: shellcheck
         run: |
           sudo apt-get update
           sudo apt-get install -y shellcheck
-          shellcheck -S warning install.sh scripts/*.sh
+          shellcheck -S warning install.sh scripts/*.sh packaging/debian/postinst packaging/debian/prerm packaging/debian/postrm
       - name: Installer tests
         run: bash tests/test_installer.sh
 
@@ -75,3 +79,54 @@ jobs:
           set -e
           test -x ./gpu-game-guard
           ./gpu-game-guard --version
+
+  ui:
+    name: Qt interface
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PyQt5
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pyqt5
+      - name: Unit tests with the offscreen platform
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: /usr/bin/python3 -m unittest discover -s tests -t . -v
+
+  deb:
+    name: Debian package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: bash scripts/build-deb.sh dist
+      - name: Inspect
+        run: |
+          set -e
+          dpkg-deb -I dist/*.deb
+          dpkg-deb -c dist/*.deb
+      - name: Package tests
+        run: bash tests/test_deb.sh
+      - name: Install in Debian and Ubuntu containers
+        run: |
+          set -e
+          for image in debian:12 ubuntu:22.04 ubuntu:24.04; do
+            echo "== $image"
+            docker run --rm -v "$PWD/dist:/dist:ro" "$image" sh -c '
+              set -e
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              cp /dist/gpu-game-guard_*_all.deb /gpu-game-guard.deb
+              apt-get install -y --no-install-recommends ./gpu-game-guard.deb
+              gpu-game-guard --version
+              gpu-game-guard config validate
+              apt-get purge -y gpu-game-guard
+              ! test -e /usr/bin/gpu-game-guard
+            '
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gpu-game-guard-deb
+          path: dist/*.deb
+          if-no-files-found: error

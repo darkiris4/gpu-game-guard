@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=GPU Game Guard
+GenericName=Game launch guard
+Comment=Choose what pauses when a game starts while GPU workloads are running
+Exec=gpu-game-guard settings
+Icon=gpu-game-guard
+Terminal=false
+Categories=Settings;System;Game;
+Keywords=GPU;Game;Steam;Docker;Podman;VRAM;
+StartupNotify=true

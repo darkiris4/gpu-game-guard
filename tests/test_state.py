@@ -185,6 +185,53 @@ class AtomicWriteTests(unittest.TestCase):
         self.assertEqual((out.getvalue(), err.getvalue()), ("", "hello\n"))
 
 
+class OptionalKeyTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = Path(tmp.name) / "state.json"
+
+    def load(self, stopped):
+        self.path.write_text(json.dumps({"stopped": stopped, "stopped_at": 1.0, "game_seen": False}))
+        return State(self.path).stopped
+
+    def test_valid_optional_keys_survive_a_round_trip(self):
+        full = {"kind": "process", "runtime": "process", "name": "obs", "scope": "user", "unit": "obs.service",
+                "id": "obs", "cmdline": ["/usr/bin/obs", "--minimized"], "cwd": "/home/u"}
+        s = State(self.path)
+        s.add([full], 100.0)
+        s.save()
+        self.assertEqual(State(self.path).stopped, [full])
+
+    def test_invalid_optional_keys_and_unknown_keys_are_dropped(self):
+        bad = {"kind": "process", "runtime": "process", "name": "obs", "scope": 3, "unit": None, "id": [],
+               "cmdline": ["a", 1], "cwd": 5, "extra": "x"}
+        self.assertEqual(self.load([bad]), [{"kind": "process", "runtime": "process", "name": "obs"}])
+        self.assertEqual(self.load([dict(bad, cmdline="obs")]), [{"kind": "process", "runtime": "process", "name": "obs"}])
+
+    def test_empty_cmdline_and_strings_are_kept(self):
+        got = self.load([{"kind": "process", "runtime": "process", "name": "a", "cmdline": [], "cwd": ""}])
+        self.assertEqual(got[0]["cmdline"], [])
+        self.assertEqual(got[0]["cwd"], "")
+
+    def test_add_drops_unknown_keys_and_stays_unique(self):
+        s = State(self.path)
+        s.add([dict(ref("a"), junk=1, id="x")], 1.0)
+        s.add([dict(ref("a"), id="y"), ref("b")], 2.0)
+        self.assertEqual(s.stopped, [dict(ref("a"), id="x"), ref("b")])
+
+    def test_stored_duplicates_collapse(self):
+        got = self.load([ref("a"), dict(ref("a"), id="x"), ref("a", "podman")])
+        self.assertEqual([(r["runtime"], r["name"]) for r in got], [("docker", "a"), ("podman", "a")])
+        self.assertNotIn("id", got[0])
+
+    def test_optional_keys_are_not_part_of_the_identity(self):
+        s = State(self.path)
+        s.add([dict(ref("a"), unit="a.service")], 1.0)
+        s.add([dict(ref("a"), unit="other.service")], 2.0)
+        self.assertEqual(len(s.stopped), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
 

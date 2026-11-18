@@ -1,0 +1,23 @@
+Package: gpu-game-guard
+Version: @VERSION@
+Architecture: all
+Section: games
+Priority: optional
+Maintainer: @MAINTAINER@
+Installed-Size: @SIZE@
+Depends: python3 (>= 3.9)
+Recommends: python3-pyqt5, zenity | kdialog | libnotify-bin, docker.io | podman
+Suggests: polkitd | policykit-1
+Homepage: https://github.com/darkiris4/gpu-game-guard
+Description: ask before a game starts while GPU workloads are running
+ GPU Game Guard watches for a game launch. When GPU containers or other
+ GPU-hungry services are running, it pauses the launch, asks what to do,
+ stops the workloads on request, starts the game again, and later offers to
+ start the workloads again.
+ .
+ It manages Docker and Podman containers automatically and can also manage
+ systemd services, commands and processes that are configured as targets.
+ A settings window and a system tray icon need python3-pyqt5; without it the
+ command line and the zenity, kdialog or notification dialogs still work.
+ .
+ The program runs as a systemd user service that is enabled for every user.

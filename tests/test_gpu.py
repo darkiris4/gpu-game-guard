@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -239,6 +241,129 @@ class VramTests(unittest.TestCase):
         with mock.patch("gpu_game_guard.util.log"):
             result = gpu.vram_by_container(self.proc / "nope")
         self.assertTrue(result is None or isinstance(result, dict))
+
+
+class VramByPidTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.proc = Path(self.tmp.name)
+
+    def drm_process(self, pid, text):
+        base = self.proc / str(pid) / "fdinfo"
+        base.mkdir(parents=True)
+        (base / "3").write_text(text)
+
+    def test_nvidia_is_summed_per_pid_and_authoritative(self):
+        def run(args, **_):
+            return "10, 100\n10, 50\n11, 7\nbad row\n"
+
+        result = gpu.vram_by_pid(self.proc, run)
+        self.assertEqual(dict(result), {10: 150, 11: 7})
+        self.assertTrue(result.authoritative)
+
+    def test_nvidia_with_no_compute_apps_is_empty_not_none(self):
+        self.assertEqual(gpu.vram_by_pid(self.proc, lambda args, **_: ""), {})
+
+    def test_fdinfo_fallback_is_not_authoritative(self):
+        self.drm_process(20, "drm-driver: amdgpu\ndrm-client-id: 1\ndrm-memory-vram: 4096 KiB\n")
+        result = gpu.vram_by_pid(self.proc, lambda args, **_: None)
+        self.assertEqual(dict(result), {20: 4})
+        self.assertFalse(result.authoritative)
+
+    def test_unmeasurable_is_none(self):
+        self.assertIsNone(gpu.vram_by_pid(self.proc, lambda args, **_: None))
+        self.assertIsNone(gpu.vram_by_pid(self.proc / "missing", lambda args, **_: None))
+
+    def test_memory_for_pids(self):
+        authoritative = gpu.PidMeasurement({1: 10, 2: 5})
+        self.assertEqual(gpu.memory_for_pids(authoritative, [1, 2, 3]), 15)
+        self.assertEqual(gpu.memory_for_pids(authoritative, [9]), 0)
+        self.assertEqual(gpu.memory_for_pids(authoritative, []), 0)
+        partial = gpu.PidMeasurement({1: 10})
+        partial.authoritative = False
+        self.assertEqual(gpu.memory_for_pids(partial, [1]), 10)
+        self.assertIsNone(gpu.memory_for_pids(partial, [9]))
+        self.assertIsNone(gpu.memory_for_pids(None, [1]))
+
+
+class CgroupHelperTests(unittest.TestCase):
+    def test_path_prefers_the_unified_line(self):
+        self.assertEqual(gpu.cgroup_path("12:cpu:/old\n0::/system.slice/a.service\n"), "/system.slice/a.service")
+        self.assertEqual(gpu.cgroup_path("1:name=systemd:/x.slice\n"), "/x.slice")
+        self.assertEqual(gpu.cgroup_path(""), "")
+
+    def test_in_unit_compares_whole_components(self):
+        text = "0::/system.slice/ollama.service\n"
+        self.assertTrue(gpu.cgroup_in_unit(text, "ollama.service"))
+        self.assertFalse(gpu.cgroup_in_unit(text, "llama.service"))
+        self.assertTrue(gpu.cgroup_in_unit("0::/system.slice/ollama.service/sub\n", "ollama.service"))
+
+    def test_service_from_cgroup(self):
+        cases = {
+            "0::/system.slice/ollama.service\n": ("system", "ollama.service"),
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/ollama.service\n": ("user", "ollama.service"),
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-obs-1.scope\n": None,
+            "0::/user.slice/user-1000.slice/session-3.scope\n": None,
+            "0::/user.slice/user-1000.slice/user@1000.service/init.scope\n": None,
+            "0::/system.slice/docker-" + "a" * 64 + ".scope\n": None,
+            "0::/\n": None,
+        }
+        for text, expected in cases.items():
+            with self.subTest(text):
+                self.assertEqual(gpu.service_from_cgroup(text), expected)
+
+
+class HostSpecTests(unittest.TestCase):
+    def config(self, *specs):
+        return lambda: types.SimpleNamespace(targets=list(specs))
+
+    def test_valid_specs_of_one_kind_and_a_bad_one_does_not_hide_the_rest(self):
+        good = types.SimpleNamespace(id="a", kind="service", unit="a.service", scope="system", enabled=True)
+        bad = types.SimpleNamespace(id="b", kind="service", unit="nope", scope="system", enabled=True)
+        off = types.SimpleNamespace(id="c", kind="service", unit="c.service", scope="user", enabled=False)
+        other = types.SimpleNamespace(id="d", kind="process", match="x", enabled=True)
+        with mock.patch("gpu_game_guard.util.log") as log:
+            self.assertEqual(gpu.usable_specs(self.config(bad, good, off, other), "service"), [good])
+            gpu.usable_specs(self.config(bad, good, off, other), "service")
+        self.assertEqual(log.call_count, 1)
+
+    def test_empty_and_invalid_lists_log_once_and_return_nothing(self):
+        with mock.patch("gpu_game_guard.util.log") as log:
+            self.assertEqual(gpu.usable_specs(self.config(), "command"), [])
+            self.assertEqual(gpu.usable_specs(self.config(), "command"), [])
+            self.assertEqual(gpu.usable_specs(lambda: types.SimpleNamespace(targets=None), "process"), [])
+            self.assertEqual(gpu.usable_specs(lambda: 1 / 0, "service"), [])
+        self.assertEqual(log.call_count, 3)
+
+    def test_find_spec_and_own_refs(self):
+        spec = types.SimpleNamespace(id="a", kind="process", match="x", enabled=True)
+        self.assertIs(gpu.find_spec(self.config(spec), "process", {"id": "a"}), spec)
+        with mock.patch("gpu_game_guard.util.log") as log:
+            self.assertIsNone(gpu.find_spec(self.config(spec), "process", {"id": "gone", "name": "Gone"}))
+        self.assertEqual(log.call_count, 1)
+        refs = [{"kind": "process", "runtime": "process"}, {"kind": "container", "runtime": "docker"}, "x"]
+        self.assertEqual(gpu.own_refs(refs, "process", "process"), refs[:1])
+        self.assertEqual(gpu.display_name(types.SimpleNamespace(id="a", label="")), "a")
+        self.assertEqual(gpu.display_name(types.SimpleNamespace(id="a", label="Label")), "Label")
+
+
+class RunProcessTests(unittest.TestCase):
+    def test_exit_status_is_returned_not_logged(self):
+        with mock.patch("gpu_game_guard.util.log") as log:
+            result = gpu.run_process([sys.executable, "-c", "import sys; print('x'); sys.exit(3)"])
+        self.assertEqual((result.returncode, result.stdout.strip()), (3, "x"))
+        log.assert_not_called()
+
+    def test_missing_command_is_none_and_logged_once(self):
+        with mock.patch("gpu_game_guard.util.log") as log:
+            self.assertIsNone(gpu.run_process(["no-such-command-xyz"]))
+            self.assertIsNone(gpu.run_process(["no-such-command-xyz"]))
+        self.assertEqual(log.call_count, 1)
+
+    def test_timeout_is_none(self):
+        with mock.patch("gpu_game_guard.util.log"):
+            self.assertIsNone(gpu.run_process([sys.executable, "-c", "import time; time.sleep(5)"], timeout=0.2))
 
 
 if __name__ == "__main__":

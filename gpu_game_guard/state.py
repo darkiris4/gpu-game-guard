@@ -15,12 +15,27 @@ def _key(ref: Ref) -> tuple:
     return (ref["kind"], ref["runtime"], ref["name"])
 
 
+_STR_KEYS = ("scope", "unit", "id", "cwd")
+
+
+def _clean(item: dict) -> Ref:
+    """The required keys of a valid ref plus those optional keys that hold a value of the right type."""
+    ref: Ref = {"kind": item["kind"], "runtime": item["runtime"], "name": item["name"]}
+    for key in _STR_KEYS:
+        if isinstance(item.get(key), str):
+            ref[key] = item[key]
+    cmdline = item.get("cmdline")
+    if isinstance(cmdline, list) and all(isinstance(part, str) for part in cmdline):
+        ref["cmdline"] = list(cmdline)
+    return ref
+
+
 def _normalise(item: Any) -> Optional[Ref]:
     """A stored entry as a Ref. The first version stored bare container names, which were Docker's."""
     if isinstance(item, str) and item:
         return {"kind": "container", "runtime": "docker", "name": item}
     if isinstance(item, dict) and all(isinstance(item.get(k), str) and item[k] for k in ("kind", "runtime", "name")):
-        return {"kind": item["kind"], "runtime": item["runtime"], "name": item["name"]}
+        return _clean(item)
     return None
 
 
@@ -30,8 +45,12 @@ _CLOCK_SKEW_SECONDS = 60.0  # how far ahead of the wall clock a stored timestamp
 def _stopped_list(value: Any) -> List[Ref]:
     if not isinstance(value, list):
         return []
-    refs = [_normalise(item) for item in value]
-    return [ref for ref in refs if ref is not None]
+    unique = {}
+    for item in value:
+        ref = _normalise(item)
+        if ref is not None:
+            unique.setdefault(_key(ref), ref)
+    return list(unique.values())
 
 
 def _stopped_at(value: Any, wall_time: float) -> float:
@@ -63,7 +82,7 @@ class State:
         """Record more stopped targets, keeping those already recorded."""
         merged = {_key(ref): ref for ref in self.stopped}
         for ref in refs:
-            merged.setdefault(_key(ref), {"kind": ref["kind"], "runtime": ref["runtime"], "name": ref["name"]})
+            merged.setdefault(_key(ref), _clean(ref))
         self.stopped = [merged[key] for key in sorted(merged)]
         self.stopped_at = wall_time
         self.game_seen = False

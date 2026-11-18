@@ -1,0 +1,13 @@
+#!/bin/sh
+# Makes sure the global enablement is gone once the unit file has been removed.
+set -e
+
+case "$1" in
+  remove|purge)
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl --global disable gpu-game-guard.service >/dev/null 2>&1 || true
+    fi
+    ;;
+esac
+
+exit 0
