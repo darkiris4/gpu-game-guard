@@ -274,7 +274,7 @@ case_rollback() {
   out="$(env -i PATH="$work/path-rb" HOME="$home" XDG_CONFIG_HOME="$home/config" XDG_STATE_HOME="$home/state" \
       GPU_GAME_GUARD_SRC="$src" GPU_GAME_GUARD_BIN_DIR="$home/bin" "$(command -v bash)" "$repo/install.sh" 2>&1)"; status=$?
   if [ "$status" -ne 0 ] && grep -q 'previous version was restored' <<<"$out" \
-     && [ "$("$home/bin/gpu-game-guard")" = previous ] \
+     && [ "$("$home/bin/gpu-game-guard" --version)" = previous ] \
      && [ "$(cat "$home/config/systemd/user/gpu-game-guard.service")" = "previous unit" ] \
      && [ "$(cat "$home/data/applications/gpu-game-guard.desktop")" = "previous entry" ] \
      && [ ! -e "$home/config/autostart/gpu-game-guard-tray.desktop" ] \
@@ -302,7 +302,7 @@ case_transactions() {
   echo "previous unit" > "$home/config/systemd/user/gpu-game-guard.service"
   out="$(env -i PATH="$work/path-tx1" HOME="$home" XDG_CONFIG_HOME="$home/config" XDG_STATE_HOME="$home/state" \
       GPU_GAME_GUARD_SRC="$src" GPU_GAME_GUARD_BIN_DIR="$home/bin" "$(command -v bash)" "$repo/install.sh" 2>&1)"; status=$?
-  if [ "$status" -ne 0 ] && [ "$("$home/bin/gpu-game-guard")" = previous ] \
+  if [ "$status" -ne 0 ] && [ "$("$home/bin/gpu-game-guard" --version)" = previous ] \
      && [ "$(cat "$home/config/systemd/user/gpu-game-guard.service")" = "previous unit" ]; then
     pass "a failing 'systemctl enable' restores the previous program and unit"
   else
