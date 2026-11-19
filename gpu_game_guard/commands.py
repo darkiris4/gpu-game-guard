@@ -2,8 +2,9 @@
 
 A target with a `check` is running while the check exits 0. A target without one has nothing to ask, so the runtime
 keeps a record in memory: after a `stop` command exits with status 0 the target counts as stopped (not running)
-until `start` runs for it, and it counts as running otherwise. The record lives in the runtime instance only, so a
-new process starts out assuming every check-less target is running."""
+until `start` runs for it or `release` drops it, and it counts as running otherwise. The guard persists the stopped
+refs, so `adopt` restores the record of every check-less target among them when the guard starts; without it a new
+process would assume every check-less target is running."""
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
@@ -72,6 +73,22 @@ class CommandRuntime:
         except Exception as exc:
             util.log(f"command {verb}: {exc}")
             return False
+
+    def adopt(self, refs: Sequence[Ref]) -> None:
+        """Mark the check-less targets among the refs loaded from the state file as stopped."""
+        for ref in gpu.own_refs(refs, "command", self.name):
+            target_id = ref.get("id")
+            if not isinstance(target_id, str):
+                continue
+            spec = gpu.find_spec(self._get_config, "command", ref, include_disabled=True)
+            if spec is None or not spec.check:
+                self._stopped.add(target_id)
+
+    def release(self, refs: Sequence[Ref]) -> None:
+        """Clear the stopped mark of refs the guard dropped without starting them."""
+        for ref in gpu.own_refs(refs, "command", self.name):
+            if isinstance(ref.get("id"), str):
+                self._stopped.discard(ref["id"])
 
     def stop(self, refs: Sequence[Ref]) -> None:
         own = gpu.own_refs(refs, "command", self.name)

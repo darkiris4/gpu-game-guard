@@ -858,21 +858,87 @@ class StricterValidationTests(unittest.TestCase):
         for good in ("ollama.service", "user@1000.service", "dev-sda.service", "a:b_c.d@e.service"):
             self.assertEqual(problems_for(dict(SERVICE, unit=good)), [], good)
 
-    def test_labels_must_be_unique_ignoring_case(self):
-        found = problems_for(dict(PROCESS, label="Media"), dict(PROCESS, id="other", label="media"))
-        self.assertEqual(len(found), 1)
-        self.assertIn('"targets"[1]', found[0])
-        self.assertIn("labels must differ", found[0])
-        self.assertIn('"targets"[0]', found[0])
-
-    def test_a_missing_label_counts_as_the_id(self):
-        found = problems_for(dict(PROCESS, id="obs"), dict(COMMAND, id="x", label="OBS"))
-        self.assertEqual(len(found), 1)
-        with self.assertRaises(ConfigError):
-            Config.from_json({"targets": [dict(PROCESS, id="obs"), dict(COMMAND, id="x", label="OBS")]})
+    def test_duplicate_and_case_different_labels_are_valid(self):
+        self.assertEqual(problems_for(dict(PROCESS, label="Media"), dict(PROCESS, id="other", label="media")), [])
+        self.assertEqual(problems_for(dict(PROCESS, id="obs"), dict(COMMAND, id="x", label="OBS")), [])
+        config = Config.from_json({"targets": [dict(PROCESS, id="obs"), dict(COMMAND, id="x", label="obs")]})
+        self.assertEqual([t.id for t in config.targets], ["obs", "x"])
 
     def test_distinct_labels_are_fine(self):
         self.assertEqual(problems_for(dict(PROCESS, label="A"), dict(PROCESS, id="b", label="B")), [])
+
+
+def nested(depth, leaf=1):
+    value = leaf
+    for _ in range(depth):
+        value = [value]
+    return value
+
+
+class DeepNestingTests(unittest.TestCase):
+    MESSAGE = "the file nests values too deeply"
+
+    def test_deep_extras_are_rejected_cleanly(self):
+        for depth in (150, 900):
+            with self.assertRaises(ConfigError) as caught:
+                Config.from_json({"future": nested(depth)})
+            self.assertEqual(caught.exception.reason, self.MESSAGE)
+            with self.assertRaises(ConfigError):
+                Config.from_json({"targets": [dict(PROCESS, extra=nested(depth))]})
+            with self.assertRaises(ConfigError):
+                Config.from_json({"games": {"steam:1": {"name": "x", "action": "ask", "more": nested(depth)}}})
+
+    def test_deep_values_in_known_keys_are_rejected_cleanly(self):
+        for key in ("poll_seconds", "runtimes", "enabled", "dialog"):
+            with self.assertRaises(ConfigError):
+                Config.from_json({key: nested(900)})
+            with self.assertRaises(ConfigError) as caught:
+                cfg.validate({key: nested(900)})
+            self.assertEqual(caught.exception.reason, self.MESSAGE)
+
+    def test_nesting_beyond_the_interpreter_limit_is_rejected_cleanly(self):
+        with self.assertRaises(ConfigError):
+            Config.from_json({"future": nested(100000)})
+        with self.assertRaises(ConfigError):
+            cfg.validate({"future": nested(100000)})
+
+    def test_moderate_nesting_still_loads_and_round_trips(self):
+        data = {"future": nested(50)}
+        self.assertEqual(Config.from_json(data).to_json()["future"], data["future"])
+        self.assertEqual(cfg.validate(data)[0][:11], "unknown key")
+
+    def test_loading_a_deep_file_reports_a_config_error_with_the_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text('{"future": ' + "[" * 500 + "]" * 500 + "}")
+            with self.assertRaises(ConfigError) as caught:
+                cfg.load(path)
+            self.assertIn(self.MESSAGE, str(caught.exception))
+
+
+class BackupModeTests(unittest.TestCase):
+    def test_copies_mirror_the_source_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            cfg.save(Config(), path)
+            os.chmod(path, 0o640)
+            cfg.save(Config(poll_seconds=2.0), path)
+            self.assertEqual(stat.S_IMODE(path.with_name("config.json.bak").stat().st_mode), 0o640)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o640)
+            path.write_text("{broken")
+            os.chmod(path, 0o600)
+            cfg.save(Config(), path)
+            (broken,) = path.parent.glob("config.json.broken-*")
+            self.assertEqual(stat.S_IMODE(broken.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_the_config_file_keeps_its_own_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text("{}")
+            os.chmod(path, 0o664)
+            cfg.save(Config(), path)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o664)
 
 
 if __name__ == "__main__":

@@ -569,3 +569,15 @@ class NotAvailableMemoryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UnknownMemoryHelperTests(unittest.TestCase):
+    def test_measured_pids_include_pids_listed_without_a_figure(self):
+        by_pid = gpu.PidMeasurement({1: 10})
+        by_pid.unknown.add(2)
+        self.assertEqual(gpu.measured_pids(by_pid), {1, 2})
+        self.assertEqual(gpu.measured_pids(None), set())
+        self.assertIsNone(gpu.memory_for_pids(by_pid, [1, 2]))
+
+    def test_root_pids_are_those_whose_parent_is_not_in_the_set(self):
+        self.assertEqual(gpu.root_pids({10: 1, 11: 10, 12: 10, 20: 1}), [10, 20])

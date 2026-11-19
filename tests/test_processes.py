@@ -342,7 +342,7 @@ class CaptureTests(Fixture):
         with mock.patch("gpu_game_guard.util.log") as log:
             self.runtime().stop([ref])
         self.assertEqual(ref["cmdline"], [])
-        self.assertIn("cannot be told", log.call_args[0][0])
+        self.assertIn("is not an executable that can be found", log.call_args[0][0])
 
     def test_no_executable_for_a_rewritten_title_is_unusable(self):
         self.add(10, "obs", cmdline=["obs: master process"])
@@ -355,12 +355,92 @@ class CaptureTests(Fixture):
         self.add(10, "obs", cmdline=["obs", "--x"])
         ref = dict(self.ref)
         self.runtime().stop([ref])
-        self.assertEqual(ref["cmdline"], ["obs", "--x"])
+        self.assertEqual(ref["cmdline"], ["/usr/bin/obs", "--x"])
+
+    def test_a_relative_path_is_resolved_against_the_process_cwd(self):
+        exe = self.executable("obs")
+        directory = os.path.dirname(exe)
+        self.add(10, "obs", cmdline=["./obs", "--x"], cwd=directory)
+        ref = dict(self.ref)
+        self.runtime().stop([ref])
+        self.assertEqual(ref["cmdline"], [exe, "--x"])
+
+    def test_a_bare_name_is_resolved_on_the_path_of_the_process_environment(self):
+        exe = self.executable("zzprog")
+        self.add(10, "zzprog", cmdline=["zzprog"], cwd="/")
+        (self.proc / "10" / "environ").write_bytes(f"HOME=/h\0PATH=/nonexistent:{os.path.dirname(exe)}\0".encode())
+        self.specs[:] = [spec(match="zzprog")]
+        ref = dict(self.ref)
+        self.runtime().stop([ref])
+        self.assertEqual(ref["cmdline"], [exe])
+
+    def test_an_unusable_line_is_logged_once_with_the_reason(self):
+        self.add(10, "obs", cmdline=["./gone", "--x"], cwd="/")
+        runtime = self.runtime()
+        with mock.patch("gpu_game_guard.util.log") as log:
+            runtime.stop([dict(self.ref)])
+            self.add(11, "obs", cmdline=["./gone", "--x"], cwd="/")
+            runtime.stop([dict(self.ref)])
+        self.assertEqual(log.call_count, 1)
+        self.assertIn("'./gone' is not an executable that can be found", log.call_args[0][0])
+
+    def test_a_rewritten_title_with_a_bare_interpreter_is_unusable(self):
+        for name in ("python3.11", "perl", "node", "bash", "sh", "java", "ruby"):
+            exe = self.executable(name)
+            self.add(10, "zzgg-daemon", cmdline=["zzgg-daemon: master"])
+            os.symlink(exe, self.proc / "10" / "exe")
+            self.specs[:] = [spec(match="zzgg*")]
+            ref = dict(self.ref)
+            with mock.patch("gpu_game_guard.util.log") as log:
+                self.runtime().stop([ref])
+            self.assertEqual(ref["cmdline"], [], name)
+            self.assertIn("interpreter", log.call_args[0][0])
+            shutil.rmtree(self.proc / "10", ignore_errors=True)
+            gpu._last_failure.clear()
+
+    def test_an_interpreter_with_a_script_argument_is_kept(self):
+        exe = self.executable("python3")
+        self.add(10, "zzgg-daemon", cmdline=["zzgg-daemon: worker", "-u", "app.py"])
+        os.symlink(exe, self.proc / "10" / "exe")
+        self.specs[:] = [spec(match="zzgg*")]
+        ref = dict(self.ref)
+        self.runtime().stop([ref])
+        self.assertEqual(ref["cmdline"], [exe, "-u", "app.py"])
 
     def test_the_scan_values_stay_when_the_process_is_gone_before_the_stop(self):
         ref = dict(self.ref, cmdline=["obs"], cwd="/tmp")
         self.runtime().stop([ref])
         self.assertEqual((ref["cmdline"], ref["cwd"]), (["obs"], "/tmp"))
+
+
+class CountTests(Fixture):
+    def test_helpers_of_one_application_count_once(self):
+        self.specs[:] = [spec(match="chrome")]
+        self.add(10, "chrome", ppid=1)
+        for pid in range(11, 71):
+            self.add(pid, "chrome", ppid=10)
+        found = self.runtime().running_gpu_targets()
+        self.assertEqual(len(found), 1)
+        runtime = self.runtime()
+        runtime.stop([found[0].ref])
+        self.assertEqual(len(self.signals), 61)
+
+    def test_more_than_the_limit_of_root_processes_is_refused(self):
+        self.specs[:] = [spec(match="chrome")]
+        for pid in range(10, 10 + 26):
+            self.add(pid, "chrome", ppid=1)
+        with mock.patch("gpu_game_guard.util.log") as log:
+            self.assertEqual(self.runtime().running_gpu_targets(), [])
+        self.assertIn("too broad", log.call_args[0][0])
+
+    def test_protection_still_applies_to_each_process(self):
+        self.specs[:] = [spec(match="custom-*")]
+        self.add(10, "custom-protected", ppid=1)
+        self.add(11, "custom-ok", ppid=10)
+        found = self.runtime().running_gpu_targets()
+        self.assertEqual(len(found), 1)
+        self.runtime().stop([found[0].ref])
+        self.assertEqual([pid for pid, _ in self.signals], [11])
 
 
 class StartTests(Fixture):
@@ -451,14 +531,47 @@ class StartTests(Fixture):
         with mock.patch("gpu_game_guard.util.log"):
             self.assertEqual(self.runtime().start([self.ref]), [self.ref])
 
-    def test_an_immediate_zero_exit_is_fine_and_a_running_child_is_watched_for_two_seconds(self):
+    def test_an_immediate_zero_exit_is_fine_and_a_running_child_is_watched_for_one_and_a_half_seconds(self):
         self.child = types.SimpleNamespace(poll=lambda: 0)
         self.assertEqual(self.runtime().start([self.ref]), [])
         self.child = types.SimpleNamespace(poll=lambda: None)
         self.now[0] = 0.0
         self.assertEqual(self.runtime().start([self.ref]), [])
-        self.assertGreaterEqual(self.now[0], 2.0)
-        self.assertLess(self.now[0], 3.0)
+        self.assertGreaterEqual(self.now[0], 1.5)
+        self.assertLess(self.now[0], 2.0)
+
+    def test_several_programs_share_one_watch(self):
+        self.specs[:] = [spec(id=f"p{n}", match=f"pp{n}") for n in range(5)]
+        refs = [dict(self.ref, id=f"p{n}") for n in range(5)]
+        self.assertEqual(self.runtime().start(refs), [])
+        self.assertEqual(len(self.started), 5)
+        self.assertLessEqual(self.now[0], 1.6)
+
+    def test_only_the_programs_that_exited_non_zero_are_failed(self):
+        self.specs[:] = [spec(id=f"p{n}", match=f"pp{n}") for n in range(3)]
+        refs = [dict(self.ref, id=f"p{n}") for n in range(3)]
+        codes = iter([0, 7, None])
+        runtime = self.runtime()
+        runtime._popen = lambda *a, **k: types.SimpleNamespace(poll=lambda code=next(codes): code)
+        with mock.patch("gpu_game_guard.util.log"):
+            self.assertEqual(runtime.start(refs), [refs[1]])
+
+    def test_a_missing_systemd_run_is_logged_once(self):
+        gpu._last_failure.clear()
+        runtime = self.runtime()
+        with mock.patch("gpu_game_guard.util.log") as log:
+            runtime.start([self.ref])
+            runtime.start([self.ref])
+        lines = [c[0][0] for c in log.call_args_list if "lifetime" in c[0][0]]
+        self.assertEqual(len(lines), 1)
+
+    def test_an_unanswering_user_manager_is_logged(self):
+        gpu._last_failure.clear()
+        self.missing = set()
+        self.manager = None
+        with mock.patch("gpu_game_guard.util.log") as log:
+            self.runtime().start([self.ref])
+        self.assertTrue([c for c in log.call_args_list if "share the guard's lifetime" in c[0][0]])
 
     def test_a_late_exit_during_the_watch_is_a_failure(self):
         codes = iter([None, None, 1])

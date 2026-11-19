@@ -111,6 +111,25 @@ class CommandRuntimeTests(unittest.TestCase):
         runtime.start(refs)
         self.assertEqual([t.name for t in runtime.running_gpu_targets()], ["A", "B"])
 
+    def test_release_clears_the_stopped_mark_without_running_start(self):
+        ref = {"kind": "command", "runtime": "command", "name": "Models", "id": "unload"}
+        runtime = self.runtime()
+        runtime.stop([ref])
+        self.assertEqual(runtime.running_gpu_targets(), [])
+        self.calls.clear()
+        runtime.release([ref, {"kind": "service", "runtime": "service", "id": "unload"}])
+        self.assertEqual(len(runtime.running_gpu_targets()), 1)
+        self.assertEqual(self.calls, [])
+
+    def test_adopt_restores_the_stopped_mark_of_a_target_without_a_check(self):
+        self.specs = [spec(id="a", label="A"), spec(id="b", label="B", check=["probe"])]
+        refs = [{"kind": "command", "runtime": "command", "name": n, "id": n.lower()} for n in ("A", "B")]
+        runtime = self.runtime()
+        runtime.adopt(refs + [{"kind": "command", "runtime": "command", "name": "X"}])
+        self.assertEqual([t.name for t in runtime.running_gpu_targets()], ["B"])
+        runtime.start(refs)
+        self.assertEqual([t.name for t in runtime.running_gpu_targets()], ["A", "B"])
+
     def test_non_zero_exit_is_logged_once(self):
         self.results["stop-it"] = gpu.CommandResult(2, "", "bad\n")
         ref = {"kind": "command", "runtime": "command", "name": "Models", "id": "unload"}

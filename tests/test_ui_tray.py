@@ -122,7 +122,8 @@ class TrayTests(unittest.TestCase):
         c.pause_hour_action.trigger()
         c.pause_until_action.trigger()
         c.resume_action.trigger()
-        c.settings_action.trigger()
+        with mock.patch("gpu_game_guard.ui.tray.settings_running", return_value=False):
+            c.settings_action.trigger()
         c.quit_action.trigger()
         self.assertEqual(self.calls, [("pause", 3600.0), ("pause", None), "resume", "settings", "quit"])
 
@@ -227,6 +228,21 @@ class TrayTests(unittest.TestCase):
         self.assertEqual(self.fake.tooltips[-1],
                          "GPU Game Guard: waiting for your answer (A &amp; B &lt;b&gt;x&lt;/b&gt;)")
         self.assertNotIn("\u202e", c.tooltip)
+
+    def test_the_menu_entry_does_not_start_a_second_settings_window(self):
+        c = self.make(status())
+        with mock.patch("gpu_game_guard.ui.tray.settings_running", return_value=True):
+            c.settings_action.trigger()
+        self.assertEqual(self.calls, [])
+        with tempfile.TemporaryDirectory() as tmp:
+            held = singleton.acquire("settings", Path(tmp))
+            real = singleton.acquire
+            with mock.patch("gpu_game_guard.ui.tray.singleton.acquire", lambda n: real(n, Path(tmp))):
+                c.settings_action.trigger()
+                self.assertEqual(self.calls, [])
+                held.release()
+                c.settings_action.trigger()
+                self.assertEqual(self.calls, ["settings"])
 
     def test_click_does_not_start_a_second_settings_window(self):
         c = self.make(status())

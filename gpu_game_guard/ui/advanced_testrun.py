@@ -32,6 +32,12 @@ def target_from_candidate(candidate: Any) -> Target:
     return Target(candidate.kind, candidate.kind, candidate.label, vram_mib=candidate.vram_mib)
 
 
+def _natural_width(widget: "QtWidgets.QWidget") -> int:
+    """The width `widget` needs for its text with the theme applied, so that a column sized by it never clips."""
+    widget.ensurePolished()
+    return widget.sizeHint().width()
+
+
 class TestRunTab(ScrolledTab):
     __test__ = False  # not a test case, despite the name
 
@@ -135,6 +141,8 @@ class TestRunTab(ScrolledTab):
         previous = {key: check.isChecked() for key, check in self.checks.items()}
         clear_layout(self.running_box)
         self.checks, self._candidates = {}, {}
+        badge_width = max(_natural_width(Badge(title)) for title in KIND_TITLE.values())
+        note_width = _natural_width(styled_label("not managed", "small", wrap=False))
         for candidate in candidates:
             line = QtWidgets.QHBoxLayout()
             line.setSpacing(SPACE)
@@ -144,7 +152,7 @@ class TestRunTab(ScrolledTab):
             risk = KIND_RISK.get(candidate.kind, "medium")
             line.addWidget(check, 1)
             kind_badge = Badge(KIND_TITLE.get(candidate.kind, candidate.kind), RISK_BADGE[risk])
-            kind_badge.setFixedWidth(84)
+            kind_badge.setFixedWidth(badge_width)
             kind_badge.setAlignment(Qt.AlignCenter)
             line.addWidget(kind_badge)
             memory = styled_label(mib_text(candidate.vram_mib), "small", wrap=False)
@@ -152,7 +160,7 @@ class TestRunTab(ScrolledTab):
             memory.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             line.addWidget(memory)
             note = styled_label("" if managed[candidate.key] else "not managed", "small", wrap=False)
-            note.setFixedWidth(84)
+            note.setFixedWidth(note_width)
             line.addWidget(note)
             holder = QtWidgets.QWidget()
             holder.setLayout(line)

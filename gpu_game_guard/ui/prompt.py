@@ -40,8 +40,8 @@ MAX_WIDTH = 640  # widest the dialog gets at the base font size, in pixels
 MIN_WIDTH = 520
 HEIGHT_FRACTION = 0.8  # the most of the screen's height the dialog may take
 MIN_LIST_HEIGHT = 76  # the target list always shows at least one card
-ENTER_GUARD_MS = 700  # Enter and Return are ignored for this long after the window appears
-HEADLESS_PLATFORMS = ("offscreen", "minimal", "minimalegl", "vnc", "linuxfb")
+ENTER_GUARD_MS = 700  # Return, Enter and Space are ignored for this long after the window appears
+HEADLESS_PLATFORMS = ("offscreen", "minimal", "minimalegl", "vnc")
 LAUNCH_LABELS = {"stop": "&Stop and launch", "anyway": "Launch &anyway", "cancel": "&Cancel"}
 RESTART_LABELS = {"restart": "&Restart", "later": "Ask me &later", "leave": "Leave &stopped"}
 REMEMBER_LABEL = "&Remember my choice for this game"
@@ -209,8 +209,9 @@ def dialog_class() -> type:
 
     class PromptDialog(QtWidgets.QDialog):
         """The launch or restart question. `choice` holds the answer; it starts as the answer for a dismissed window
-        (cancel for a launch, later for a restart) and only a button changes it. Enter and Return are ignored for
-        `ENTER_GUARD_MS` after the window appears, so a key press meant for the game cannot answer the question."""
+        (cancel for a launch, later for a restart) and only a button changes it. Return, Enter and Space are ignored
+        for `ENTER_GUARD_MS` after the window appears, so a key press meant for the game cannot answer the question;
+        mouse clicks are not."""
 
         def __init__(self, payload: Mapping[str, Any], clock: Callable[[], float] = time.monotonic):
             super().__init__()
@@ -304,10 +305,9 @@ def dialog_class() -> type:
             if self.kind == "launch":
                 full = theme.safe_text(self.payload.get("title") or "").strip() or "this game"
                 title = self._title_text(headline)
-                count = len(self.targets)
+                these, verb = dialogs.subject_phrase([t.kind for t, _ in self.targets])
                 head = f"Launching {title}"
-                sub = (f"GPU Game Guard paused this launch because {count} "
-                       f"{'program is' if count == 1 else 'programs are'} using the GPU.")
+                sub = f"GPU Game Guard paused this launch because {these} {verb} access to the GPU."
                 if title != full:
                     theme.plain_tooltip(headline, f"Launching {full}")
             else:
@@ -406,7 +406,8 @@ def dialog_class() -> type:
 
         def eventFilter(self, obj: Any, event: Any) -> bool:  # noqa: N802 (Qt naming)
             if (event.type() in (QtCore.QEvent.KeyPress, QtCore.QEvent.KeyRelease)
-                    and event.key() in (Qt.Key_Return, Qt.Key_Enter) and not self.enter_allowed()):
+                    and event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space)
+                    and not self.enter_allowed()):
                 return True
             return super().eventFilter(obj, event)
 
@@ -435,11 +436,11 @@ def dialog_class() -> type:
                 return
             floor = min(content, int(MIN_LIST_HEIGHT * theme.font_scale()))
             limit = int(available * HEIGHT_FRACTION)
-            least = self.layout().minimumSize().height() - content + floor  # with the list at its smallest
+            width = min(max(self.sizeHint().width(), self.minimumWidth()), self.maximumWidth())
+            total = self._height_for(width)  # includes the wrapped headline's growth at this width
+            least = total - content + floor  # with the list at its smallest
             if limit < least:  # a very small screen: use all of it before clipping
                 limit = min(available, least)
-            width = min(max(self.sizeHint().width(), self.minimumWidth()), self.maximumWidth())
-            total = self._height_for(width)
             if total > limit:
                 area.setFixedHeight(max(floor, content - (total - limit)))
                 self.layout().invalidate()

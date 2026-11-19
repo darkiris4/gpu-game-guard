@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -257,10 +258,119 @@ class RealModelTests(unittest.TestCase):
         self.assertEqual(len(problems), 1)
         self.assertIn("could not be saved", problems[0])
         self.assertNotIn(".tmp", problems[0])
-        self.assertNotIn(str(blocker), problems[0])
+        self.assertIn(str(model.path), problems[0])
+        self.assertTrue(model.dirty)
+
+    def test_a_file_deleted_since_it_was_read_is_written_again_with_every_setting(self):
+        base = Config(poll_seconds=2.5)
+        base.games = {"steam:1": GameRule("One", "stop")}
+        base.targets = [TargetSpec(id="svc", kind="service", label="Svc", unit="svc.service")]
+        configmod.save(base, self.path)
+        model = self.model()
+        model.update(on_launch="stop")
+        self.path.unlink()
+        self.assertEqual(model.apply(), [])
+        saved = configmod.load(self.path)
+        self.assertEqual(saved.poll_seconds, 2.5)
+        self.assertEqual(saved.on_launch, "stop")
+        self.assertEqual(saved.games, base.games)
+        self.assertEqual(saved.targets, base.targets)
+        self.assertEqual(model.config, saved)
+        self.assertEqual(model.notices, ["The configuration file was removed; it has been written again with "
+                                         "your settings."])
+
+    def test_an_unreadable_file_replaced_by_the_defaults_says_when_no_copy_could_be_made(self):
+        if os.geteuid() == 0:
+            self.skipTest("file permissions do not apply to root")
+        self.path.write_text("{ not json", encoding="utf-8")
+        self.path.chmod(0)
+        self.addCleanup(lambda: self.path.exists() and self.path.chmod(0o600))
+        model = self.model()
+        self.assertIn("cannot be read", model.load_error)
+        model.accept_defaults()
+        self.assertEqual(model.apply(), [])
+        self.assertEqual(list(self.dir.glob("config.json.broken-*")), [])
+        self.assertEqual(len(model.notices), 1)
+        self.assertIn("no backup copy", model.notices[0])
+        self.assertIn("cannot be read", model.notices[0])
+        self.assertNotIn("was kept as", model.notices[0])
+        self.path.chmod(0o600)
+        self.assertEqual(configmod.load(self.path), Config())
+
+    def test_a_file_that_became_invalid_after_it_was_read_says_what_to_do(self):
+        configmod.save(Config(), self.path)
+        model = self.model()
+        model.update(on_launch="stop")
+        self.path.write_text("{ not json", encoding="utf-8")
+        problems = model.apply()
+        self.assertEqual(len(problems), 1)
+        self.assertIn(str(self.path), problems[0])
+        self.assertIn("Revert", problems[0])
+        self.assertIn("Raw config", problems[0])
+        self.assertEqual(self.path.read_text(encoding="utf-8"), "{ not json")
+        model.revert()
+        self.assertTrue(model.load_error)
+        self.assertEqual(model.raw_file_text, "{ not json")
+
+    def test_a_read_only_directory_is_reported_with_the_path_and_the_reason(self):
+        if os.geteuid() == 0:
+            self.skipTest("file permissions do not apply to root")
+        configmod.save(Config(), self.path)
+        model = self.model()
+        model.update(on_launch="stop")
+        self.dir.chmod(0o500)
+        self.addCleanup(lambda: self.dir.chmod(0o700))
+        problems = model.apply()
+        self.assertEqual(len(problems), 1)
+        self.assertIn(str(self.path), problems[0])
+        self.assertIn("Permission denied", problems[0])
+        self.assertNotIn(".tmp", problems[0])
         self.assertTrue(model.dirty)
 
     # discovery
+
+    def test_shutdown_returns_at_once_during_a_slow_scan_and_drops_its_result(self):
+        gate = threading.Event()
+        started = threading.Event()
+
+        def slow(config):
+            started.set()
+            gate.wait(10)
+            return [candidate("late")]
+
+        model = SettingsModel(self.path, self.dir / "state", discover=slow, runner=lambda argv: (0, ""))
+        changes = []
+        model.changed.connect(lambda: changes.append(1))
+        model.scan()
+        self.assertTrue(started.wait(5))
+        changes.clear()
+        began = time.monotonic()
+        model.shutdown()
+        self.assertLess(time.monotonic() - began, 1.0)
+        self.assertFalse(model.scanning)
+        self.assertFalse(model.scan())
+        gate.set()
+        for _ in range(20):
+            time.sleep(0.01)
+            self.app.processEvents()
+        self.assertEqual(changes, [])
+        self.assertEqual(model.cached_candidates(), [])
+
+    def test_a_failed_scan_is_recorded_and_cleared_by_the_next_good_one(self):
+        outcome = [RuntimeError("docker is down")]
+
+        def discover(config):
+            if outcome:
+                raise outcome.pop()
+            return []
+
+        model = SettingsModel(self.path, self.dir / "state", discover=discover, runner=lambda argv: (0, ""),
+                              threaded=False)
+        model.scan()
+        self.assertEqual(model.scan_error, "docker is down")
+        self.assertTrue(model.candidates_loaded)
+        model.scan()
+        self.assertEqual(model.scan_error, "")
 
     def test_a_scan_runs_in_a_worker_thread_and_lands_on_the_calling_thread(self):
         gate = threading.Event()

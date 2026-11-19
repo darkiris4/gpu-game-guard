@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,6 +26,7 @@ class Status:
 
     version: str = ""
     pid: int = 0
+    pid_start: int = 0  # the process's start time in clock ticks since boot (/proc), 0 when unknown
     updated: float = 0.0  # wall time of the write
     state: str = "watching"  # "watching", "paused", "disabled", "asking", "game-running" or "restart-pending"
     paused_until: Optional[float] = None  # wall time; None when not paused; float("inf") when paused with no end
@@ -39,6 +41,41 @@ class Status:
     valid_for: float = 15.0  # seconds after `updated` for which a reader may take this status as current
 
 
+def process_start(pid: int) -> int:
+    """The start time of process `pid` in clock ticks since boot, read from /proc/<pid>/stat; 0 when it cannot
+    be read, for example off Linux or when the process is gone."""
+    try:
+        text = Path(f"/proc/{int(pid)}/stat").read_text(encoding="utf-8", errors="replace")
+        # the command name (field 2) may hold spaces and parentheses, so count fields after its closing one
+        return int(text[text.rindex(")") + 2:].split()[19])
+    except (OSError, ValueError, IndexError, OverflowError):
+        return 0
+
+
+def pid_alive(pid: int) -> bool:
+    """True when a process with this id exists; a process of another user counts as existing."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except (OSError, OverflowError):
+        return False
+    return True
+
+
+def _same_process(pid: int, recorded_start: int) -> bool:
+    """False when `pid` is gone or now belongs to a process that started at another time than recorded."""
+    if not pid_alive(pid):
+        return False
+    if recorded_start > 0:
+        current = process_start(pid)
+        if current > 0 and current != recorded_start:
+            return False
+    return True
+
+
 def status_dir(directory: Optional[Path] = None) -> Path:
     return Path(directory) if directory is not None else xdg_state_home() / "gpu-game-guard"
 
@@ -51,7 +88,7 @@ def _number(value: Any, default: float) -> float:
 
 def write_status(status: Status, directory: Optional[Path] = None) -> None:
     data = {
-        "version": status.version, "pid": status.pid, "updated": status.updated, "state": status.state,
+        "version": status.version, "pid": status.pid, "pid_start": status.pid_start, "updated": status.updated, "state": status.state,
         "paused": status.paused,
         "paused_until": status.paused_until if status.paused_until is not None and math.isfinite(status.paused_until) else None,
         "game": status.game, "stopped": list(status.stopped), "config_ok": status.config_ok,
@@ -62,8 +99,9 @@ def write_status(status: Status, directory: Optional[Path] = None) -> None:
 
 
 def read_status(directory: Optional[Path] = None, max_age: float = 15.0) -> Optional[Status]:
-    """The status last written, or None when there is none, it cannot be read, or it is older than `max_age`
-    seconds, or than the status's own `valid_for` when that is longer (the guard is then taken to be not running).
+    """The status last written, or None when there is none, it cannot be read, it is older than `max_age`
+    seconds, or than the status's own `valid_for` when that is longer, or the process that wrote it is gone or
+    has been replaced by another one with the same id (the guard is then taken to be not running).
     A guard that blocks on a dialog publishes a long `valid_for` so it is not mistaken for a stopped one."""
     try:
         data = json.loads((status_dir(directory) / STATUS_FILE).read_text(encoding="utf-8"))
@@ -75,6 +113,10 @@ def read_status(directory: Optional[Path] = None, max_age: float = 15.0) -> Opti
     valid_for = min(max(_number(data.get("valid_for"), 15.0), 0.0), MAX_VALID_FOR)
     if time.time() - updated > max(max_age, valid_for):
         return None
+    pid = int(_number(data.get("pid"), 0))
+    pid_start = int(_number(data.get("pid_start"), 0))
+    if pid > 0 and not _same_process(pid, pid_start):
+        return None
     paused = data.get("paused") is True
     until = data.get("paused_until")
     paused_until = None
@@ -84,13 +126,30 @@ def read_status(directory: Optional[Path] = None, max_age: float = 15.0) -> Opti
     game = data.get("game")
     error = data.get("config_error")
     return Status(
-        version=str(data.get("version", "")), pid=int(_number(data.get("pid"), 0)), updated=updated,
+        version=str(data.get("version", "")), pid=pid, pid_start=pid_start, updated=updated,
         state=str(data.get("state", "watching")), paused_until=paused_until, paused=paused,
         game=game if isinstance(game, dict) else None,
         stopped=[ref for ref in stopped if isinstance(ref, dict)] if isinstance(stopped, list) else [],
         config_ok=data.get("config_ok") is not False, config_error=error if isinstance(error, str) else None,
         dialog=str(data.get("dialog", "")), can_ask=data.get("can_ask") is not False,
         targets=int(_number(data.get("targets"), 0)), valid_for=valid_for)
+
+
+def remove_status(directory: Optional[Path] = None, pid: Optional[int] = None) -> None:
+    """Delete the status file, so a stopped guard never reads as running. With `pid`, a file written by another
+    process is left alone. A file that is already gone or cannot be removed is ignored."""
+    path = status_dir(directory) / STATUS_FILE
+    if pid is not None:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, RecursionError):
+            data = None
+        if isinstance(data, dict) and int(_number(data.get("pid"), 0)) not in (0, pid):
+            return
+    try:
+        path.unlink()
+    except OSError:
+        pass
 
 
 def append_event(kind: str, message: str, directory: Optional[Path] = None, **fields: Any) -> None:

@@ -23,9 +23,10 @@ and the tray always use the default path.
 | `gpu-game-guard check` | diagnose the whole setup, including whether the config file is valid |
 
 `config validate` reports unknown keys (typos such as `on_lauch`) with a did-you-mean hint and exits 1,
-including unknown keys inside a game rule or a target. Loading a file with unknown keys still works: they
-are ignored and a warning is logged to stderr. A wrong type, a value outside the allowed set or a number
-outside its range makes the file invalid.
+including unknown keys inside a game rule or a target. Loading a file with unknown keys still works: the
+guard ignores them, logs a warning to stderr and writes them back unchanged on every save. A wrong type, a
+value outside the allowed set, a number outside its range or values nested more than 100 levels deep makes the
+file invalid.
 
 Logs go to stderr, which the systemd journal captures. Exit codes: 0 ok; 1 a failed check, an invalid
 config or another failed command; 2 usage error; 78 when `run` refuses to start on an invalid config (the
@@ -33,7 +34,11 @@ service does not restart on 78); 130 on Ctrl-C.
 
 Files are written atomically and keep the existing file's permissions (a new file gets 0644 as masked by
 the umask; a symlinked file is written through). Rewriting the config (the settings window, `targets`,
-`presets add`, a remembered choice) saves it in a fixed layout with sorted keys.
+`presets add`, a remembered choice) saves it in a fixed layout with sorted keys. Each save is a read-modify-write
+under a lock on `config.json.lock` (next to the file, mode 0600), so two writers do not lose each other's
+changes; without the lock the save goes ahead after a warning. Before a save replaces a valid file with
+different content, it is copied to `config.json.bak`, one rolling backup with the same mode. A file that could
+not be used is copied to `config.json.broken-<time>` instead, and the newest five are kept.
 
 ## Keys
 
@@ -82,6 +87,11 @@ the umask; a symlinked file is written through). Rewriting the config (the setti
 The list of what was stopped lives in `$XDG_STATE_HOME/gpu-game-guard/state.json` until it has been dealt
 with, so it survives a crash or a reboot.
 
+When a start fails, the targets stay in that list and are tried again after `dialog_retry_seconds`, then after
+twice that, four times and so on, never more than an hour apart (or `dialog_retry_seconds` when that is longer).
+After five failures in a row to start the same targets, the guard says so once in the log and then retries
+hourly without dialogs or notifications. They stay recorded; `gpu-game-guard state clear` forgets them.
+
 ### dialog
 
 `auto` uses the Qt window when `python3-pyqt5` is installed and a display exists, then zenity or kdialog
@@ -105,7 +115,7 @@ Keys common to every kind:
 | --- | --- | --- | --- |
 | `id` | string | required | A short unique name, matching `[a-z0-9][a-z0-9_-]{0,39}`. It is how the guard remembers the target across a stop and a restart, so a target renamed or removed while it is stopped can no longer be started again by the guard. |
 | `kind` | string | required | `service`, `command` or `process`. |
-| `label` | string | the `id` | The name shown in dialogs and lists. |
+| `label` | string | the `id` | The name shown in dialogs and lists. Labels need not be unique; ids must be. |
 | `enabled` | boolean | `true` | `false` keeps the entry without managing it. |
 
 An invalid entry is reported by `config validate` with its index and id. At run time an invalid entry is
@@ -117,7 +127,7 @@ A systemd service, stopped and started with `systemctl`.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `unit` | string | required | The unit name. Must end in `.service` and contain no spaces or `/`. |
+| `unit` | string | required | The unit name: letters, digits and `:_.@-`, ending in `.service`; no spaces or `/`. |
 | `scope` | string | `"system"` | `"system"`, or `"user"` for a unit of the user's own systemd instance (`systemctl --user`). |
 
 The service counts as running while `systemctl is-active` says `active`. Its GPU memory is the memory of the
@@ -140,10 +150,12 @@ Commands are run directly, never through a shell. To use a pipe, a redirection o
 yourself: `["sh", "-c", "..."]`. A list entry must not be empty. The GPU memory of a command target is never
 measured, so the dialog shows "GPU memory use unknown" for it.
 
-**Always give a `check`.** Without one the target counts as running whenever it is enabled, so after `stop`
-the guard still sees it as running, concludes it could not be stopped, records nothing, and never runs
-`start`. With a `check` that exits 0 only while the workload holds the GPU, the target is offered only when
-there is something to stop, and is recorded as stopped once the check fails.
+**Give a `check` when you can.** With a `check` that exits 0 only while the workload holds the GPU, the target
+is offered only when there is something to stop, and is recorded as stopped once the check fails. Without one
+the target is offered whenever it is enabled: the guard counts it as stopped once its `stop` command has
+exited with status 0, and as running again once `start` has run or the target has been released (the answer
+was **Leave stopped**, `after_game` is `leave`, or `gpu-game-guard state clear`). The guard rebuilds that
+record from `state.json` when it restarts. It is the guard's belief, not a measurement.
 
 ### process
 
@@ -151,17 +163,27 @@ A running program, matched by name, asked to close with SIGTERM and started agai
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `match` | string | required | A glob (`fnmatch`) matched, case-sensitively, against the name of the user's processes. No `/`. |
+| `match` | string | required | A glob (`fnmatch`) matched, case-sensitively, against the name of the user's processes. 3 to 15 characters, at least 3 of them not `*?[]`, no `/`. |
 | `restart` | boolean | `true` | Start the same command line again after the game, detached, in the same working directory. |
 
 - `match` is compared with the process name as the kernel reports it (`/proc/<pid>/comm`), which is cut to
-  15 characters. A pattern such as `obs` or `firefox*` is typical; a pattern made only of wildcards is
-  refused when the guard runs.
+  15 characters, hence the limit. A pattern such as `obs` or `firefox*` is typical. A pattern that matches
+  more than 25 root processes (matching processes whose parent is not itself a match, so the helpers of a
+  multi-process program do not count) is refused when the guard runs as too broad.
 - Only the current user's processes are considered. The guard itself and its parent processes are never
   signalled, and neither is anything on the [protect list](#protect).
 - Processes are terminated, never killed: the guard sends SIGTERM, waits up to five seconds and logs what
   stayed. It never sends SIGKILL. **Unsaved work in the program can be lost**, and a restarted program
   starts with the command line it had, which may not restore its previous state.
+- The command line and working directory are read when the program is stopped, not when it is scanned. A
+  relative first entry is made absolute (against the process's working directory, or its `PATH`). The program
+  is restarted through `systemd-run --user --scope` when that and the user manager are available, so it
+  survives a restart of the guard; otherwise it shares the guard's lifetime, and the log says so once.
+- A program whose command line cannot be told is reported as failed to restart, with the reason logged once:
+  nothing readable, an executable that cannot be found, or a program that renamed itself to a bare interpreter
+  (`python3`, `bash`, `node` and the like with no script argument), which the guard will not start with
+  nothing to run. A restarted program that exits with an error within about a second and a half counts as
+  failed too.
 - With `restart: false` the program stays closed after the game.
 
 ### Risk levels
@@ -265,17 +287,19 @@ In the Basic page, switching a container off adds its exact name to this list.
 
 ## Files the guard writes
 
-Besides `config.json`, these files exist, all small and all safe to delete while the service is stopped.
+Besides `config.json`, these files exist, all small and all safe to delete while the service is stopped. The
+four state files are written with mode 0600 and the state directory has mode 0700; existing ones are tightened
+to that when the current user owns them.
 
 | File | Location | Holds |
 | --- | --- | --- |
-| `state.json` | `$XDG_STATE_HOME/gpu-game-guard/` (usually `~/.local/state/gpu-game-guard/`) | what the guard stopped and has not yet started again, so the restart question survives a crash or a reboot. Deleting it makes the guard forget that anything is stopped. |
-| `status.json` | same directory | what the guard is doing; rewritten on every pass, and older than 15 seconds means the service is not running. `gpu-game-guard status` and the tray read it. |
+| `state.json` | `$XDG_STATE_HOME/gpu-game-guard/` (usually `~/.local/state/gpu-game-guard/`) | what the guard stopped and has not yet started again, so the restart question survives a crash or a reboot. Deleting it, or `gpu-game-guard state clear`, makes the guard forget that anything is stopped. An unreadable file is reported and copied to `state.json.corrupt-<time>` (mode 0600, the newest three kept) before it is replaced. |
+| `status.json` | same directory | what the guard is doing; rewritten on every pass and removed when the guard stops cleanly. It counts as current for 15 seconds, or for its `valid_for` (900 seconds) while the guard waits for an answer, for a restart or for a stop or start to finish. It also names the guard's process: when that process is gone, or its pid now belongs to another process, readers say the service is not running. `gpu-game-guard status` and the tray read it. |
 | `events.jsonl` | same directory | the last 300 events, one JSON object per line. |
 | `pause.json` | same directory | a pause: `{"until": <unix time>}`, or `{"until": null}` until resumed. Created by `gpu-game-guard pause`, the tray and the settings window, removed by `resume`. A pause whose time has passed is ignored. |
 | `ui.json` | next to `config.json` | the settings window's mode (`"basic"` or `"advanced"`) and size. |
 
-`status.json` holds `version`, `pid`, `updated` (unix time), `state` (`watching`, `paused`, `disabled`,
+`status.json` holds `version`, `pid`, `pid_start` (the process's start time in clock ticks since boot), `updated` (unix time), `valid_for` (seconds), `state` (`watching`, `paused`, `disabled`,
 `asking`, `game-running` or `restart-pending`), `paused`, `paused_until`, `game` (`id` and `title`),
 `stopped` (the refs of what the guard stopped), `config_ok`, `config_error`, `dialog`, `can_ask` and
 `targets`. `gpu-game-guard status --json` prints it with `running` added; when there is no recent status it prints only `"running": false` and the pause.
@@ -300,8 +324,13 @@ the previous settings and logs the problem once; the tray and `gpu-game-guard st
 a problem. `gpu-game-guard run` itself refuses to start on an invalid config (exit 78). Run
 `gpu-game-guard config validate` after editing to see what is wrong.
 
-The settings window works on a copy: nothing is written until **Apply** (or Ctrl+S). Pause, Resume and
-Restart service act at once.
+The settings window works on a copy: nothing is written until **Apply** (or Ctrl+S), a single button that
+saves every tab, the Raw config tab included (text typed there that is valid counts as an unsaved change, and
+text that is not yet valid blocks Apply and is listed). If the file changed on disk while the window was open,
+Apply merges the window's edits into the new content; if the file was deleted, it is written again. A file
+that cannot be used is left untouched and its text opens in the Raw config tab, or the defaults can replace it,
+in which case the old file is kept as `config.json.broken-<time>` when it can be read. Only one settings window
+opens at a time. Pause, Resume and Restart service act at once.
 
 ## Examples
 

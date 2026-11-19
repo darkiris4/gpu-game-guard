@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import io
 import json
 import os
@@ -309,7 +310,7 @@ class PauseResumeTests(Sandbox):
 
 class StatusCommandTests(Sandbox):
     def write_status(self, **changes):
-        fields = dict(version="2.0", pid=7, updated=time.time(), state="watching", dialog="zenity",
+        fields = dict(version="2.0", pid=os.getpid(), updated=time.time(), state="watching", dialog="zenity",
                       targets=2)
         fields.update(changes)
         status.write_status(status.Status(**fields), self.state / "gpu-game-guard")
@@ -326,7 +327,7 @@ class StatusCommandTests(Sandbox):
                                                                            "name": "ollama"}])
         code, out, _ = self.cli("status")
         self.assertEqual(code, 0)
-        for part in ("is running (pid 7)", "state:    watching", "CS (steam:730)", "ollama", "zenity", "2 configured", "ok"):
+        for part in ("is running (pid %d)" % os.getpid(), "state:    watching", "CS (steam:730)", "ollama", "zenity", "2 configured", "ok"):
             self.assertIn(part, out)
 
     def test_running_json_and_infinite_pause(self):
@@ -530,7 +531,7 @@ class QtCommandTests(Sandbox):
 
     def test_settings_and_tray_call_run(self):
         calls = []
-        code, _, _ = self.run_with(["settings"], settings={"run": lambda: calls.append("settings") or 0})
+        code, _, _ = self.run_with(["settings"], settings={"run": lambda **kwargs: calls.append("settings") or 0})
         self.assertEqual((code, calls), (0, ["settings"]))
         code, _, _ = self.run_with(["tray"], tray={"run": lambda: calls.append("tray") or 3})
         self.assertEqual((code, calls), (3, ["settings", "tray"]))
@@ -625,6 +626,96 @@ class RunWiringTests(Sandbox):
         self.path.write_text('{"poll_seconds": -1}')
         live.current()
         self.assertIn("poll_seconds", live.error)
+
+
+class TerminationTests(Sandbox):
+    def test_terminating_signals_unwind_the_guard_and_the_handlers_are_restored(self):
+        prompter = mock.Mock()
+        prompter.name = "zenity"
+        calls = []
+        terminate = []
+
+        def fake_signal(number, handler):
+            calls.append((number, handler))
+            return "previous"
+
+        def run_guard():
+            number, handler = calls[0]
+            terminate.append(handler)
+            with self.assertRaises(SystemExit) as caught:
+                handler(number, None)
+            self.assertEqual(caught.exception.code, 0)
+
+        with mock.patch.object(cli.runtimes, "build", return_value=[]), \
+                mock.patch.object(cli.triggers, "build", return_value=[]), \
+                mock.patch.object(cli.dialogs, "choose", return_value=prompter), \
+                mock.patch.object(cli, "State"), mock.patch.object(cli, "Guard") as guard, \
+                mock.patch.object(cli.signal, "signal", side_effect=fake_signal):
+            guard.return_value.run.side_effect = run_guard
+            code, _, _ = self.cli("run")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(terminate), 1)
+        installed = {number for number, handler in calls if handler is terminate[0]}
+        self.assertIn(cli.signal.SIGTERM, installed)
+        self.assertIn((cli.signal.SIGTERM, "previous"), calls)
+
+
+class StateClearTests(Sandbox):
+    def stopped(self, *names):
+        from gpu_game_guard.state import State
+        state = State(self.state / "gpu-game-guard" / "state.json")
+        state.add([{"kind": "container", "runtime": "docker", "name": n} for n in names], 1.0)
+        state.save()
+
+    def clear(self, runtime):
+        with mock.patch.object(cli.runtimes, "build", return_value=[runtime] if runtime else []) as build:
+            result = self.cli("state", "clear")
+        return result, build
+
+    def test_it_prints_and_drops_the_stopped_refs_and_only_releases_them(self):
+        self.stopped("ollama", "whisper")
+        runtime = FakeRuntime("docker")
+        (code, out, _), _ = self.clear(runtime)
+        self.assertEqual(code, 0)
+        self.assertIn("ollama, whisper", out)
+        self.assertEqual(runtime.released, [["ollama", "whisper"]])
+        self.assertEqual((runtime.started, runtime.stopped, runtime.start_calls, runtime.adopted), ([], [], [], []))
+        self.assertFalse((self.state / "gpu-game-guard" / "state.json").exists())
+
+    def test_with_nothing_stopped_nothing_is_called(self):
+        runtime = FakeRuntime("docker")
+        (code, out, _), build = self.clear(runtime)
+        self.assertEqual((code, runtime.released), (0, []))
+        self.assertIn("nothing is recorded as stopped", out)
+
+    def test_a_provider_without_release_or_that_fails_does_not_block_the_clear(self):
+        self.stopped("ollama")
+        runtime = FakeRuntime("docker")
+        runtime.fail_hooks = True
+        (code, _, err), _ = self.clear(runtime)
+        self.assertEqual(code, 0)
+        self.assertIn("release through docker failed", err)
+        self.assertFalse((self.state / "gpu-game-guard" / "state.json").exists())
+        self.stopped("ollama")
+        (code, _, _), _ = self.clear(types.SimpleNamespace(name="docker"))
+        self.assertEqual(code, 0)
+        self.assertFalse((self.state / "gpu-game-guard" / "state.json").exists())
+
+    def test_a_running_service_is_told_to_restart(self):
+        self.stopped("ollama")
+        with mock.patch.object(cli.statusmod, "read_status", return_value=status.Status(pid=1)):
+            (code, _, err), _ = self.clear(FakeRuntime("docker"))
+        self.assertEqual(code, 0)
+        self.assertIn("restart it", err)
+
+
+class DurationDigitTests(unittest.TestCase):
+    def test_only_ascii_digits_are_accepted(self):
+        for text in ("\u0663\u0660m", "\uff13\uff10m", "1\u0663s", "\u0661.\u0665h"):
+            with self.assertRaises(argparse.ArgumentTypeError, msg=text):
+                cli.parse_duration(text)
+        self.assertEqual(cli.parse_duration("30m"), 1800)
+        self.assertEqual(cli.parse_duration("1.5h"), 5400)
 
 
 class PauseBoundsTests(Sandbox):
@@ -731,16 +822,6 @@ class SettingsConfigPathTests(Sandbox):
         with mock.patch.object(cli.configmod, "config_path", return_value=self.path):
             self.assertEqual(run("settings", state_dir=self.state)[0], 0)
         self.assertEqual(calls, [{}])
-
-    def test_a_window_without_the_parameter_is_started_without_it(self):
-        def run_window():
-            return 0
-
-        helper = QtCommandTests("test_settings_and_tray_call_run")
-        for patch in helper.modules(True, settings={"run": run_window}):
-            patch.start()
-            self.addCleanup(patch.stop)
-        self.assertEqual(self.cli("settings")[0], 0)
 
 
 if __name__ == "__main__":

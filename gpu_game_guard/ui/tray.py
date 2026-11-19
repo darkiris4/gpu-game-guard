@@ -120,7 +120,7 @@ class TrayController:
         self.pause_hour_action.triggered.connect(lambda: self.actions.pause(PAUSE_HOUR_SECONDS))
         self.pause_until_action.triggered.connect(lambda: self.actions.pause(None))
         self.resume_action.triggered.connect(lambda: self.actions.resume())
-        self.settings_action.triggered.connect(lambda: self.actions.open_settings())
+        self.settings_action.triggered.connect(lambda: self._open_settings())
         self.quit_action.triggered.connect(lambda: self.actions.quit())
         self.tray.setContextMenu(self.menu)
         self.tray.activated.connect(self._activated)
@@ -128,9 +128,14 @@ class TrayController:
         self._timer.timeout.connect(self.refresh)
         self.refresh()
 
-    def _activated(self, reason: Any) -> None:
-        if reason == qt.QtWidgets.QSystemTrayIcon.Trigger and not settings_running():
+    def _open_settings(self) -> None:
+        """Start the settings window unless another process already holds it."""
+        if not settings_running():
             self.actions.open_settings()
+
+    def _activated(self, reason: Any) -> None:
+        if reason == qt.QtWidgets.QSystemTrayIcon.Trigger:
+            self._open_settings()
 
     def start(self) -> None:
         self._timer.start(REFRESH_MS)

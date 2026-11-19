@@ -13,6 +13,8 @@ from .model import Ref, Target
 
 CHANGE_TIMEOUT = 120.0  # stopping a service waits for its own shutdown first
 QUERY_TIMEOUT = 10.0
+_ERROR_MARKERS = ("failed", "error", "denied", "not found")
+_LOG_WIDTH = 200  # characters of a failure line
 _AUTH_FAILURES = ("interactive authentication required", "access denied", "authentication is required")
 
 
@@ -66,21 +68,27 @@ class ServiceRuntime:
             by_pid = None
         targets = []
         for spec in active:
-            vram = None if by_pid is None else gpu.memory_for_pids(by_pid, self._unit_pids(spec.unit, list(by_pid)))
+            vram = None if by_pid is None else gpu.memory_for_pids(by_pid, self._unit_pids(spec.unit, sorted(gpu.measured_pids(by_pid))))
             extra = {"id": spec.id, "unit": spec.unit, "scope": spec.scope or "system"}
             targets.append(Target("service", self.name, gpu.display_name(spec), "", vram, "", extra))
         return targets
 
     def _report_failure(self, verb: str, unit: str, scope: str, result: gpu.CommandResult) -> None:
-        detail = (result.stderr.strip() or result.stdout.strip()).splitlines()
-        text = detail[-1] if detail else f"exit status {result.returncode}"
-        refused = any(marker in " ".join(detail).lower() for marker in _AUTH_FAILURES)
+        """Log a failed systemctl call once. The detail is the line that names the error rather than the last
+        line, and the polkit hint is kept whole: the detail is cut first to make the line fit."""
+        lines = [line.strip() for line in (result.stderr.strip() or result.stdout.strip()).splitlines() if line.strip()]
+        marked = [line for line in lines if any(marker in line.lower() for marker in _ERROR_MARKERS)]
+        text = marked[0] if marked else lines[-1] if lines else f"exit status {result.returncode}"
+        refused = any(marker in " ".join(lines).lower() for marker in _AUTH_FAILURES)
+        key = f"systemctl {verb} {unit}"
         if scope == "system" and refused:
-            gpu.log_once(f"service {verb} {unit}",
-                         f"systemctl {verb} {unit}: not authorised ({text}); "
-                         f"run 'sudo gpu-game-guard polkit allow {unit}' to allow it without a password")
+            hint = f"; run 'sudo gpu-game-guard polkit allow {unit}' to allow it without a password"
+            head = "not authorised ("
+            room = max(40, _LOG_WIDTH - len(head) - len(")") - len(hint))
+            message = f"{head}{gpu.clip(text, room)}){hint}"
         else:
-            gpu.log_once(f"service {verb} {unit}", f"systemctl {verb} {unit}: {text}")
+            message = gpu.clip(text, _LOG_WIDTH)
+        gpu.log_once(key, message, limit=max(_LOG_WIDTH, len(message)))
 
     def _resolve(self, verb: str, ref: Ref) -> Optional[Tuple[str, str]]:
         """(unit, scope) to act on for a ref, or None after logging why it is refused.
@@ -120,7 +128,7 @@ class ServiceRuntime:
             if result.returncode != 0:
                 self._report_failure(verb, unit, scope, result)
                 return False
-            gpu.clear_failure(f"service {verb} {unit}")
+            gpu.clear_failure(f"systemctl {verb} {unit}")
             return True
         except Exception as exc:
             util.log(f"service {verb}: {exc}")

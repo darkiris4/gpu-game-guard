@@ -149,6 +149,32 @@ class HostTests(Fixture):
         self.assertEqual(proc.spec, {"id": "obs", "kind": "process", "label": "obs", "match": "obs", "restart": True})
         self.assertIn("unsaved work", proc.note)
 
+    def test_unknown_memory_still_offers_candidates_with_none(self):
+        self.add(10, "ollama", "0::/system.slice/ollama.service\n", mib="[N/A]")
+        self.add(11, "obs", mib="[N/A]")
+        by_key = self.by_key(self.discover())
+        self.assertIsNone(by_key["service:system:ollama.service"].vram_mib)
+        self.assertIsNone(by_key["process:obs"].vram_mib)
+
+    def test_one_unknown_pid_makes_the_total_unknown_not_undercounted(self):
+        self.add(10, "ollama", "0::/system.slice/ollama.service\n", mib=3000)
+        self.add(11, "ollama", "0::/system.slice/ollama.service\n", mib="[N/A]")
+        self.add(12, "obs", mib=200)
+        by_key = self.by_key(self.discover())
+        self.assertIsNone(by_key["service:system:ollama.service"].vram_mib)
+        self.assertEqual(by_key["process:obs"].vram_mib, 200)
+
+    def test_a_name_with_too_many_root_processes_is_not_offered(self):
+        self.add(10, "chrome")
+        for pid in range(11, 71):
+            self.add(pid, "chrome", mib=1)
+        for pid in range(10, 71):
+            (self.proc / str(pid) / "stat").write_text(f"{pid} (chrome) S {10 if pid > 10 else 1} " + " ".join(["0"] * 17) + " 5 0 0\n")
+        self.assertEqual([c.key for c in self.discover()], ["process:chrome"])
+        for pid in range(11, 40):
+            (self.proc / str(pid) / "stat").write_text(f"{pid} (chrome) S 1 " + " ".join(["0"] * 17) + " 5 0 0\n")
+        self.assertEqual(self.discover(), [])
+
     def test_specs_validate_against_the_real_config(self):
         self.add(10, "ollama", "0::/system.slice/ollama.service\n")
         self.add(11, "obs")

@@ -77,9 +77,56 @@ All notable changes to this project are documented here. The format follows
   Ubuntu 24.04, for the shell scripts, and for the zipapp build.
 - `scripts/test-matrix-docker.sh` to run the tests locally on Python 3.9 to 3.13 in Docker; it exits
   non-zero when every image was skipped.
+- `gpu-game-guard state clear`: drops the list of targets the guard stopped and has not started again,
+  without starting them, and tells the providers (see `release`). It warns when the service is running, which
+  keeps its own copy until restarted.
+- Optional `adopt` and `release` hooks on a `Runtime`. `adopt` receives the refs read from the state file when
+  the guard starts; `release` receives refs the guard drops without starting them (`after_game` `leave`, a
+  restart question answered **Leave stopped**, the no-game timeout with `leave`, `state clear`). The command
+  provider uses them to keep its record of check-less targets across a restart.
+- A failed restart is retried after `dialog_retry_seconds`, then twice, four times that and so on, never
+  longer than an hour (or `dialog_retry_seconds` when that is longer). After five failures in a row to start the
+  same targets the guard says so once, stops asking and notifying, keeps them in the state file and retries
+  hourly.
+- `status.json` records the guard's process start time (`pid_start`) beside its pid, and its `valid_for`
+  stays at 900 seconds while a stop or start is running, not only while asking or waiting to restart.
+- The guard removes `status.json` when it stops cleanly (SIGTERM, SIGHUP or Ctrl-C).
+- An unreadable `state.json` is reported (log, event, notification) and a copy is kept as
+  `state.json.corrupt-<time>`, the newest three.
+- Process restarts: the command line and working directory are read when the program is stopped, a relative
+  first entry is resolved to an absolute path, and the program is started through
+  `systemd-run --user --scope` when that is available, so it outlives a restart of the guard.
 
 ### Changed
 
+- Config saves keep keys this version does not know, at the top level and inside game rules and targets, and
+  go through a locked read-modify-write (`<config>.lock`), so a change made on disk in the meantime is merged
+  instead of overwritten. The settings window merges its edits with changes made on disk. Each save keeps one
+  rolling `<config>.bak`. A file nested more than 100 levels deep is rejected as invalid.
+- Target labels no longer have to be unique; ids still do.
+- A process target's `match` must be 3 to 15 characters with at least 3 that are not glob characters, and is
+  refused when it matches more than 25 root processes (helpers whose parent is also a match do not count).
+- A command target without a `check` counts as stopped after its `stop` command succeeds, until `start` runs
+  or the target is released, and the record survives a restart of the guard.
+- A process that cannot be restarted (no usable command line, or a bare interpreter such as `python3` with no
+  script) is reported as failed, with the reason logged once, rather than started wrongly. Restarted programs
+  are watched together, once, for an immediate failure.
+- Readers treat a `status.json` whose process is gone, or whose pid now belongs to another process, as "not
+  running", however recent the file looks.
+- `state.json`, `status.json`, `events.jsonl` and `pause.json` are written with mode 0600 and the state
+  directory is 0700; existing ones are tightened when the current user owns them. The `.bak` and
+  `.broken-<time>` copies of the config have the mode of the file they copy.
+- The launch and restart dialogs name every kind of target ("this container", "these containers or
+  services") and show names, images and titles as plain text, with control and bidirectional override
+  characters removed.
+- The Qt dialog process picks the platform plugin itself: an inherited headless platform is dropped, and a
+  Wayland session with none chosen gets `wayland;xcb`, which falls back to X11.
+- The theme's small images (combo box arrow, check mark) go to a private directory under the runtime
+  directory, or under `<tmp>/gpu-game-guard-<uid>` when that is unusable; without them the controls keep their
+  borders and backgrounds.
+- The Raw config tab counts as unsaved changes while it holds text that is not yet valid, and there is a single
+  Apply for everything. A settings file that cannot be used is left untouched until you replace it; the
+  replaced file is kept as a `.broken-<time>` copy when it can be read.
 - The automatic dialog choice prefers the Qt dialog when it can be shown, then kdialog or zenity, then
   notifications. `dialog` also accepts `qt`.
 - `runtimes` defaults to `["docker", "podman", "service", "command", "process"]`.
@@ -132,6 +179,16 @@ All notable changes to this project are documented here. The format follows
   written, `systemctl` fails or the service does not start, requires an absolute install directory,
   quotes the unit's `ExecStart`, and leaves an invalid-config start failure (exit status 78) in place.
 - Config and state writes follow a symlinked file instead of replacing it.
+- A command target without a `check` that was stopped before the guard restarted is no longer taken for
+  running when the guard starts again.
+- Discovery counts and offers processes the way the process runtime does (root processes only), and reads GPU
+  memory of a process listed without a figure as unknown, not zero.
+- A settings file deleted while the window was open is written again with the window's settings; a failed
+  discovery scan says so on the Basic page instead of "Nothing is using the GPU"; closing the window no longer
+  waits for a running scan.
+- `config validate` and the Raw editor report a deeply nested value instead of failing.
+- `systemctl` failure lines name the actual error and keep the polkit hint whole.
+- The Space key can no longer answer the launch dialog in its first 700 ms.
 
 ## 0.1.0
 

@@ -95,9 +95,16 @@ When the game has been closed for about 8 seconds, it asks whether to start what
 **Restart** starts them, **Ask me later** repeats the question after five minutes, and **Leave stopped**
 forgets them. Closing the window counts as **Ask me later**. What was stopped is kept in
 `~/.local/state/gpu-game-guard/state.json` until you answer, so the question survives a crash or a reboot. A
-container stopped with `docker stop` stays stopped across reboots even with `restart: unless-stopped`.
+container stopped with `docker stop` stays stopped across reboots even with `restart: unless-stopped`. If
+something cannot be started, it stays in that file and is retried after five minutes, then ten, twenty and so
+on up to an hour; after five failures in a row the guard stops asking and retries hourly without a dialog.
+`gpu-game-guard state clear` forgets what was stopped without starting it.
 Launches already running when the service starts are left alone, so restarting the service in the middle of
 a game cannot interrupt it.
+
+In the Qt dialog the buttons have Alt mnemonics, and Enter, Return and Space are ignored for the first 700 ms
+so a key press meant for the game cannot answer it. On a Wayland session with no Qt platform set it
+asks for Wayland and falls back to X11. Game titles, names and images are shown as plain text.
 
 The dialog backend is chosen automatically: the Qt window above when `python3-pyqt5` is installed, then
 kdialog (first on KDE) or zenity, then desktop notifications with buttons, then none. With none, or
@@ -113,7 +120,7 @@ chosen with the switch in its header and remembered.
 **Basic** is for most people. It shows what the guard is doing, with Pause 1 hour and Pause until resumed;
 "When I start a game" (ask, stop automatically, do nothing); a list of the apps and services using your
 graphics card with a switch for each; and "After the game" (ask, start again automatically, leave stopped).
-Nothing is saved until you press **Apply**. Switching a container off adds it to the ignore list; switching
+Nothing is saved until you press **Apply**, one button for every page and tab. Switching a container off adds it to the ignore list; switching
 a service on or off adds or removes its target.
 
 **Advanced** has a tab for each part of the configuration:
@@ -129,7 +136,7 @@ a service on or off adds or removes its target.
 | Dialogs | the dialog backend and which are installed here, the launchers watched |
 | Activity | the live status and recent events |
 | Test run | preview what the guard would do for a game and a set of running workloads, without doing it |
-| Raw config | the configuration as validated JSON, with import and export |
+| Raw config | the configuration as validated JSON, with import and export; valid text counts as an unsaved change |
 
 ## What can be managed
 
@@ -146,11 +153,14 @@ a service on or off adds or removes its target.
   settings window shows the command and whether the rule exists.
 - **Custom commands** are an opt-in target: a stop command, a start command and a check that says whether it
   is running, for anything else (for example unloading models from a server that stays up). Commands run as
-  written, never through a shell. Give every command target a `check`, or the guard cannot tell it stopped.
+  written, never through a shell. Give a command target a `check` where you can; without one the guard counts it as stopped once its `stop`
+  command has succeeded, and as running again after `start` or when it is released.
 - **Processes** are an opt-in target: a program matched by name, such as OBS. The guard sends SIGTERM, waits
   five seconds and never sends SIGKILL, so a program that ignores the request stays running. **Unsaved work
-  in it can be lost**, and it starts again with its old command line, not its old state, unless you turn
-  restart off.
+  in it can be lost**, and it starts again with the command line it had when it was stopped, not its old
+  state, unless you turn restart off. It is started through `systemd-run --user --scope` when that is
+  available, so it survives a restart of the guard. A name must be 3 to 15 characters with at least 3 literal
+  ones, and one that matches more than 25 root processes is refused.
 
 | Kind | Found | Risk |
 | --- | --- | --- |
@@ -230,7 +240,8 @@ Every key, the target kinds, how to find a game id and more examples are in
 | --- | --- |
 | `gpu-game-guard` or `gpu-game-guard run` | watch for launches; this is what the service runs |
 | `gpu-game-guard check` | diagnose the setup: config, dialog backend, runtimes, launches and GPU workloads now, targets, the service |
-| `gpu-game-guard status [--json]` | what the running service is doing; exit status 1 when it is not running |
+| `gpu-game-guard status [--json]` | what the running service is doing; exit status 1 when it is not running (a service whose process is gone counts as not running) |
+| `gpu-game-guard state clear` | forget the targets the guard stopped without starting them; exit status 0; prints a note when the service is running, which keeps its own copy until `systemctl --user restart gpu-game-guard` |
 | `gpu-game-guard pause [--for 30m]` / `resume` | stop intercepting launches for a while, or until resumed / end a pause |
 | `gpu-game-guard settings` | open the settings window |
 | `gpu-game-guard tray` | run the tray icon (started at login by the autostart entry) |
@@ -249,7 +260,8 @@ Exit codes: 0 ok; 1 a failed check, an invalid config or a service that is not r
 when `run` refuses to start on an invalid config (the service does not restart on 78); 130 on Ctrl-C.
 
 The configuration file is `~/.config/gpu-game-guard/config.json` (honouring `XDG_CONFIG_HOME`). It is
-optional, and the running service picks up edits, except to `runtimes`, `triggers` and `dialog`, which need
+optional. Saves keep keys this version does not know and one rolling `config.json.bak`. The state files are
+private to your user (0600 in a 0700 directory). The running service picks up edits, except to `runtimes`, `triggers` and `dialog`, which need
 `systemctl --user restart gpu-game-guard`. The design is in [`docs/architecture.md`](docs/architecture.md).
 
 ## Requirements

@@ -66,16 +66,23 @@ def private_directory(base: Path, *names: str) -> Path:
     return path
 
 
+def fallback_base() -> Path:
+    """The private per-user directory below the temporary directory that stands in for an unusable runtime
+    directory, created with mode 0700. Raises OSError when it cannot be had or belongs to someone else."""
+    base = Path(tempfile.gettempdir()) / f"{DIRECTORY_NAME}-{os.getuid()}"
+    try:
+        os.mkdir(base, 0o700)
+    except FileExistsError:
+        pass
+    _owned_directory(base)
+    _make_private(base)
+    return base
+
+
 def _lock_directory(directory: Optional[Path]) -> Path:
     base = Path(directory) if directory is not None else runtime_base()
     if base is None:
-        base = Path(tempfile.gettempdir()) / f"{DIRECTORY_NAME}-{os.getuid()}"
-        try:
-            os.mkdir(base, 0o700)
-        except FileExistsError:
-            pass
-        _owned_directory(base)
-        _make_private(base)
+        base = fallback_base()
     return private_directory(base, DIRECTORY_NAME)
 
 

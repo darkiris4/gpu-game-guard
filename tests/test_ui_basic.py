@@ -427,6 +427,24 @@ class BasicViewTests(unittest.TestCase):
         row = list(self.rows().values())[0]
         self.assertEqual(row.title_label.textFormat(), QtCore.Qt.PlainText)
 
+    def test_a_failed_scan_is_not_shown_as_an_idle_gpu(self):
+        def broken(config):
+            raise RuntimeError("nvidia-smi is gone")
+
+        model = SettingsModel(self.dir / "other.json", self.status_dir, discover=broken, runner=lambda argv: (0, ""),
+                              threaded=False)
+        view = basic.BasicView(model, autoload=False)
+        self.addCleanup(view.deleteLater)
+        view.load()
+        self.assertFalse(view.empty_label.isHidden())
+        self.assertIn("Could not check what is using the graphics card", view.empty_label.text())
+        self.assertNotIn("Nothing is using", view.empty_label.text())
+        self.assertTrue(view.refresh_button.isEnabled())
+        self.assertEqual(view.refresh_button.text(), "Refresh")
+        view.model._discover = lambda config: []
+        view.refresh_button.click()
+        self.assertIn("Nothing is using the GPU", view.empty_label.text())
+
     def test_the_load_is_in_the_background_and_lands_on_the_ui_thread(self):
         gate = threading.Event()
         threads = []

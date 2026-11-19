@@ -799,15 +799,46 @@ class RunTests(Base):
         self.assertTrue(model.wait_scan(5))
         self.assertEqual([row.item.name for row in window.basic._rows], ["comfy"])
 
-    def test_closing_waits_for_a_running_scan(self):
+    def test_closing_does_not_wait_for_a_running_scan(self):
         gate = threading.Event()
-        model = SettingsModel(self.path, self.status_dir, discover=lambda c: (gate.wait(5), [])[1], runner=self.runner)
+        started = threading.Event()
+
+        def slow(config):
+            started.set()
+            gate.wait(10)
+            return []
+
+        model = SettingsModel(self.path, self.status_dir, discover=slow, runner=self.runner)
         window = settings.SettingsWindow(model, self.dir / "ui.json")
         self.addCleanup(window.deleteLater)
         model.scan()
-        threading.Timer(0.2, gate.set).start()
+        self.assertTrue(started.wait(5))
+        began = time.monotonic()
         window.close()
+        self.assertLess(time.monotonic() - began, 1.0)
         self.assertFalse(model.scanning)
+        gate.set()
+        for _ in range(10):
+            time.sleep(0.01)
+            self.app.processEvents()
+
+    def test_the_service_card_lines_up_with_the_status_card(self):
+        window = settings.SettingsWindow(self.make(), self.dir / "ui.json")
+        self.addCleanup(window.deleteLater)
+        self.addCleanup(window.hide)
+        window.resize(900, 760)
+        window.show()
+        window.basic.load()
+        self.app.processEvents()
+        self.assertFalse(window.not_running.isHidden())
+        self.assertGreater(window.basic.scrollbar_extent(), 0)
+        for _ in range(3):
+            self.app.processEvents()
+        service = window.not_running
+        status = window.basic.status_card
+        left = lambda widget: widget.mapTo(window, QtCore.QPoint(0, 0)).x()  # noqa: E731
+        self.assertEqual(left(service), left(status))
+        self.assertEqual(service.width(), status.width())
 
 
 if __name__ == "__main__":

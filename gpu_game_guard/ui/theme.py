@@ -47,17 +47,24 @@ LABEL_ROLES = ("headline", "title", "muted", "small")
 BASE_POINT_SIZE = 10.0  # the default font size the unscaled dimensions were designed for
 HEADLESS_PLATFORMS = ("offscreen", "minimal", "minimalegl")
 
-_CONTROLS = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029\ud800-\udfff\ufffe\uffff]")
-_BIDI = re.compile("[\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c]")
-_BLANKS = re.compile("[\t\n\r]")
+# Characters removed from shown text: C0 and C1 controls other than the line breaks handled by `_BLANKS`, lone
+# surrogates and the two non-characters ending the basic plane. The left-to-right, right-to-left and Arabic letter
+# marks stay, because legitimate Arabic and Hebrew text uses them; zero-width joiners and emoji are untouched.
+_CONTROLS = re.compile("[\x00-\x08\x0e-\x1f\x7f-\x84\x86-\x9f\ud800-\udfff\ufffe\uffff]")
+_BIDI = re.compile("[\u202a-\u202e\u2066-\u2069]")
+# Tab, line feed, carriage return, vertical tab, form feed, next line and the Unicode line and paragraph separators.
+_BLANKS = re.compile("[\t\n\r\x0b\x0c\x85\u2028\u2029]")
+_BREAKS = re.compile("[\x0b\x0c\x85\u2028\u2029]")
 
 
 def safe_text(text: object, keep_newlines: bool = False) -> str:
-    """`text` as a string fit to show: control characters and bidirectional override and isolate characters are
-    removed, and newlines and tabs become a space (tabs always, newlines unless `keep_newlines`)."""
+    """`text` as a string fit to show: control characters and bidirectional embedding, override and isolate
+    characters are removed, and tabs, vertical and form feeds, next-line and the Unicode line and paragraph
+    separators become a space, as do newlines unless `keep_newlines`. The direction marks used by Arabic and Hebrew
+    text, joiners and emoji are kept."""
     value = "" if text is None else str(text)
     if keep_newlines:
-        value = value.replace("\r\n", "\n").replace("\r", "\n").replace("\t", " ")
+        value = _BREAKS.sub(" ", value.replace("\r\n", "\n").replace("\r", "\n").replace("\t", " "))
         return _CONTROLS.sub("", _BIDI.sub("", value))
     return _CONTROLS.sub("", _BIDI.sub("", _BLANKS.sub(" ", value)))
 
@@ -251,7 +258,8 @@ QProgressBar::chunk { background: $accent; border-radius: 4px; }
 
 def stylesheet(palette: Colors, assets: Optional[Dict[str, str]] = None, scale: float = 1.0) -> str:
     """The application stylesheet for `palette`. `assets` maps `arrow` and `check` to image files used for the combo
-    box arrow and the check box tick; without them those controls keep the style's own drawing. `scale` is the
+    box arrow and the check box tick; without them the borders and backgrounds of the check boxes, radio buttons and
+    combo box arrow area stay and only the images are left out. `scale` is the
     default font size relative to `BASE_POINT_SIZE`: text sizes are point sizes derived from it, and the fixed
     dimensions that hold text or an indicator grow with it."""
     p = palette
@@ -265,22 +273,20 @@ def stylesheet(palette: Colors, assets: Optional[Dict[str, str]] = None, scale: 
     def pt(factor: float) -> str:
         return f"{base * factor:.1f}".rstrip("0").rstrip(".")
 
-    arrow = (f"QComboBox::down-arrow {{ image: url(\"{assets['arrow']}\"); width: {px(12)}px; height: {px(12)}px; }}"
-             if "arrow" in assets else "")
-    if "check" in assets:
-        indicators = (
-            f"QCheckBox::indicator {{ width: {px(18)}px; height: {px(18)}px; border: 1px solid {p.muted}; "
-            f"border-radius: 5px; background: {p.input}; }}\n"
-            f"QCheckBox::indicator:hover {{ border-color: {p.accent}; }}\n"
-            f"QCheckBox::indicator:checked {{ background: {p.accent}; border: 1px solid {p.accent}; "
-            f"image: url(\"{assets['check']}\"); }}\n"
-            f"QCheckBox::indicator:focus {{ border: 2px solid {p.accent}; }}\n"
-            f"QRadioButton::indicator {{ width: {px(16)}px; height: {px(16)}px; border: 1px solid {p.muted}; "
-            f"border-radius: {px(9)}px; background: {p.input}; }}\n"
-            f"QRadioButton::indicator:checked {{ border: {px(5)}px solid {p.accent}; background: {p.input}; }}\n"
-            f"QRadioButton::indicator:focus {{ border: 2px solid {p.accent}; }}")
-    else:
-        indicators = ""
+    arrow_image = f" image: url(\"{assets['arrow']}\");" if "arrow" in assets else ""
+    check_image = f" image: url(\"{assets['check']}\");" if "check" in assets else ""
+    arrow = (f"QComboBox::down-arrow {{{arrow_image} width: {px(12)}px; height: {px(12)}px; }}" if arrow_image else
+             f"QComboBox::drop-down {{ border-left: 1px solid {mix(p.border, p.muted, 0.45)}; }}")
+    indicators = (
+        f"QCheckBox::indicator {{ width: {px(18)}px; height: {px(18)}px; border: 1px solid {p.muted}; "
+        f"border-radius: 5px; background: {p.input}; }}\n"
+        f"QCheckBox::indicator:hover {{ border-color: {p.accent}; }}\n"
+        f"QCheckBox::indicator:checked {{ background: {p.accent}; border: 1px solid {p.accent};{check_image} }}\n"
+        f"QCheckBox::indicator:focus {{ border: 2px solid {p.accent}; }}\n"
+        f"QRadioButton::indicator {{ width: {px(16)}px; height: {px(16)}px; border: 1px solid {p.muted}; "
+        f"border-radius: {px(8)}px; background: {p.input}; }}\n"
+        f"QRadioButton::indicator:checked {{ border: {px(5)}px solid {p.accent}; background: {p.input}; }}\n"
+        f"QRadioButton::indicator:focus {{ border: 2px solid {p.accent}; }}")
     return _STYLE.substitute(
         text=p.text, window=p.window, card=p.card, muted=p.muted, accent=p.accent, accent_text=p.accent_text,
         border=p.border, input=p.input, hover=p.hover, ok=p.ok, warn=p.warn, danger=p.danger,
@@ -342,12 +348,18 @@ def _store(path: Path, data: bytes) -> None:
 
 
 def _write_assets(p: Colors, root: Optional[Path] = None) -> Dict[str, str]:
-    """Paint the small images the stylesheet refers to into a private per-user directory below `root` (by default
-    the runtime directory). Any failure, or no usable directory, gives an empty mapping and the controls keep the
-    style's own drawing."""
-    base = root if root is not None else singleton.runtime_base()
-    if base is None:
-        return {}
+    """Paint the small images the stylesheet refers to into a private per-user directory below `root`. By default
+    the runtime directory is tried first and then the private per-user fallback directory (see
+    `singleton.fallback_base`). Any failure, or no usable directory, gives an empty mapping and the controls are
+    drawn without the images."""
+    if root is not None:
+        bases = [root]
+    else:
+        bases = []
+        runtime = singleton.runtime_base()
+        if runtime is not None:
+            bases.append(runtime)
+        bases.append(None)  # the fallback directory, resolved below so that its failure is handled like any other
     key = hashlib.sha1(f"{p.muted}{p.accent_text}".encode()).hexdigest()[:10]
 
     def arrow(painter: "QtGui.QPainter") -> None:
@@ -360,21 +372,24 @@ def _write_assets(p: Colors, root: Optional[Path] = None) -> Dict[str, str]:
         painter.setPen(pen)
         painter.drawPolyline(QtGui.QPolygonF([QtCore.QPointF(8, 19), QtCore.QPointF(15, 26), QtCore.QPointF(28, 11)]))
 
-    try:
-        directory = singleton.private_directory(base, "gpu-game-guard", f"theme-{key}")
-        _store(directory / "arrow.png", _glyph(arrow))
-        _store(directory / "check.png", _glyph(tick))
-        return {"arrow": (directory / "arrow.png").as_posix(), "check": (directory / "check.png").as_posix()}
-    except OSError as exc:
-        log(f"theme images are not used ({exc})")
-        return {}
+    for base in bases:
+        try:
+            directory = singleton.private_directory(
+                singleton.fallback_base() if base is None else base, "gpu-game-guard", f"theme-{key}")
+            _store(directory / "arrow.png", _glyph(arrow))
+            _store(directory / "check.png", _glyph(tick))
+            return {"arrow": (directory / "arrow.png").as_posix(), "check": (directory / "check.png").as_posix()}
+        except OSError as exc:
+            log(f"theme images are not written below {'the fallback directory' if base is None else base} ({exc})")
+    return {}
 
 
 def apply_theme(app: "QtWidgets.QApplication", dark: Optional[bool] = None,
                 asset_root: Optional[Path] = None) -> Colors:
     """Install the palette and stylesheet on `app`. `dark` forces a scheme; by default the system's is followed.
     The combo box arrow and the check mark are small images kept in a private directory of the runtime directory
-    (or of `asset_root`); on a headless platform, or when no private directory can be had, they are skipped.
+    (or of `asset_root`), with a private per-user fallback when that is unusable; on a headless platform, or when no
+    private directory can be had, they are skipped and the controls keep their borders and backgrounds.
     Returns the palette in use (also available later through `current_colors()`)."""
     global _current
     use_dark = is_dark(app) if dark is None else dark

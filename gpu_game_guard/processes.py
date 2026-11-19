@@ -1,12 +1,17 @@
 """Configured processes as a Runtime: matched by name, ended with SIGTERM, started again detached.
 
 A `match` is a glob on the kernel's process name (`comm`, at most 15 characters), so a pattern needs at least three
-literal characters and at most 15 characters in all, and one that matches more than 25 of the user's processes is
-refused as too broad. The command line and working directory a restart needs are read from /proc immediately before
-the SIGTERM and written into the ref passed to `stop`; a process that rewrote its argv[0] is started from its
-executable path instead, and a command line that cannot be reconstructed is recorded as an empty list, which makes
-the restart fail rather than guess. The restarted program is started in its own systemd scope when the user manager
-is reachable, so that stopping or restarting the guard does not end it."""
+literal characters and at most 15 characters in all, and one that matches more than 25 root processes of the user's
+(matching processes whose parent is not itself a match) is refused as too broad; the helpers of a multi-process
+application do not count. The command line and working directory a restart needs are read from /proc immediately
+before the SIGTERM and written into the ref passed to `stop`. A relative first entry is resolved then against the
+process's own working directory and the PATH of its environment, and stored as an absolute path. A process that
+rewrote its argv[0] is started from its executable path instead, unless that is an interpreter with no script
+argument. A command line that cannot be reconstructed is recorded as an empty list, which makes the restart fail
+rather than guess, and the reason is logged once. The restarted program is started in its own systemd scope when
+the user manager is reachable, so that stopping or restarting the guard does not end it; otherwise it shares the
+guard's lifetime, which is logged once. All restarted programs are watched together, briefly, for an immediate
+failure."""
 from __future__ import annotations
 
 import fnmatch
@@ -24,13 +29,14 @@ from . import discovery, gpu, util
 from .model import Ref, Target
 
 TERM_WAIT_SECONDS = 5.0
-START_WATCH_SECONDS = 2.0  # how long a restarted program is watched for an immediate failure
+START_WATCH_SECONDS = 1.5  # how long the restarted programs, together, are watched for an immediate failure
 MIN_LITERAL = 3  # literal characters a pattern needs
 MAX_MATCH = 15  # the kernel truncates comm to 15 characters
-MAX_PROCESSES = 25  # a pattern matching more of the user's processes is too broad
+MAX_PROCESSES = discovery.MAX_ROOTS  # a pattern matching more root processes of the user's is too broad
 _POLL_SECONDS = 0.1
 _SESSION_VARIABLES = ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR")
 _MANAGER_STATES = ("running", "degraded", "starting", "initializing")
+_INTERPRETER = re.compile(r"(python[0-9.]*|perl[0-9.]*|ruby[0-9.]*|node(js)?|bash|sh|java)")
 
 
 @dataclass(frozen=True)
@@ -38,6 +44,7 @@ class Proc:
     pid: int
     start: str  # field 22 of /proc/<pid>/stat: the start time in clock ticks since boot
     comm: str
+    ppid: int = 0
 
 
 def _read(path: Path) -> Optional[str]:
@@ -47,17 +54,7 @@ def _read(path: Path) -> Optional[str]:
         return None
 
 
-def parse_stat(text: str) -> Optional[Tuple[str, int, str]]:
-    """(state, parent pid, start time) from the contents of /proc/<pid>/stat. The command name in the second
-    field may contain spaces and parentheses, so fields are counted from the last closing parenthesis."""
-    end = text.rfind(")")
-    fields = text[end + 2:].split() if end >= 0 else []
-    if len(fields) < 20:
-        return None
-    try:
-        return fields[0], int(fields[1]), fields[19]
-    except ValueError:
-        return None
+parse_stat = gpu.parse_stat
 
 
 class ProcessRuntime:
@@ -128,7 +125,7 @@ class ProcessRuntime:
                 continue
             comm = (_read(self._proc / name / "comm") or "").strip()
             if comm:
-                found.append(Proc(pid, stat[2], comm))
+                found.append(Proc(pid, stat[2], comm, stat[1]))
         return found
 
     def _cmdline(self, pid: int) -> List[str]:
@@ -169,9 +166,10 @@ class ProcessRuntime:
         found = []
         candidates = [item for item in (self._all() if everything is None else everything)
                       if fnmatch.fnmatchcase(item.comm, pattern)]
-        if len(candidates) > MAX_PROCESSES:
+        roots = gpu.root_pids({item.pid: item.ppid for item in candidates})
+        if len(roots) > MAX_PROCESSES:
             gpu.log_once(f"process pattern {spec.id}",
-                         f"process target {spec.id!r}: pattern {pattern!r} matches {len(candidates)} processes; too broad, refused")
+                         f"process target {spec.id!r}: pattern {pattern!r} matches {len(roots)} root processes; too broad, refused")
             return []
         for item in candidates:
             if item.pid in skip:
@@ -224,18 +222,58 @@ class ProcessRuntime:
             return bool(path) and os.path.isfile(path) and os.access(path, os.X_OK)
         return self._which(command) is not None
 
-    def _restart_command(self, cmdline: List[str], exe: Optional[str], cwd: Optional[str]) -> List[str]:
-        """The command line to start a process again, or an empty list when none can be told. A command line whose
-        first entry is not an executable and looks like a rewritten title (it contains a colon or a space) is
-        replaced by the executable path with the remaining arguments."""
+    def _process_path(self, pid: int) -> Optional[str]:
+        """The PATH of a process's environment, or None when /proc/<pid>/environ cannot be read."""
+        text = _read(self._proc / str(pid) / "environ")
+        for entry in (text or "").split("\0"):
+            if entry.startswith("PATH="):
+                return entry[len("PATH="):]
+        return None
+
+    @staticmethod
+    def _is_executable_file(path: str) -> bool:
+        return os.path.isfile(path) and os.access(path, os.X_OK)
+
+    def _absolute(self, command: str, pid: int, cwd: Optional[str]) -> Optional[str]:
+        """The absolute path of an executable named by a relative first entry: a path with a slash is taken
+        against the process's working directory; a bare name is looked up on the PATH of its environment, then on
+        the guard's own PATH. None when nothing executable is found."""
+        if os.path.isabs(command):
+            return command if self._is_executable_file(command) else None
+        if "/" in command:
+            path = os.path.normpath(os.path.join(cwd, command)) if cwd else ""
+            return path if path and self._is_executable_file(path) else None
+        for directory in (self._process_path(pid) or "").split(":"):
+            if not directory:
+                continue
+            path = os.path.normpath(os.path.join(cwd, directory, command) if cwd and not os.path.isabs(directory)
+                                    else os.path.join(directory, command))
+            if self._is_executable_file(path):
+                return path
+        found = self._which(command)
+        return os.path.abspath(found) if found else None
+
+    @staticmethod
+    def _bare_interpreter(exe: str, args: Sequence[str]) -> bool:
+        """True when `exe` is an interpreter and `args` name nothing for it to run (no argument that is not an option)."""
+        return bool(_INTERPRETER.fullmatch(os.path.basename(exe))) and not any(not arg.startswith("-") for arg in args)
+
+    def _restart_command(self, cmdline: List[str], exe: Optional[str], cwd: Optional[str], pid: int = 0) -> Tuple[List[str], str]:
+        """(command line to start a process again, "") or ([], reason) when none can be told. The first entry is
+        made absolute. A command line whose first entry is not an executable and looks like a rewritten title (it
+        contains a colon or a space) is replaced by the executable path with the remaining arguments, unless that
+        would start an interpreter with nothing to run."""
         if not cmdline:
-            return []
-        if self._executable(cmdline[0], cwd):
-            return list(cmdline)
+            return [], "no command line could be read"
+        resolved = self._absolute(cmdline[0], pid, cwd)
+        if resolved:
+            return [resolved, *cmdline[1:]], ""
         rewritten = ":" in cmdline[0] or " " in cmdline[0]
         if rewritten and exe and self._executable(exe, None):
-            return [exe, *cmdline[1:]]
-        return []
+            if self._bare_interpreter(exe, cmdline[1:]):
+                return [], f"the process rewrote its title and its executable {exe} is an interpreter with no script argument"
+            return [exe, *cmdline[1:]], ""
+        return [], f"{cmdline[0]!r} is not an executable that can be found"
 
     def _record_command(self, ref: Ref, item: Proc) -> None:
         """Write the restart command line and working directory of a process into the ref, read from /proc now.
@@ -245,11 +283,13 @@ class ProcessRuntime:
         scanned = ref.get("cmdline")
         cmdline = self._cmdline(item.pid) or (scanned if isinstance(scanned, list) else [])
         cwd = self._cwd(item.pid) or (ref.get("cwd") if isinstance(ref.get("cwd"), str) else None)
-        ref["cmdline"] = self._restart_command([part for part in cmdline if isinstance(part, str)], self._exe(item.pid), cwd)
+        ref["cmdline"], reason = self._restart_command([part for part in cmdline if isinstance(part, str)],
+                                                       self._exe(item.pid), cwd, item.pid)
         if cwd:
             ref["cwd"] = cwd
         if not ref["cmdline"]:
-            util.log(f"process {item.comm} ({item.pid}): the command line cannot be told; it will not be started again")
+            gpu.log_once(f"process command {ref.get('id', item.comm)}",
+                         f"process {item.comm}: {reason}; it will not be started again")
 
     def stop(self, refs: Sequence[Ref]) -> None:
         signalled: List[Proc] = []
@@ -307,25 +347,36 @@ class ProcessRuntime:
         if self._which("systemd-run") and self._which("systemctl") and self._user_manager_answers():
             unit = f"gpu-game-guard-{re.sub(r'[^A-Za-z0-9_-]+', '-', spec_id)}-{int(self._wall())}"
             command = ["systemd-run", "--user", "--scope", "--quiet", "--collect", f"--unit={unit}", "--", *cmdline]
+            gpu.clear_failure("process scope")
+        else:
+            gpu.log_once("process scope", "systemd-run or the user manager is unavailable; restarted programs share the guard's lifetime")
         return self._popen(command, cwd=cwd, env=self._environment(), start_new_session=True, stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
 
-    def _failed_at_once(self, child: Any) -> bool:
-        """True when the started process exits with a non-zero status within the watch period."""
-        poll = getattr(child, "poll", None)
-        if poll is None:
-            return False
+    def _watch(self, children: List[Tuple[Ref, Any]]) -> List[Ref]:
+        """Watch all started programs together for at most START_WATCH_SECONDS; the refs of those that exited
+        with a non-zero status in that time."""
+        pending = [(ref, child) for ref, child in children if getattr(child, "poll", None) is not None]
+        failed: List[Ref] = []
         deadline = self._clock() + START_WATCH_SECONDS
-        while True:
-            code = poll()
-            if code is not None:
-                return code != 0
-            if self._clock() >= deadline:
-                return False
+        while pending:
+            still = []
+            for ref, child in pending:
+                code = child.poll()
+                if code is None:
+                    still.append((ref, child))
+                elif code != 0:
+                    util.log(f"process target {ref.get('id')!r}: the restarted program exited at once")
+                    failed.append(ref)
+            pending = still
+            if not pending or self._clock() >= deadline:
+                break
             self._sleep(_POLL_SECONDS)
+        return failed
 
-    def _start_one(self, ref: Ref) -> bool:
-        """Start one ref again; False when it could not be started."""
+    def _start_one(self, ref: Ref) -> Any:
+        """Start one ref again. False when it could not be started, True when nothing needs watching, otherwise
+        the started child."""
         spec = gpu.find_spec(self._get_config, "process", ref, include_disabled=True)
         if spec is None:
             return False
@@ -339,20 +390,25 @@ class ProcessRuntime:
         if self._matches(spec):
             return True  # already running again
         cwd = ref.get("cwd")
-        child = self._launch(spec.id, cmdline, cwd if isinstance(cwd, str) and os.path.isdir(cwd) else None)
-        if self._failed_at_once(child):
-            util.log(f"process target {spec.id!r}: the restarted program exited at once")
-            return False
-        return True
+        return self._launch(spec.id, cmdline, cwd if isinstance(cwd, str) and os.path.isdir(cwd) else None)
 
     def start(self, refs: Sequence[Ref]) -> Optional[List[Ref]]:
-        """Start the processes again; returns the refs that could not be started."""
+        """Start the processes again; returns the refs that could not be started. Every program is started before
+        any is watched, so the watch costs START_WATCH_SECONDS once, not once per program."""
         failed = []
+        started: List[Tuple[Ref, Any]] = []
         for ref in gpu.own_refs(refs, "process", self.name):
             try:
-                if not self._start_one(ref):
+                outcome = self._start_one(ref)
+                if outcome is False:
                     failed.append(ref)
+                elif outcome is not True:
+                    started.append((ref, outcome))
             except Exception as exc:
                 util.log(f"process start: {exc}")
                 failed.append(ref)
+        try:
+            failed.extend(self._watch(started))
+        except Exception as exc:
+            util.log(f"process start: {exc}")
         return failed

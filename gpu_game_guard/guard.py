@@ -19,7 +19,9 @@ from .util import log
 LaunchKey = Tuple[str, Tuple[Any, ...]]  # (trigger name, Launch.key)
 CONTAINER_RUNTIMES = ("docker", "podman")  # runtimes that `auto_containers` switches off
 STATUS_REWRITE_SECONDS = 5.0  # an unchanged status is rewritten at most this often, to show the guard is alive
-LONG_VALIDITY_SECONDS = 900.0  # how long a status stays current while a dialog blocks or a restart is pending
+LONG_VALIDITY_SECONDS = 900.0  # how long a status stays current while a dialog blocks, a restart is pending or a command runs
+RETRY_CAP_SECONDS = 3600.0  # the longest wait between attempts to start targets again
+GIVE_UP_AFTER = 5  # consecutive failures to start the same targets before the guard stops asking about them
 
 
 @dataclass
@@ -85,7 +87,14 @@ class Guard:
         self.pending_adoption: Set[str] = {t.name for t in self.triggers}  # triggers not yet scanned successfully
         self.last_active = self.clock()
         self.retry_at = 0.0
+        self._busy = False  # a stop or start is in progress; the commands behind it may take minutes
+        self._pid_start = statusmod.process_start(os.getpid())
+        self._fail_keys: frozenset = frozenset()  # the targets whose start failed on the latest attempt
+        self._fail_count = 0  # consecutive failed attempts to start exactly those targets
+        self._gave_up = False
         self._scan()  # adopts the launches that are already running
+        self._adopt()
+        self._report_unreadable_state()
 
     @property
     def _can_ask(self) -> bool:
@@ -110,6 +119,39 @@ class Guard:
                 self.seen.update(key for _launch, key in pairs)
             found.extend(pairs)
         return found
+
+    def _adopt(self) -> None:
+        """Hand each provider that has an `adopt` hook the refs loaded from the state file that belong to it."""
+        for runtime in self.runtimes:
+            mine = [dict(ref) for ref in self.state.stopped if ref["runtime"] == runtime.name]
+            hook = getattr(runtime, "adopt", None)
+            if not mine or not callable(hook):
+                continue
+            try:
+                hook(mine)
+            except Exception as exc:
+                log(f"adopt through {runtime.name} failed: {exc!r}")
+
+    def _release(self, refs: List[Ref]) -> None:
+        """Tell each provider that has a `release` hook that the guard dropped these refs without starting them."""
+        for name in dict.fromkeys(ref["runtime"] for ref in refs):
+            runtime = next((r for r in self.runtimes if r.name == name), None)
+            hook = getattr(runtime, "release", None)
+            if not callable(hook):
+                continue
+            try:
+                hook([dict(ref) for ref in refs if ref["runtime"] == name])
+            except Exception as exc:
+                log(f"release through {name} failed: {exc!r}")
+
+    def _report_unreadable_state(self) -> None:
+        if not getattr(self.state, "unreadable", False):
+            return
+        kept = getattr(self.state, "corrupt_copy", None) is not None
+        message = "could not read the list of stopped programs" + ("; a copy was kept" if kept else "")
+        log(message)
+        self._event("failure", message)
+        self._notify("GPU Game Guard", message[0].upper() + message[1:] + ".")
 
     def _targets(self, config: Config) -> List[Target]:
         targets: List[Target] = []
@@ -179,12 +221,12 @@ class Guard:
         STATUS_REWRITE_SECONDS. A failure is logged once and never stops the guard."""
         state = self._state_name()
         current = statusmod.Status(
-            version=__version__, pid=os.getpid(), updated=0.0, state=state,
+            version=__version__, pid=os.getpid(), pid_start=self._pid_start, updated=0.0, state=state,
             paused_until=self.paused_until, paused=self.paused_until is not None, game=self.current_game,
             stopped=[dict(ref) for ref in self.state.stopped], config_ok=self.config_error is None,
             config_error=self.config_error, dialog=self.dialog_name, can_ask=self._can_ask,
             targets=len(self.last_config.targets),
-            valid_for=LONG_VALIDITY_SECONDS if state in ("asking", "restart-pending") else 15.0)
+            valid_for=LONG_VALIDITY_SECONDS if self._busy or state in ("asking", "restart-pending") else 15.0)
         fingerprint = dataclasses.asdict(current)
         now = self.clock()
         if (fingerprint == self._last_status and self._status_written_at is not None
@@ -333,7 +375,12 @@ class Guard:
     def _stop(self, targets: List[Target], present: Set[LaunchKey]) -> List[str]:
         """Stop the targets and record those that are no longer running; returns their names."""
         refs = [t.ref for t in targets]
-        self._each_runtime(refs, "stop")
+        self._busy = True
+        self._publish()
+        try:
+            self._each_runtime(refs, "stop")
+        finally:
+            self._busy = False
         still = self._running_keys()
         stopped = [ref for ref in refs if ref_key(ref) not in still]
         survivors = [ref["name"] for ref in refs if ref not in stopped]
@@ -343,6 +390,7 @@ class Guard:
             return []
         self.baseline |= present
         self.state.add(stopped, self.wall())
+        self._reset_failures()
         try:
             self.state.save()
         except Exception as exc:  # the stop already happened; the restart offer works from memory
@@ -360,7 +408,12 @@ class Guard:
 
     def _start(self, refs: List[Ref]) -> List[Ref]:
         """Start the targets through their providers; returns the refs that could not be started."""
-        return self._each_runtime(refs, "start")
+        self._busy = True
+        self._publish()
+        try:
+            return self._each_runtime(refs, "start")
+        finally:
+            self._busy = False
 
     def _each_runtime(self, refs: List[Ref], verb: str) -> List[Ref]:
         """Hand each provider its refs. For `start`, returns the refs that failed: those the provider reported,
@@ -392,9 +445,24 @@ class Guard:
         except Exception as exc:
             log(f"notification failed: {exc!r}")
 
+    def _reset_failures(self) -> None:
+        self._fail_keys, self._fail_count, self._gave_up = frozenset(), 0, False
+
+    def _retry_delay(self, config: Config) -> float:
+        """How long to wait after the latest failed attempt: the retry interval, doubled for each further failure
+        in a row up to an hour, and an hour once the guard has stopped asking."""
+        base = config.dialog_retry_seconds
+        if self._gave_up:
+            return max(RETRY_CAP_SECONDS, base)
+        return min(base * 2 ** max(self._fail_count - 1, 0), max(RETRY_CAP_SECONDS, base))
+
     def _maybe_restart(self, now: float, config: Config) -> None:
         if not self.state.stopped:
+            if self._fail_count or self._gave_up:
+                self._reset_failures()
             return
+        if self._fail_keys and frozenset(ref_key(ref) for ref in self.state.stopped) != self._fail_keys:
+            self._reset_failures()  # the stopped set is not the one that kept failing
         if self.state.game_seen:
             due = now - self.last_active >= config.exit_grace_seconds
         else:
@@ -406,11 +474,15 @@ class Guard:
         after_game = config.after_game
         if after_game == "ask" and not self._can_ask:
             after_game = "restart"
+        if self._gave_up:
+            after_game = "restart"  # the answer was given before; later attempts are silent
+        dropped = False
         if after_game == "leave":
             log(f"leaving stopped: {names}")
             self._event("leave", f"left stopped: {names}")
+            dropped = True
         elif after_game == "restart":
-            if not self._restart(refs, config, now, notify_success=True):
+            if not self._restart(refs, config, now, notify_success=not self._gave_up):
                 return
         else:
             self.asking = True
@@ -433,6 +505,10 @@ class Guard:
             else:
                 log("leaving containers stopped")
                 self._event("leave", f"left stopped: {names}")
+                dropped = True
+        if dropped:
+            self._release(refs)
+        self._reset_failures()
         try:
             self.state.clear()
         except Exception as exc:  # the state clears itself in memory before it touches the disk
@@ -442,32 +518,45 @@ class Guard:
 
     def _restart(self, refs: List[Ref], config: Config, now: float, notify_success: bool) -> bool:
         """Start the recorded targets. Returns True when all started. Targets that could not be started stay
-        in the state and are tried again after `dialog_retry_seconds`; only those that started are forgotten."""
+        in the state and are tried again after a delay that doubles with each failure in a row (see
+        `_retry_delay`); only those that started are forgotten. After GIVE_UP_AFTER failures in a row to start
+        the same targets the guard logs that once and from then on retries hourly without dialogs or
+        notifications."""
         log(f"restarting {', '.join(ref['name'] for ref in refs)}")
         failed = self._start(refs)
         failed_keys = {ref_key(ref) for ref in failed}
         started = [ref["name"] for ref in refs if ref_key(ref) not in failed_keys]
         missed = [ref["name"] for ref in refs if ref_key(ref) in failed_keys]
+        if not missed:
+            self._event("restart", f"started {', '.join(started)} again")
+            if notify_success:
+                self._notify("GPU Game Guard", f"Started {', '.join(started)} again.")
+            return True
         if started:
-            message = f"started {', '.join(started)} again"
-            if missed:
-                message += f"; could not start {', '.join(missed)}"
+            message = f"started {', '.join(started)} again; could not start {', '.join(missed)}"
         else:
             message = f"could not start {', '.join(missed)}"
-        self._event("restart", message)
-        if missed:
+        if started or frozenset(failed_keys) != self._fail_keys:
+            self._fail_count = 1
+            self._gave_up = False
+        else:
+            self._fail_count += 1
+        self._fail_keys = frozenset(failed_keys)
+        quiet = self._gave_up
+        if not quiet:
+            self._event("restart", message)
             log(message)
             self._notify("GPU Game Guard", message[0].upper() + message[1:] + ".")
-            self.state.remove([ref for ref in refs if ref_key(ref) not in failed_keys])
-            try:
-                self.state.save()
-            except Exception as exc:
-                log(f"could not save the state: {exc!r}")
-            self.retry_at = now + config.dialog_retry_seconds
-            return False
-        if notify_success:
-            self._notify("GPU Game Guard", f"Started {', '.join(started)} again.")
-        return True
+            if self._fail_count >= GIVE_UP_AFTER:
+                self._gave_up = True
+                log("giving up asking, refs kept in state; run `gpu-game-guard status`")
+        self.state.remove([ref for ref in refs if ref_key(ref) not in failed_keys])
+        try:
+            self.state.save()
+        except Exception as exc:
+            log(f"could not save the state: {exc!r}")
+        self.retry_at = now + self._retry_delay(config)
+        return False
 
     def _poll_delay(self) -> float:
         """The configured poll interval limited to a range `time.sleep` accepts and a sensible one."""
@@ -477,14 +566,21 @@ class Guard:
             return 1.0
         return min(max(seconds, 0.2), 60.0) if math.isfinite(seconds) else 1.0
 
+    def shutdown(self) -> None:
+        """Remove this guard's status file so a stopped service never reads as running."""
+        statusmod.remove_status(self.status_dir, pid=os.getpid())
+
     def run(self) -> None:
-        while True:
-            try:
-                self.step()
-            except Exception as exc:  # keep watching; a failed pass must not end the service
-                log(f"error: {exc!r}")
-            try:
-                time.sleep(self._poll_delay())
-            except Exception as exc:
-                log(f"error: {exc!r}")
-                time.sleep(1.0)
+        try:
+            while True:
+                try:
+                    self.step()
+                except Exception as exc:  # keep watching; a failed pass must not end the service
+                    log(f"error: {exc!r}")
+                try:
+                    time.sleep(self._poll_delay())
+                except Exception as exc:
+                    log(f"error: {exc!r}")
+                    time.sleep(1.0)
+        finally:
+            self.shutdown()

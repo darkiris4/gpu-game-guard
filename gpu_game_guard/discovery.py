@@ -34,6 +34,7 @@ _PYTHON = re.compile(r"python[0-9.]*")
 _GLOB_CHARS = re.compile(r"[*?\[\]/]")
 _ID_CHARS = re.compile(r"[^a-z0-9_-]+")
 
+MAX_ROOTS = 25  # a process name with more root processes than this is refused by the process runtime (see processes.MAX_PROCESSES)
 MIN_MATCH = 3  # a process name shorter than this cannot be managed (see processes.MIN_LITERAL)
 
 RISK_LOW, RISK_MEDIUM, RISK_HIGH = "low", "medium", "high"
@@ -160,6 +161,26 @@ def _owner(proc: Path, pid: int) -> Optional[int]:
     return None
 
 
+def _roots_by_name(proc: Path, uid: int, names: Set[str]) -> Dict[str, int]:
+    """For each of `names`, the number of the user's live processes of that name whose parent does not share it:
+    the count the process runtime compares with its limit."""
+    found: Dict[str, Dict[int, int]] = {}
+    try:
+        entries = [entry.name for entry in proc.iterdir() if entry.name.isdigit()]
+    except OSError:
+        return {}
+    for entry in entries:
+        pid = int(entry)
+        comm = (_read(proc / entry / "comm") or "").strip()
+        if comm not in names or _owner(proc, pid) != uid:
+            continue
+        stat = gpu.parse_stat(_read(proc / entry / "stat") or "")
+        if stat is None or stat[0] in ("Z", "X"):
+            continue
+        found.setdefault(comm, {})[pid] = stat[1]
+    return {comm: len(gpu.root_pids(parents)) for comm, parents in found.items()}
+
+
 def discover(config: Any, runtimes: Sequence[Runtime], proc: Path = gpu.PROC, run: Optional[gpu.Runner] = None,
              uid: Optional[int] = None) -> List[Candidate]:
     """What could be paused, safest first: auto containers, then services, then processes. Protected names are
@@ -172,7 +193,8 @@ def discover(config: Any, runtimes: Sequence[Runtime], proc: Path = gpu.PROC, ru
     except Exception as exc:
         util.log(f"discovery: GPU memory lookup failed ({exc})")
         by_pid = None
-    if not by_pid:
+    listed = gpu.measured_pids(by_pid)
+    if not listed:
         return candidates
     specs = _managed_specs(config)
     taken = {str(getattr(spec, "id", "")) for spec in specs}
@@ -182,7 +204,7 @@ def discover(config: Any, runtimes: Sequence[Runtime], proc: Path = gpu.PROC, ru
     unit_comms: Dict[Tuple[str, str], Set[str]] = {}
     unit_cmdlines: Dict[Tuple[str, str], List[List[str]]] = {}
     processes: Dict[str, List[int]] = {}
-    for pid in sorted(by_pid):
+    for pid in sorted(listed):
         if pid == own_pid:
             continue
         cgroup = _read(proc / str(pid) / "cgroup")
@@ -206,8 +228,10 @@ def discover(config: Any, runtimes: Sequence[Runtime], proc: Path = gpu.PROC, ru
         if any(is_protected(config, name, cmdline) for name in names for cmdline in unit_cmdlines[service]):
             del units[service]
 
-    def total(pids: List[int]) -> int:
-        return sum(by_pid.get(pid, 0) for pid in pids)
+    def total(pids: List[int]) -> Optional[int]:
+        return gpu.memory_for_pids(by_pid, pids)  # None when any of the pids is listed without a figure
+
+    roots = _roots_by_name(proc, own_uid, set(processes)) if processes else {}
 
     services = []
     for (scope, unit), pids in units.items():
@@ -223,6 +247,8 @@ def discover(config: Any, runtimes: Sequence[Runtime], proc: Path = gpu.PROC, ru
                                   total(pids), managed, RISK_LOW, spec_dict, note))
     procs = []
     for comm, pids in processes.items():
+        if roots.get(comm, 0) > MAX_ROOTS:
+            continue  # the process runtime would refuse the pattern as too broad
         managed = any(getattr(spec, "kind", None) == "process" and isinstance(getattr(spec, "match", None), str)
                       and fnmatch.fnmatchcase(comm, spec.match) for spec in specs)
         spec_dict = {"id": _slug(comm, taken), "kind": "process", "label": comm, "match": comm, "restart": True}

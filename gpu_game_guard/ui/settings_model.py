@@ -8,6 +8,9 @@ import copy
 import dataclasses
 import glob
 import json
+import os
+import queue
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Sequence, Tuple
@@ -26,6 +29,7 @@ RESTART_COMMAND = ["systemctl", "--user", "restart", SERVICE_UNIT]
 START_COMMAND = "systemctl --user start gpu-game-guard"
 # Settings that the running service reads once at start; a saved change to one of them needs a restart.
 _RESTART_FIELDS = ("runtimes", "triggers", "dialog")
+SCAN_POLL_MS = 30  # how often the GUI thread looks for the result of a scan
 MAX_RAW_BYTES = 2 * 1024 * 1024  # the largest unusable file offered for repair in the Raw editor
 
 Runner = Callable[[List[str]], Tuple[int, str]]
@@ -46,23 +50,6 @@ def _default_runner(argv: List[str]) -> Tuple[int, str]:
 def _restart_key(config: Config) -> Tuple[Any, ...]:
     return tuple(tuple(getattr(config, name)) if isinstance(getattr(config, name), list) else getattr(config, name)
                  for name in _RESTART_FIELDS)
-
-
-class _ScanThread(QtCore.QThread):
-    """Runs one discovery off the GUI thread. `result` is read after `finished`."""
-
-    def __init__(self, discover: Discover, config: Config, parent: Optional[QtCore.QObject] = None):
-        super().__init__(parent)
-        self._discover = discover
-        self._config = config
-        self.result: List[Candidate] = []
-        self.error = ""
-
-    def run(self) -> None:
-        try:
-            self.result = list(self._discover(self._config))
-        except Exception as exc:
-            self.error = str(exc) or type(exc).__name__
 
 
 def _load_report(path: Path, error: ConfigError) -> Tuple[List[str], str]:
@@ -107,8 +94,15 @@ class SettingsModel(QtCore.QObject):
         self._candidates: Optional[List[Candidate]] = None
         self._defaults_accepted = False  # a broken file was given up on; the next save replaces it
         self.scanning = False
-        self._scan_thread: Optional[_ScanThread] = None
+        self.scan_error = ""  # why the last scan found nothing; empty when it worked
+        self._scan_results: "queue.Queue[Tuple[int, List[Candidate], str]]" = queue.Queue()
+        self._scan_running = False
+        self._scan_serial = 0
         self._scan_again = False
+        self._closed = False
+        self._scan_poll = QtCore.QTimer(self)
+        self._scan_poll.setInterval(SCAN_POLL_MS)
+        self._scan_poll.timeout.connect(self._poll_scan)
 
     def _load(self) -> Tuple[Config, Optional[Tuple[int, int, int]]]:
         """(the config in the file, the file's stamp from before it was read). A file that cannot be used leaves
@@ -198,6 +192,49 @@ class SettingsModel(QtCore.QObject):
     def _broken_copies(self) -> List[Path]:
         return sorted(self.path.parent.glob(glob.escape(self.path.name) + ".broken-*"))
 
+    def _config_error_problem(self, error: ConfigError) -> str:
+        """The message for a save that was refused because of `error`. A file that became unusable after it was
+        read says how to repair it."""
+        try:
+            configmod.load(self.path)
+        except ConfigError as disk:
+            return (f"The settings could not be saved because the file on disk has become unusable: {self.path} "
+                    f"{disk.reason}. It was left as it is. Press Revert to load the file again, which discards "
+                    "these edits and opens its text in the Raw config tab for repair; or open the Raw config tab, "
+                    "whose text is that file, and repair it there.")
+        return f"The settings could not be saved: {error.reason}. {self.path} was left as it is."
+
+    def _replace_unusable_file(self, ours: Config) -> Config:
+        """Save `ours` over a file that could not be used, and note whether the old file was kept as a copy."""
+        started = time.time()
+        before = set(self._broken_copies())
+        existed = os.path.lexists(self.path)
+        why = self._unreadable_reason()
+        configmod.save(ours, self.path)
+
+        def newer(copy_path: Path) -> bool:
+            try:
+                return copy_path not in before or copy_path.stat().st_mtime >= started - 2
+            except OSError:
+                return False
+
+        fresh = [p for p in self._broken_copies() if newer(p)]
+        if fresh:
+            self.notices.append(f"The unusable settings file was kept as {fresh[-1]}.")
+        elif existed:
+            self.notices.append("The unusable settings file was replaced, but no backup copy of it could be made: "
+                                + (f"it cannot be read ({why})." if why else "the copy could not be written next to it."))
+        return ours
+
+    def _unreadable_reason(self) -> str:
+        """Why the file cannot be read, or an empty string when it can."""
+        try:
+            with open(self.path, "rb") as handle:
+                handle.read(1)
+        except OSError as exc:
+            return exc.strerror or type(exc).__name__
+        return ""
+
     def apply(self) -> List[str]:
         """Validate and save the working copy. Returns the problems; an empty list means it was saved. When the
         file changed on disk since it was read, the edits are merged into the new content first."""
@@ -219,27 +256,31 @@ class SettingsModel(QtCore.QObject):
                 pass
         try:
             if replace_file:
-                before = set(self._broken_copies())
-                configmod.save(ours, self.path)
-                merged = ours
-                fresh = [p for p in self._broken_copies() if p not in before]
-                if fresh:
-                    self.notices.append(f"The unusable settings file was kept as {fresh[-1]}.")
+                merged = self._replace_unusable_file(ours)
             else:
-                changed_on_disk: List[bool] = []
+                outcome: List[str] = []
 
                 def mutate(disk: Config) -> Config:
-                    external = configmod.file_stamp(self.path) != self._stamp
-                    changed_on_disk.append(external)
-                    return configmod.merge3(self._base, ours, disk) if external else ours
+                    if self._stamp is not None and not os.path.lexists(self.path):
+                        outcome.append("removed")  # nothing on disk to merge with: the working copy is the file
+                        return ours
+                    if configmod.file_stamp(self.path) != self._stamp:
+                        outcome.append("merged")
+                        return configmod.merge3(self._base, ours, disk)
+                    return ours
 
                 merged = configmod.update_file(mutate, self.path)
-                if changed_on_disk and changed_on_disk[0]:
+                if outcome == ["removed"]:
+                    self.notices.append("The configuration file was removed; it has been written again with "
+                                        "your settings.")
+                elif outcome == ["merged"]:
                     self.notices.append("The configuration changed on disk; your edits were merged.")
         except ConfigError as exc:
-            return [f"The settings could not be saved: {exc.reason}. The file was left as it is."]
+            return [self._config_error_problem(exc)]
         except (OSError, ValueError) as exc:
-            return [f"The settings could not be saved: {getattr(exc, 'strerror', None) or type(exc).__name__}."]
+            reason = getattr(exc, "strerror", None) or str(exc) or type(exc).__name__
+            return [f"The settings could not be saved: {reason}. {self.path} could not be written, so the changes "
+                    "are still unsaved."]
         self._base = copy.deepcopy(merged)
         self._working = copy.deepcopy(merged)
         self._stamp = configmod.file_stamp(self.path)
@@ -291,14 +332,18 @@ class SettingsModel(QtCore.QObject):
         if error:
             log(f"settings: discovery failed ({error})")
         self._candidates = found
+        self.scan_error = error
         self.scanning = False
         self.changed.emit()
 
     def scan(self, refresh: bool = True) -> bool:
-        """Look for candidates without blocking the window: the work runs in a thread and `changed` fires when it
-        starts and again when the result is in. Returns False when nothing was started (a scan is under way, or
-        `refresh` is false and there is a result already)."""
-        if self._scan_thread is not None:
+        """Look for candidates without blocking the window: the work runs in a daemon thread whose result is
+        handed back through a queue that a timer on the GUI thread reads, and `changed` fires when the scan starts
+        and again when the result is in. Returns False when nothing was started (a scan is under way, `refresh`
+        is false and there is a result already, or the model was shut down)."""
+        if self._closed:
+            return False
+        if self._scan_running:
             self._scan_again = self._scan_again or refresh
             return False
         if not refresh and self._candidates is not None:
@@ -306,22 +351,33 @@ class SettingsModel(QtCore.QObject):
         if not self._threaded:
             self._finish_scan(*self._discover_now(copy.deepcopy(self._working)))
             return True
-        thread = _ScanThread(self._discover, copy.deepcopy(self._working), self)
-        thread.finished.connect(self._scan_finished)
-        self._scan_thread = thread
+        self._scan_serial += 1
+        serial, config, discover, results = self._scan_serial, copy.deepcopy(self._working), self._discover, self._scan_results
+
+        def work() -> None:
+            try:
+                outcome: Tuple[int, List[Candidate], str] = (serial, list(discover(config)), "")
+            except BaseException as exc:
+                outcome = (serial, [], str(exc) or type(exc).__name__)
+            results.put(outcome)
+
+        self._scan_running = True
         self.scanning = True
-        thread.start()
+        self._scan_poll.start()
+        threading.Thread(target=work, name="settings-scan", daemon=True).start()
         self.changed.emit()
         return True
 
-    def _scan_finished(self) -> None:
-        thread = self._scan_thread
-        if thread is None:
+    def _poll_scan(self) -> None:
+        """Take the result of the scan on the GUI thread once the worker has delivered it."""
+        try:
+            serial, found, error = self._scan_results.get_nowait()
+        except queue.Empty:
             return
-        thread.wait()
-        self._scan_thread = None
-        found, error = list(thread.result), thread.error
-        thread.deleteLater()
+        self._scan_poll.stop()
+        if self._closed or serial != self._scan_serial:
+            return
+        self._scan_running = False
         again, self._scan_again = self._scan_again, False
         self._finish_scan(found, error)
         if again:
@@ -330,18 +386,23 @@ class SettingsModel(QtCore.QObject):
     def wait_scan(self, timeout: float = 10.0) -> bool:
         """Block until no scan is running and its result has been applied; True when that happened in time."""
         deadline = time.monotonic() + timeout
-        while self._scan_thread is not None:
-            thread = self._scan_thread
+        while self._scan_running:
             if time.monotonic() >= deadline:
                 return False
-            thread.wait(50)
+            self._poll_scan()
+            if self._scan_running:
+                time.sleep(0.01)
             QtCore.QCoreApplication.processEvents()
         return True
 
     def shutdown(self) -> None:
-        """Wait for a running scan, so that no thread outlives the model."""
+        """Stop following a running scan and return at once. The scan's thread is a daemon: it finishes or ends
+        with the process, and its result is dropped."""
+        self._closed = True
         self._scan_again = False
-        self.wait_scan(10.0)
+        self._scan_running = False
+        self.scanning = False
+        self._scan_poll.stop()
 
     # the service
 

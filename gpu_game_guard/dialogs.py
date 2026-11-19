@@ -33,10 +33,13 @@ NOTIFY_EXPIRE_MS = NOTIFY_TIMEOUT_SECONDS * 1000
 INFO_TIMEOUT_SECONDS = 30  # commands that only display something and return
 
 # Characters that cannot appear in XML text or in a command line argument: C0 and C1 controls other than tab and
-# newline, lone surrogates and the two non-characters at the end of the basic plane. The bidirectional override and
-# isolate characters are included because they reorder the text around them.
+# newline, lone surrogates and the two non-characters at the end of the basic plane. The bidirectional embedding,
+# override and isolate characters are included because they reorder the text around them, and the Unicode line and
+# paragraph separators because they break a line. The left-to-right, right-to-left and Arabic letter marks stay:
+# legitimate Arabic and Hebrew text uses them. Controls that break a line (vertical tab, form feed, next line) and
+# the separators become a space, as in `ui.theme.safe_text`.
 _UNSAFE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\ud800-\udfff\ufffe\uffff\u202a-\u202e\u2066-\u2069"
-                     "\u200e\u200f\u061c]")
+                     "\u2028\u2029]")
 # What a target kind is called in running text: (singular, plural), in the order a list of kinds is written.
 _KIND_NOUNS = (("container", "containers"), ("service", "services"), ("program", "programs"))
 _KIND_ALIASES = {"process": "program", "command": "program"}
@@ -123,6 +126,17 @@ def kind_phrase(kinds: Optional[Sequence[str]] = None, joiner: str = "or") -> st
     return f"{', '.join(nouns[:-1])} {joiner} {nouns[-1]}"
 
 
+def subject_phrase(kinds: Optional[Sequence[str]] = None) -> Tuple[str, str]:
+    """The subject of a sentence about the targets and the verb that agrees with it: ("this container", "has") for
+    one target, ("these containers or services", "have") for several. Without kinds the generic plural is used."""
+    kinds = list(kinds or [])
+    if len(kinds) == 1:
+        known = {singular for singular, _ in _KIND_NOUNS}
+        kind = _KIND_ALIASES.get(kinds[0], kinds[0])
+        return f"this {kind if kind in known else 'program'}", "has"
+    return f"these {kind_phrase(kinds or None)}", "have"
+
+
 def _memory_text(target: Target) -> str:
     if target.vram_mib is None:
         return "GPU memory use unknown"
@@ -145,12 +159,12 @@ def _totals_text(totals: Optional[Tuple[int, int]]) -> str:
 def launch_message(launch: Launch, targets: Sequence[Target], totals: Optional[Tuple[int, int]],
                    markup: str = "plain") -> str:
     title = _esc(launch.title, markup)
-    these = f"these {kind_phrase([t.kind for t in targets])}" if targets else "these programs and services"
-    intro = (f"{_bold(TITLE, markup)} ended the launch of {_bold(title, markup)} because {these} have "
+    these, verb = subject_phrase([t.kind for t in targets])
+    intro = (f"{_bold(TITLE, markup)} ended the launch of {_bold(title, markup)} because {these} {verb} "
              "access to the GPU:")
     summary = _totals_text(totals)
     impact = impact_sentence(targets, markup)
-    question = "Stop them and start the game?"
+    question = "Stop it and start the game?" if len(targets) == 1 else "Stop them and start the game?"
     if markup == "html":
         rows = "".join(f"<li><b>{_esc(t.name, markup)}</b><br><small>{_detail(t, markup)}</small></li>" for t in targets)
         small = f"<p><small>{summary}</small></p>" if summary else ""

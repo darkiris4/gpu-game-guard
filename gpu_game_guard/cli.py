@@ -6,6 +6,7 @@ import dataclasses
 import json
 import math
 import re
+import signal
 import sys
 import time
 from pathlib import Path
@@ -20,7 +21,7 @@ EXIT_OK, EXIT_FAILED, EXIT_USAGE = 0, 1, 2
 EXIT_CONFIG = 78  # EX_CONFIG: `run` refuses to start on an invalid config
 EXIT_INTERRUPTED = 130
 QT_MISSING = "Install python3-pyqt5 (sudo apt install python3-pyqt5)"
-_DURATION = re.compile(r"(\d+(?:\.\d+)?)([smhd])\Z")
+_DURATION = re.compile(r"([0-9]+(?:\.[0-9]+)?)([smhd])\Z")
 _UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 MAX_PAUSE_DAYS = 365
 MAX_PAUSE_SECONDS = MAX_PAUSE_DAYS * 86400
@@ -67,6 +68,10 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser = commands.add_parser("status", parents=[common],
                                         help="show what the running service is doing (exit 1 when it is not running)")
     status_parser.add_argument("--json", action="store_true", help="print the status as JSON")
+    state_parser = commands.add_parser("state", parents=[common],
+                                       help="inspect or drop the list of targets the guard stopped and has not started again")
+    state_parser.add_argument("action", choices=["clear"],
+                              help="clear: print the stopped targets and forget them without starting them")
     targets_parser = commands.add_parser("targets", parents=[common], help="list or change the configured host targets")
     targets_parser.add_argument("action", choices=["list", "enable", "disable", "remove"],
                                 help="list the targets, or enable, disable or remove the target ID")
@@ -141,8 +146,27 @@ def command_run(args) -> int:
     prompter = dialogs.choose(cfg.dialog)
     log(f"gpu-game-guard {__version__}: triggers {[t.name for t in active_triggers]}, "
         f"runtimes {[r.name for r in active_runtimes]}, dialogs {prompter.name}")
-    Guard(watcher, active_triggers, active_runtimes, prompter, State(), gpu_totals=gpu.totals,
-          status_dir=None, dialog_name=prompter.name).run()
+    guard = Guard(watcher, active_triggers, active_runtimes, prompter, State(), gpu_totals=gpu.totals,
+                  status_dir=None, dialog_name=prompter.name)
+
+    def terminate(signum, frame):
+        raise SystemExit(EXIT_OK)  # unwinds through `Guard.run`, which removes the status file
+
+    previous = {}
+    for name in ("SIGTERM", "SIGHUP"):
+        try:
+            number = getattr(signal, name)
+            previous[number] = signal.signal(number, terminate)
+        except (AttributeError, ValueError, OSError):
+            pass  # not available on this platform, or not the main thread
+    try:
+        guard.run()
+    finally:
+        for number, handler in previous.items():
+            try:
+                signal.signal(number, handler)
+            except (ValueError, OSError, TypeError):
+                pass
     return EXIT_OK
 
 
@@ -245,7 +269,10 @@ def command_config(args) -> int:
         detail = exc.strerror if isinstance(exc, OSError) and exc.strerror else exc
         print(f"{path}: cannot be read as JSON: {detail}", file=sys.stderr)
         return EXIT_FAILED
-    problems = configmod.validate(data)
+    try:
+        problems = configmod.validate(data)
+    except configmod.ConfigError as exc:
+        problems = [exc.reason]
     for problem in problems:
         print(f"{path}: {problem}", file=sys.stderr)
     if any("unknown key" in problem for problem in problems):
@@ -308,6 +335,37 @@ def command_status(args) -> int:
     print(f"dialogs:  {view.dialog or 'unknown'}" + ("" if view.can_ask else " (cannot ask)"))
     print(f"targets:  {view.targets} configured")
     print("config:   " + ("ok" if view.config_ok else f"INVALID: {view.config_error}; the previous settings are in use"))
+    return EXIT_OK
+
+
+def command_state(args) -> int:
+    """`state clear`: forget the stopped targets without starting them. Providers hear of it through `release`."""
+    state = State()
+    if not state.stopped:
+        print("nothing is recorded as stopped")
+        return EXIT_OK
+    refs = [dict(ref) for ref in state.stopped]
+    print("stopped targets dropped from the list (they were not started): " + ", ".join(str(ref["name"]) for ref in refs))
+    if statusmod.read_status() is not None:
+        print("note: the service is running; restart it (systemctl --user restart gpu-game-guard) so it forgets them too",
+              file=sys.stderr)
+    cfg, _problem = read_config(args.config)
+    cfg = cfg or configmod.Config()
+    wanted = {ref["runtime"] for ref in refs}
+    try:
+        found = [runtime for runtime in runtimes.build(cfg.runtimes, get_config=lambda: cfg) if runtime.name in wanted]
+    except Exception as exc:
+        log(f"cannot reach the providers to release the targets: {exc!r}")
+        found = []
+    for runtime in found:
+        hook = getattr(runtime, "release", None)
+        if not callable(hook):
+            continue
+        try:
+            hook([ref for ref in refs if ref["runtime"] == runtime.name])
+        except Exception as exc:
+            log(f"release through {runtime.name} failed: {exc!r}")
+    state.clear()
     return EXIT_OK
 
 
@@ -490,12 +548,9 @@ def command_settings(args) -> int:
     except ImportError:
         print(QT_MISSING, file=sys.stderr)
         return EXIT_FAILED
-    if not getattr(args, "config_given", False):
-        return int(run())
-    try:
+    if getattr(args, "config_given", False):
         return int(run(config_path=args.config))
-    except TypeError:  # a settings window that does not take the parameter
-        return int(run())
+    return int(run())
 
 
 def command_tray(args) -> int:
@@ -532,7 +587,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     command = args.command or "run"
     handlers = {
         "run": command_run, "check": command_check, "config": command_config, "pause": command_pause,
-        "resume": command_resume, "status": command_status, "targets": command_targets,
+        "resume": command_resume, "status": command_status, "state": command_state, "targets": command_targets,
         "presets": command_presets, "discover": command_discover, "polkit": command_polkit,
         "settings": command_settings, "tray": command_tray, "prompt": command_prompt,
     }

@@ -128,13 +128,20 @@ class MessageTests(unittest.TestCase):
         def intro(*kinds):
             targets = [Target(k, "x", f"n{i}", "", 1) for i, k in enumerate(kinds)]
             return dialogs.launch_message(launch("G"), targets, None, "plain")
-        self.assertIn("because these containers have access", intro("container"))
+        self.assertIn("because this container has access", intro("container"))
+        self.assertIn("because this service has access", intro("service"))
+        self.assertIn("because this program has access", intro("process"))
         self.assertIn("because these services have access", intro("service", "service"))
         self.assertIn("because these programs have access", intro("process", "command"))
         self.assertIn("because these containers, services or programs have access",
                       intro("process", "container", "service"))
         self.assertIn("because these containers or services have access", intro("service", "container"))
-        self.assertIn("these programs have", intro("mystery"))
+        self.assertIn("this program has", intro("mystery"))
+        self.assertNotIn("using the GPU", intro("container", "service"))
+        self.assertEqual(dialogs.subject_phrase(["container"]), ("this container", "has"))
+        self.assertEqual(dialogs.subject_phrase(["container", "service"]), ("these containers or services", "have"))
+        self.assertEqual(dialogs.subject_phrase(), ("these programs and services", "have"))
+        self.assertEqual(dialogs.subject_phrase([]), ("these programs and services", "have"))
         self.assertNotIn("containers", intro("service"))
         self.assertEqual(dialogs.kind_phrase(), "programs and services")
         self.assertIn("stopped these services or programs earlier",
@@ -156,7 +163,21 @@ class MessageTests(unittest.TestCase):
 
     def test_bidirectional_controls_are_removed(self):
         text = dialogs.launch_message(launch("a\u202eb\u2066c\u200fd"), [target()], None, "plain")
-        self.assertIn("a b c d", text)
+        self.assertIn("a b c\u200fd", text)
+
+    def test_marks_of_right_to_left_text_stay_and_overrides_go(self):
+        title = "\u0645\u0631\u062d\u0628\u0627\u061c \u05e9\u05dc\u05d5\u05dd\u200f abc\u200e"
+        text = dialogs.launch_message(launch(title + "\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"),
+                                      [target()], None, "plain")
+        self.assertIn(title, text)
+        for char in "\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069":
+            self.assertNotIn(char, text)
+
+    def test_line_separators_become_a_space_and_joiners_stay(self):
+        family = "\U0001f468\u200d\U0001f469\u200d\U0001f467"
+        text = dialogs.launch_message(launch(f"a\u2028b\u2029c\x0bd\x0ce\x85f{family}\u200c"), [target()], None,
+                                      "plain")
+        self.assertIn(f"a b c d e f{family}\u200c", text)
 
     def test_restart_message_is_neutral(self):
         for markup in ("html", "pango", "plain"):

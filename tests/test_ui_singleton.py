@@ -32,6 +32,17 @@ class SingletonTests(unittest.TestCase):
         again.release()
         first.release()  # releasing twice is harmless
 
+    def test_fallback_base_is_a_private_per_user_directory(self):
+        with mock.patch("gpu_game_guard.ui.singleton.tempfile.gettempdir", return_value=str(self.dir)):
+            base = singleton.fallback_base()
+            self.assertEqual(base, self.dir / f"gpu-game-guard-{os.getuid()}")
+            self.assertEqual(stat.S_IMODE(os.stat(base).st_mode), 0o700)
+            self.assertEqual(singleton.fallback_base(), base)  # an existing directory is accepted
+            base.rmdir()
+            base.symlink_to(self.dir)
+            with self.assertRaises(OSError):
+                singleton.fallback_base()
+
     def test_names_are_independent(self):
         one, two = singleton.acquire("one", self.dir), singleton.acquire("two", self.dir)
         self.assertTrue(one and two)

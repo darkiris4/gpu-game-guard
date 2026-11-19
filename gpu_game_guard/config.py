@@ -228,6 +228,13 @@ class Config:
 
     @classmethod
     def from_json(cls, data: dict) -> "Config":
+        try:
+            return cls._from_json(data)
+        except (RecursionError, OverflowError) as exc:
+            raise ConfigError(TOO_DEEP) from exc
+
+    @classmethod
+    def _from_json(cls, data: dict) -> "Config":
         problems = _problems(data, strict=False)
         if problems:
             raise ConfigError("; ".join(problems))
@@ -287,11 +294,43 @@ def _suggestion(key: str, known: Any) -> str:
 
 
 def validate(data: dict) -> List[str]:
-    """Human-readable problems with a decoded config, unknown keys included; an empty list means it is valid."""
+    """Human-readable problems with a decoded config, unknown keys included; an empty list means it is valid.
+    Raises ConfigError when the values nest too deeply to examine."""
     return _problems(data, strict=True)
 
 
+MAX_DEPTH = 100  # the deepest nesting of lists and objects a config may have
+TOO_DEEP = "the file nests values too deeply"
+
+
+def _too_deep(value: Any) -> bool:
+    """True when lists and objects inside `value` nest deeper than MAX_DEPTH. Iterative, so the check itself
+    cannot exhaust the stack."""
+    pending = [(value, 1)]
+    while pending:
+        item, depth = pending.pop()
+        if isinstance(item, dict):
+            children = list(item.values())
+        elif isinstance(item, list):
+            children = item
+        else:
+            continue
+        if depth > MAX_DEPTH:
+            return True
+        pending.extend((child, depth + 1) for child in children)
+    return False
+
+
 def _problems(data: Any, strict: bool) -> List[str]:
+    try:
+        if _too_deep(data):
+            raise ConfigError(TOO_DEEP)
+        return _problem_list(data, strict)
+    except (RecursionError, OverflowError) as exc:
+        raise ConfigError(TOO_DEEP) from exc
+
+
+def _problem_list(data: Any, strict: bool) -> List[str]:
     if not isinstance(data, dict):
         return [f"the top level must be a JSON object, not {type(data).__name__}"]
     problems: List[str] = []
@@ -351,7 +390,6 @@ def _target_problems(targets: Any, strict: bool) -> List[str]:
         return [f'"targets" must be a list of objects, got {_shown(targets)}']
     problems: List[str] = []
     seen: Dict[str, int] = {}
-    labels: Dict[str, int] = {}
     for index, entry in enumerate(targets):
         if not isinstance(entry, dict):
             problems.append(f'"targets"[{index}] must be an object, got {_shown(entry)}')
@@ -370,14 +408,6 @@ def _target_problems(targets: Any, strict: bool) -> List[str]:
             kind = None
         if "label" in entry and not isinstance(entry["label"], str):
             problems.append(f'{where}: "label" must be a string, got {_shown(entry["label"])}')
-        elif isinstance(target_id, str) and target_id:
-            shown_label = (entry.get("label") or target_id).strip().lower()
-            if shown_label in labels:
-                problems.append(f'{where}: the label {(entry.get("label") or target_id)!r} is already used by '
-                                f'"targets"[{labels[shown_label]}]; labels must differ (ignoring case) so the dialogs '
-                                "can tell the targets apart")
-            else:
-                labels[shown_label] = index
         if "enabled" in entry and not isinstance(entry["enabled"], bool):
             problems.append(f'{where}: "enabled" must be true or false, got {_shown(entry["enabled"])}')
         if kind == "service":
@@ -472,7 +502,10 @@ def _parses_as_config(path: Path) -> Optional[dict]:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, RecursionError):
         return None
-    return data if not _problems(data, strict=False) else None
+    try:
+        return data if not _problems(data, strict=False) else None
+    except ConfigError:
+        return None
 
 
 def _copy_file(source: Path, destination: Path) -> None:

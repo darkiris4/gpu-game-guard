@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import tempfile
 import unittest
@@ -36,6 +37,17 @@ def blend(foreground, background, alpha):
 
 
 HOSTILE = '<img src="file:///etc/passwd"><a href="file:///etc/passwd">x</a><b>B</b>'
+
+
+def _mkdir_unless(refused):
+    """An `os.mkdir` stand-in that fails inside `refused` and creates directories elsewhere."""
+    real = os.mkdir
+
+    def mkdir(path, mode=0o777):
+        if Path(path).parent == refused:
+            raise PermissionError("read-only")
+        real(path, mode)
+    return mkdir
 
 
 def key_event(kind, key):
@@ -84,6 +96,30 @@ class ThemeTests(unittest.TestCase):
                          "QTableView", "QHeaderView", "QScrollBar", "QMenu", "QFrame#Card", "QCheckBox", "badge"):
                 self.assertIn(part, sheet)
             self.assertIn(theme.colors(dark).accent, sheet)
+
+    def test_stylesheet_without_assets_keeps_the_indicator_borders_and_backgrounds(self):
+        sheet = theme.stylesheet(theme.LIGHT)
+        self.assertNotIn("image:", sheet)
+        for selector in ("QCheckBox::indicator {", "QRadioButton::indicator {", "QCheckBox::indicator:checked {"):
+            line = next(part for part in sheet.splitlines() if part.startswith(selector))
+            self.assertIn("border:", line)
+            self.assertIn("background:", line)
+        self.assertIn("QComboBox::drop-down", sheet)
+        self.assertIn("border-left:", sheet)
+        with_assets = theme.stylesheet(theme.LIGHT, {"arrow": "/a.png", "check": "/c.png"})
+        self.assertEqual(with_assets.count("image:"), 2)
+        self.assertEqual(sheet.count("QCheckBox::indicator {"), with_assets.count("QCheckBox::indicator {"))
+
+    def test_an_unchecked_box_is_visible_without_assets(self):
+        theme.apply_theme(self.app, dark=False)
+        self.assertNotIn("image:", self.app.styleSheet())
+        box = QtWidgets.QCheckBox("Remember my choice")
+        box.resize(box.sizeHint())
+        image = box.grab().toImage()
+        border = QtGui.QColor(theme.LIGHT.muted)
+        found = any(QtGui.QColor(image.pixel(x, image.height() // 2)).name() == border.name()
+                    for x in range(image.width() // 2))
+        self.assertTrue(found)
 
     def test_stylesheet_assets_are_optional(self):
         self.assertNotIn("url(", theme.stylesheet(theme.LIGHT))
@@ -195,13 +231,32 @@ class SafetyTests(unittest.TestCase):
         cls.app = qt.app()
 
     def test_safe_text_strips_controls_and_bidi(self):
-        raw = "a\x00b\x07c\u202ed\u2066e\u2069f\u200eg\u200fh\u061ci\x7fj\x85k"
-        self.assertEqual(theme.safe_text(raw), "abcdefghijk")
+        raw = "a\x00b\x07c\u202ad\u202be\u202cf\u202dg\u202eh\u2066i\u2067j\u2068k\u2069l\x7fm"
+        self.assertEqual(theme.safe_text(raw), "abcdefghijklm")
         self.assertEqual(theme.safe_text("a\nb\tc\r\nd"), "a b c  d")
         self.assertEqual(theme.safe_text("a\nb\tc\r\nd", keep_newlines=True), "a\nb c\nd")
         self.assertEqual(theme.safe_text(None), "")
         self.assertEqual(theme.safe_text(12), "12")
         self.assertEqual(theme.safe_text("plain <b>text</b> \u00e9"), "plain <b>text</b> \u00e9")
+
+    def test_direction_marks_of_arabic_and_hebrew_text_are_kept(self):
+        arabic = "\u0645\u0631\u062d\u0628\u0627\u061c 123\u200f"
+        hebrew = "\u05e9\u05dc\u05d5\u05dd\u200f (abc\u200e)"
+        mixed = f"Game {arabic} {hebrew} \u200eend"
+        self.assertEqual(theme.safe_text(mixed), mixed)
+        self.assertEqual(theme.safe_text(mixed + "\u202e\u2067"), mixed)
+        self.assertEqual(theme.safe_text(f"{hebrew}\u202bx\u202c", keep_newlines=True), f"{hebrew}x")
+
+    def test_line_separators_become_a_space(self):
+        self.assertEqual(theme.safe_text("a\u2028b\u2029c\x0bd\x0ce\x85f"), "a b c d e f")
+        self.assertEqual(theme.safe_text("a\u2028b\u2029c\x0bd\x0ce\x85f", keep_newlines=True), "a b c d e f")
+        self.assertEqual(theme.safe_text("a\nb", keep_newlines=True), "a\nb")
+
+    def test_joiners_emoji_and_cjk_are_kept(self):
+        family = "\U0001f468\u200d\U0001f469\u200d\U0001f467"
+        flag = "\U0001f3f3\ufe0f\u200d\U0001f308"
+        text = f"{family} {flag} \u65e5\u672c\u8a9e \u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645"
+        self.assertEqual(theme.safe_text(text), text)
 
     def test_labels_are_plain_text_by_default(self):
         label = theme.styled_label(HOSTILE, "muted")
@@ -268,9 +323,43 @@ class AssetTests(unittest.TestCase):
             self.assertEqual(os.stat(path).st_mode & 0o077, 0)
         self.assertEqual(os.stat(Path(assets["arrow"]).parent).st_mode & 0o077, 0)
 
-    def test_no_runtime_directory_means_no_images(self):
-        with mock.patch.dict(os.environ, {}, clear=True):
+    def fallback_environment(self, runtime=None):
+        """The temporary directory is a test directory and the runtime directory is `runtime` (or unset)."""
+        env = {} if runtime is None else {"XDG_RUNTIME_DIR": str(runtime)}
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.dict(os.environ, env, clear=True))
+        stack.enter_context(mock.patch("gpu_game_guard.ui.singleton.tempfile.gettempdir", return_value=str(self.root)))
+        self.addCleanup(stack.close)
+
+    def test_no_runtime_directory_uses_the_private_fallback_directory(self):
+        self.fallback_environment()
+        assets = theme._write_assets(theme.LIGHT)
+        self.assertEqual(set(assets), {"arrow", "check"})
+        fallback = self.root / f"gpu-game-guard-{os.getuid()}"
+        for path in assets.values():
+            self.assertTrue(path.startswith(str(fallback)))
+            self.assertFalse(QtGui.QImage(path).isNull())
+        self.assertEqual(os.stat(fallback).st_mode & 0o077, 0)
+
+    def test_an_unwritable_runtime_directory_uses_the_fallback(self):
+        runtime = self.root / "run"
+        runtime.mkdir()
+        self.fallback_environment(runtime)
+        with mock.patch("gpu_game_guard.ui.singleton.os.mkdir", side_effect=_mkdir_unless(runtime)):
+            assets = theme._write_assets(theme.LIGHT)
+        self.assertEqual(set(assets), {"arrow", "check"})
+        self.assertTrue(assets["arrow"].startswith(str(self.root / f"gpu-game-guard-{os.getuid()}")))
+
+    def test_no_directory_at_all_means_no_images(self):
+        self.fallback_environment()
+        with mock.patch("gpu_game_guard.ui.singleton.os.mkdir", side_effect=PermissionError("no")):
             self.assertEqual(theme._write_assets(theme.LIGHT), {})
+        self.assertTrue(self.log.called)
+        with mock.patch("gpu_game_guard.ui.theme._write_assets", return_value={}):
+            theme.apply_theme(self.app, dark=False)
+        sheet = self.app.styleSheet()
+        self.assertNotIn("image:", sheet)
+        self.assertIn("QCheckBox::indicator {", sheet)
 
     def test_a_planted_symlink_is_not_followed(self):
         victim = self.root / "victim.txt"

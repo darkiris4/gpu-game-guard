@@ -284,7 +284,7 @@ class KeyAndPermissionTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(self.path.parent.stat().st_mode), 0o700)
 
-    def test_an_existing_file_and_directory_keep_their_modes(self):
+    def test_an_existing_file_and_directory_are_tightened(self):
         self.path.parent.mkdir(parents=True)
         os.chmod(self.path.parent, 0o755)
         self.path.write_text("{}")
@@ -292,8 +292,8 @@ class KeyAndPermissionTests(unittest.TestCase):
         s = State(self.path)
         s.add([ref("a")], 1.0)
         s.save()
-        self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o640)
-        self.assertEqual(stat.S_IMODE(self.path.parent.stat().st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(self.path.parent.stat().st_mode), 0o700)
 
     def test_atomic_write_json_private_option(self):
         target = self.path.parent / "x.json"
@@ -302,6 +302,66 @@ class KeyAndPermissionTests(unittest.TestCase):
         private = self.path.parent / "y.json"
         util.atomic_write_json(private, {"a": 1}, private=True)
         self.assertEqual(stat.S_IMODE(private.stat().st_mode), 0o600)
+
+
+class CorruptCopyTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = Path(tmp.name) / "state.json"
+
+    def load(self):
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            return State(self.path), err.getvalue()
+
+    def copies(self):
+        return sorted(self.path.parent.glob("state.json.corrupt-*"))
+
+    def test_a_corrupt_file_is_copied_before_it_can_be_overwritten(self):
+        self.path.write_text("{nope")
+        state, err = self.load()
+        (copy,) = self.copies()
+        self.assertEqual(copy.read_text(), "{nope")
+        self.assertEqual(stat.S_IMODE(copy.stat().st_mode), 0o600)
+        self.assertEqual((state.unreadable, state.corrupt_copy, state.stopped), (True, copy, []))
+        self.assertEqual(err.count("ignoring"), 1)
+        state.add([ref("a")], 1.0)
+        state.save()
+        self.assertEqual(copy.read_text(), "{nope")
+        self.assertEqual(State(self.path).stopped, [ref("a")])
+
+    def test_wrong_shapes_count_as_corrupt(self):
+        for text in ("[]", '{"stopped": 5}', '{"stopped": "ollama"}', "\xff"):
+            for old in self.copies():
+                old.unlink()
+            self.path.write_text(text)
+            state, _ = self.load()
+            self.assertTrue(state.unreadable, text)
+            self.assertEqual(len(self.copies()), 1, text)
+
+    def test_missing_and_valid_files_are_not_corrupt(self):
+        state, err = self.load()
+        self.assertEqual((state.unreadable, state.corrupt_copy, self.copies(), err), (False, None, [], ""))
+        self.path.write_text('{"stopped": [], "stopped_at": 0}')
+        state, _ = self.load()
+        self.assertEqual((state.unreadable, self.copies()), (False, []))
+
+    def test_only_the_newest_three_copies_are_kept(self):
+        for stamp in ("20200101-000001", "20200101-000002", "20200101-000003", "20200101-000004"):
+            (self.path.parent / f"state.json.corrupt-{stamp}").write_text(stamp)
+        self.path.write_text("{nope")
+        self.load()
+        names = [p.name for p in self.copies()]
+        self.assertEqual(len(names), 3)
+        self.assertNotIn("state.json.corrupt-20200101-000001", names)
+        self.assertNotIn("state.json.corrupt-20200101-000002", names)
+
+    def test_a_failed_copy_is_logged_and_the_state_still_loads_empty(self):
+        self.path.write_text("{nope")
+        with mock.patch("gpu_game_guard.state.os.open", side_effect=PermissionError(13, "denied")):
+            state, err = self.load()
+        self.assertEqual((state.unreadable, state.corrupt_copy, state.stopped), (True, None, []))
+        self.assertIn("could not keep a copy", err)
 
 
 if __name__ == "__main__":

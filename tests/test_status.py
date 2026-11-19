@@ -21,7 +21,7 @@ class StatusTestCase(unittest.TestCase):
 
 
 def sample(**changes):
-    base = dict(version="2.0", pid=42, updated=1000.0, state="game-running", paused_until=None, paused=False,
+    base = dict(version="2.0", pid=os.getpid(), updated=1000.0, state="game-running", paused_until=None, paused=False,
                 game={"id": "steam:730", "title": "CS"},
                 stopped=[{"kind": "container", "runtime": "docker", "name": "ollama"}],
                 config_ok=False, config_error="bad", dialog="zenity", can_ask=False, targets=3)
@@ -82,7 +82,7 @@ class StatusFileTests(StatusTestCase):
             status.write_status(sample())
             self.assertTrue((self.dir / "gpu-game-guard" / "status.json").exists())
             with mock.patch.object(status.time, "time", return_value=1001.0):
-                self.assertEqual(status.read_status().pid, 42)
+                self.assertEqual(status.read_status().pid, os.getpid())
 
     def test_the_file_is_readable_by_others_and_no_temp_files_remain(self):
         status.write_status(sample(), self.dir)
@@ -212,13 +212,103 @@ class ValidForAndPermissionTests(StatusTestCase):
             self.assertEqual(stat.S_IMODE((self.dir / name).stat().st_mode), 0o600, name)
         self.assertEqual(stat.S_IMODE(self.dir.stat().st_mode), 0o700)
 
-    def test_an_existing_events_file_keeps_its_mode(self):
+    def test_an_existing_events_file_is_tightened(self):
         self.dir.mkdir(parents=True)
         events = self.dir / "events.jsonl"
         events.write_text("")
         os.chmod(events, 0o644)
         status.append_event("stop", "x", self.dir)
-        self.assertEqual(stat.S_IMODE(events.stat().st_mode), 0o644)
+        self.assertEqual(stat.S_IMODE(events.stat().st_mode), 0o600)
+
+
+class LivenessTests(StatusTestCase):
+    def read(self, **changes):
+        status.write_status(sample(updated=1000.0, **changes), self.dir)
+        with mock.patch.object(status.time, "time", return_value=1001.0):
+            return status.read_status(self.dir)
+
+    def test_a_live_pid_reads_as_running(self):
+        self.assertEqual(self.read(pid=os.getpid()).pid, os.getpid())
+
+    def test_a_dead_pid_reads_as_not_running_even_when_the_status_is_fresh(self):
+        with mock.patch.object(status.os, "kill", side_effect=ProcessLookupError):
+            self.assertIsNone(self.read(pid=4242, valid_for=900.0))
+
+    def test_a_pid_of_another_user_counts_as_alive(self):
+        with mock.patch.object(status.os, "kill", side_effect=PermissionError):
+            self.assertIsNotNone(self.read(pid=4242))
+
+    def test_pid_alive_probes_with_signal_zero(self):
+        with mock.patch.object(status.os, "kill") as kill:
+            self.assertTrue(status.pid_alive(77))
+        kill.assert_called_once_with(77, 0)
+        self.assertFalse(status.pid_alive(0))
+        self.assertFalse(status.pid_alive(-3))
+        with mock.patch.object(status.os, "kill", side_effect=OverflowError):
+            self.assertFalse(status.pid_alive(10 ** 30))
+
+    def test_a_reused_pid_is_detected_by_its_start_time(self):
+        start = status.process_start(os.getpid())
+        if start == 0:
+            self.skipTest("no /proc on this system")
+        self.assertIsNotNone(self.read(pid=os.getpid(), pid_start=start))
+        self.assertIsNone(self.read(pid=os.getpid(), pid_start=start + 1000))
+
+    def test_a_reused_pid_with_a_faked_start_time(self):
+        with mock.patch.object(status, "process_start", return_value=500):
+            self.assertIsNone(self.read(pid=os.getpid(), pid_start=400))
+            self.assertIsNotNone(self.read(pid=os.getpid(), pid_start=500))
+
+    def test_without_a_readable_start_time_a_live_pid_is_trusted(self):
+        with mock.patch.object(status, "process_start", return_value=0):
+            self.assertIsNotNone(self.read(pid=os.getpid(), pid_start=123))
+        self.assertIsNotNone(self.read(pid=os.getpid(), pid_start=0))
+
+    def test_process_start_reads_field_22_even_with_odd_command_names(self):
+        stat_line = "123 (we ird) name) S " + " ".join(str(n) for n in range(4, 22)) + " 987654 23 24\n"
+        with mock.patch.object(Path, "read_text", return_value=stat_line):
+            self.assertEqual(status.process_start(123), 987654)
+        with mock.patch.object(Path, "read_text", side_effect=FileNotFoundError):
+            self.assertEqual(status.process_start(123), 0)
+        with mock.patch.object(Path, "read_text", return_value="garbage"):
+            self.assertEqual(status.process_start(123), 0)
+
+    def test_pid_start_round_trips(self):
+        self.assertEqual(self.read(pid=os.getpid(), pid_start=0).pid_start, 0)
+        with mock.patch.object(status, "process_start", return_value=77):
+            self.assertEqual(self.read(pid=os.getpid(), pid_start=77).pid_start, 77)
+
+    def test_a_status_without_a_pid_is_not_judged_by_liveness(self):
+        self.dir.mkdir(parents=True)
+        (self.dir / "status.json").write_text(json.dumps({"updated": 1000.0}))
+        with mock.patch.object(status.time, "time", return_value=1001.0):
+            self.assertIsNotNone(status.read_status(self.dir))
+
+    def test_remove_status(self):
+        status.write_status(sample(pid=os.getpid()), self.dir)
+        status.remove_status(self.dir, pid=os.getpid() + 1)
+        self.assertTrue((self.dir / "status.json").exists())
+        status.remove_status(self.dir, pid=os.getpid())
+        self.assertFalse((self.dir / "status.json").exists())
+        status.remove_status(self.dir)  # already gone
+
+    def test_remove_status_removes_an_unreadable_file(self):
+        self.dir.mkdir(parents=True)
+        (self.dir / "status.json").write_text("{nope")
+        status.remove_status(self.dir, pid=1)
+        self.assertFalse((self.dir / "status.json").exists())
+
+    def test_existing_status_and_pause_files_are_tightened(self):
+        self.dir.mkdir(parents=True)
+        os.chmod(self.dir, 0o755)
+        for name in ("status.json", "pause.json"):
+            (self.dir / name).write_text("{}")
+            os.chmod(self.dir / name, 0o644)
+        status.write_status(sample(), self.dir)
+        status.pause(60, self.dir)
+        for name in ("status.json", "pause.json"):
+            self.assertEqual(stat.S_IMODE((self.dir / name).stat().st_mode), 0o600, name)
+        self.assertEqual(stat.S_IMODE(self.dir.stat().st_mode), 0o700)
 
 
 if __name__ == "__main__":

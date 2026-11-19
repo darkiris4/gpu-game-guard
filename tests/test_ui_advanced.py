@@ -1014,6 +1014,19 @@ class TestRunTabTests(Base):
     def lines(self):
         return "\n".join(self.tab.result_lines)
 
+    def test_the_kind_badge_and_the_note_are_not_clipped_at_900_px(self):
+        self.tab.resize(900, 800)
+        self.tab.show()
+        self.app.processEvents()
+        seen = 0
+        for index in range(self.tab.running_box.count()):
+            for label in self.tab.running_box.itemAt(index).widget().findChildren(QtWidgets.QLabel):
+                if label.text():
+                    seen += 1
+                    self.assertGreaterEqual(label.width(), label.sizeHint().width(), label.text())
+        self.tab.hide()
+        self.assertGreaterEqual(seen, 10)
+
     def test_managed_candidates_are_ticked_and_listed_with_memory(self):
         self.assertEqual({k: c.isChecked() for k, c in self.tab.checks.items()},
                          {"container:docker:ollama": True, "container:docker:comfyui": True,
@@ -1227,6 +1240,29 @@ class RawTabTests(Base):
         self.model.update(poll_seconds=3.0)
         self.assertEqual(self.tab.text(), '{"poll_seconds": 9')
         self.assertIn("changed elsewhere", self.tab.report.label.text())
+
+    def test_a_value_nested_5000_deep_is_reported_not_raised(self):
+        before = copy.deepcopy(self.model.config)
+        deep = "[" * 5000 + "]" * 5000
+        data = json.dumps(self.model.config.to_json())
+        for text in (data[:-1] + ', "extra_key": ' + deep + "}", deep):
+            self.tab.set_text(text)
+            self.assertEqual(self.model.raw_problems, ["The text nests values too deeply"])
+            self.assertIn("nests values too deeply", self.tab.report.label.text())
+            self.assertEqual(self.model.config, before)
+            self.assertEqual(self.tab.validate(), ["The text nests values too deeply"])
+        self.tab.reset_button.click()
+        self.assertEqual(self.model.raw_problems, [])
+
+    def test_a_deep_value_that_parses_but_cannot_be_copied_is_reported_not_raised(self):
+        from unittest import mock
+
+        from gpu_game_guard.ui import advanced_raw
+
+        text = json.dumps(self.model.config.to_json())
+        with mock.patch.object(advanced_raw.config_module.Config, "from_json", side_effect=RecursionError):
+            self.tab.set_text(text + " ")
+        self.assertEqual(self.model.raw_problems, ["The text nests values too deeply"])
 
     def test_every_kind_of_hostile_text_is_reported_not_raised(self):
         for text in ("[" * 200000, '{"a":' * 100000, "9" * 6000, '{"poll_seconds": ' + "9" * 6000 + "}",

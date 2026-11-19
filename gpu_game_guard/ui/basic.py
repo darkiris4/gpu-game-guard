@@ -310,7 +310,7 @@ class BasicView(QtWidgets.QWidget):
     def _build(self) -> None:
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        scroll = QtWidgets.QScrollArea(self)
+        scroll = self.scroll = QtWidgets.QScrollArea(self)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -329,7 +329,8 @@ class BasicView(QtWidgets.QWidget):
         column.setContentsMargins(0, 0, 0, 0)
         column.setSpacing(2 * SPACE)
 
-        column.addWidget(self._build_status())
+        self.status_card = self._build_status()
+        column.addWidget(self.status_card)
 
         column.addWidget(theme.SectionHeader("When I start a game",
                                              "What should happen to the apps below when a game launches."))
@@ -416,6 +417,11 @@ class BasicView(QtWidgets.QWidget):
         card.addWidget(self.empty_label)
         return card
 
+    def scrollbar_extent(self) -> int:
+        """The width the page's vertical scroll bar takes from the content, 0 while it is hidden."""
+        bar = self.scroll.verticalScrollBar()
+        return bar.sizeHint().width() if bar.isVisibleTo(self) and bar.maximum() > 0 else 0
+
     # data
 
     def load(self, refresh: bool = False) -> None:
@@ -493,14 +499,17 @@ class BasicView(QtWidgets.QWidget):
             for row, item in zip(self._rows, items):
                 row.update_item(item)
         scanning = bool(self.model.scanning)
+        failed = bool(getattr(self.model, "scan_error", "")) and self._loaded and not scanning
         if scanning or not self._loaded:
             self.empty_label.setText("Scanning...")
+        elif failed:
+            self.empty_label.setText("Could not check what is using the graphics card. Press Refresh to try again.")
         else:
             self.empty_label.setText("Nothing is using the GPU right now. Start your apps and press Refresh.")
         self.refresh_button.setEnabled(not scanning)
         self.refresh_button.setText("Scanning..." if self.model.scanning else "Refresh")
         self.auto_button.setVisible(not config.auto_containers)
-        self.empty_label.setVisible(not items)
+        self.empty_label.setVisible(not items or failed)
         self.refresh_status()
 
     def _rebuild(self, items: List[Item], keys: List[Tuple[str, str]]) -> None:

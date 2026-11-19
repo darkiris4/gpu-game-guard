@@ -237,3 +237,33 @@ class ChangeTests(Fixture):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FailureLineTests(Fixture):
+    ref = {"kind": "service", "runtime": "service", "name": "Ollama", "id": "ollama"}
+    key = ("systemctl", "--no-ask-password", "stop", "--", "ollama.service")
+
+    def logged(self, stderr, unit_calls=1):
+        self.answers[self.key] = gpu.CommandResult(1, "", stderr)
+        gpu._last_failure.clear()
+        with mock.patch("gpu_game_guard.util.log") as log:
+            self.runtime().stop([self.ref])
+        self.assertEqual(log.call_count, unit_calls)
+        return log.call_args[0][0]
+
+    def test_the_line_naming_the_error_is_logged_not_the_last_line(self):
+        line = self.logged("Failed to stop ollama.service: Unit is masked.\nSee system logs and 'systemctl status ollama.service' for details.")
+        self.assertIn("Failed to stop ollama.service: Unit is masked.", line)
+        self.assertNotIn("See system logs", line)
+
+    def test_the_last_line_is_used_when_none_names_an_error(self):
+        self.assertIn("second", self.logged("first\nsecond"))
+
+    def test_the_polkit_hint_survives_a_long_message(self):
+        line = self.logged("Failed to stop ollama.service: Access denied " + "x" * 600)
+        self.assertIn("run 'sudo gpu-game-guard polkit allow ollama.service' to allow it without a password", line)
+        self.assertLess(len(line), 400)
+
+    def test_the_prefix_is_not_repeated(self):
+        line = self.logged("Failed to stop ollama.service: Unit is masked.")
+        self.assertEqual(line.count("systemctl stop ollama.service"), 1)

@@ -41,6 +41,10 @@ class FakeRuntime:
         self.fail_scan = False
         self.refuse_stop: List[str] = []  # names that keep running when asked to stop
         self.fail_start: List[str] = []  # names that cannot be started; `start` returns their refs
+        self.start_calls: List[List[str]] = []  # the names handed to each call of `start`
+        self.adopted: List[List[str]] = []  # the names handed to each call of `adopt`
+        self.released: List[List[str]] = []  # the names handed to each call of `release`
+        self.fail_hooks = False  # `adopt` and `release` raise
         self.is_available = True
 
     def installed(self) -> bool:
@@ -61,7 +65,18 @@ class FakeRuntime:
                 if ref["name"] not in self.refuse_stop:
                     self.running = [n for n in self.running if n != ref["name"]]
 
+    def adopt(self, refs: Sequence[Ref]) -> None:
+        self.adopted.append([ref["name"] for ref in refs])
+        if self.fail_hooks:
+            raise RuntimeError("adopt failed")
+
+    def release(self, refs: Sequence[Ref]) -> None:
+        self.released.append([ref["name"] for ref in refs])
+        if self.fail_hooks:
+            raise RuntimeError("release failed")
+
     def start(self, refs: Sequence[Ref]) -> List[Ref]:
+        self.start_calls.append([ref["name"] for ref in refs if ref["runtime"] == self.name])
         failed: List[Ref] = []
         for ref in refs:
             if ref["runtime"] != self.name:

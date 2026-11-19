@@ -1,8 +1,10 @@
 """What the guard stopped and has not yet started again, kept on disk across restarts and reboots."""
 from __future__ import annotations
 
+import glob
 import json
 import math
+import os
 import time
 from pathlib import Path
 from typing import Any, Iterable, List, Optional
@@ -67,16 +69,46 @@ def _stopped_at(value: Any, wall_time: float) -> float:
     return float(value) if value > -1e18 else wall_time
 
 
+CORRUPT_KEPT = 3  # copies of an unreadable state file that are kept
+
+
+def keep_corrupt_copy(path: Path) -> Optional[Path]:
+    """Copy the unreadable file at `path` to `<path>.corrupt-<time>` (mode 0o600) before it can be overwritten,
+    keeping the newest CORRUPT_KEPT copies. Returns the copy, or None when none could be made."""
+    destination = path.with_name(f"{path.name}.corrupt-{time.strftime('%Y%m%d-%H%M%S')}")
+    try:
+        content = path.read_bytes()
+        try:
+            fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            return destination  # a copy of this moment exists already
+        with os.fdopen(fd, "wb") as out:
+            out.write(content)
+        for old in sorted(path.parent.glob(glob.escape(path.name) + ".corrupt-*"))[:-CORRUPT_KEPT]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+    except OSError as exc:
+        log(f"state: could not keep a copy of {path}: {exc.strerror or exc}")
+        return None
+    return destination
+
+
 class State:
     def __init__(self, path: Optional[Path] = None):
         self.path = Path(path) if path is not None else xdg_state_home() / "gpu-game-guard" / "state.json"
         self.stopped: List[Ref] = []
         self.stopped_at = 0.0
         self.game_seen = False
+        self.unreadable = False  # the file existed but could not be used
+        self.corrupt_copy: Optional[Path] = None  # where a copy of that file was kept
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 raise ValueError("the top level is not a JSON object")
+            if "stopped" in data and not isinstance(data["stopped"], list):
+                raise ValueError('"stopped" is not a list')
             stopped = _stopped_list(data.get("stopped"))
             if stopped:
                 self.stopped = stopped
@@ -87,6 +119,8 @@ class State:
         except (OSError, ValueError, AttributeError, RecursionError) as exc:
             log(f"state: ignoring {self.path}; it cannot be read ({exc.strerror if isinstance(exc, OSError) and exc.strerror else exc})")
             self.stopped, self.stopped_at, self.game_seen = [], 0.0, False
+            self.unreadable = True
+            self.corrupt_copy = keep_corrupt_copy(self.path)
 
     def add(self, refs: Iterable[Ref], wall_time: float) -> None:
         """Record more stopped targets, keeping those already recorded."""

@@ -57,6 +57,17 @@ class Trigger(Protocol):
 
 
 class Runtime(Protocol):
+    """A provider of stoppable targets. Besides the methods below, a provider may define two optional hooks; the
+    guard looks them up with `getattr`, so a provider without them works unchanged:
+
+    - `adopt(refs: List[Ref]) -> None`, called once when the guard starts, with the refs loaded from the state
+      file that belong to this provider (not called when there are none).
+    - `release(refs: List[Ref]) -> None`, called when the guard drops stopped refs of this provider without
+      starting them: after_game "leave", the user answering that they stay stopped, the no-game timeout with
+      "leave", and `gpu-game-guard state clear`.
+
+    Failures in either hook are logged and ignored."""
+
     name: str
 
     def installed(self) -> bool:

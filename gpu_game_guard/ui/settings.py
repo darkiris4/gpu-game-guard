@@ -177,7 +177,8 @@ def _confirm_defaults(window: QtWidgets.QWidget) -> bool:
     box.setWindowTitle("Start from the defaults")
     box.setTextFormat(Qt.PlainText)
     box.setText("Start from the default settings? Your games and targets in the unusable file are not carried "
-                "over. Applying keeps the old file next to it as a .broken copy.")
+                "over. Applying replaces the file; when it can be read, the old one is kept next to it as a .broken "
+                "copy.")
     start = box.addButton("Start from the defaults", QtWidgets.QMessageBox.DestructiveRole)
     keep = box.addButton("Keep the file", QtWidgets.QMessageBox.RejectRole)
     box.setDefaultButton(keep)
@@ -194,6 +195,7 @@ class SettingsWindow(QtWidgets.QMainWindow):
         self.confirm_unsaved: Callable[[QtWidgets.QWidget], str] = _ask_unsaved
         self.confirm_defaults: Callable[[QtWidgets.QWidget], bool] = _confirm_defaults
         self.notice_text = ""
+        self.mode = "basic"
         self._shape: tuple = ()
         self.advanced: Optional[QtWidgets.QWidget] = None
         self.advanced_error = ""
@@ -218,7 +220,7 @@ class SettingsWindow(QtWidgets.QMainWindow):
         layout.addWidget(self._divider())
 
         self.notices = QtWidgets.QWidget()
-        centre = QtWidgets.QHBoxLayout(self.notices)
+        centre = self._notice_margins = QtWidgets.QHBoxLayout(self.notices)
         centre.setContentsMargins(3 * SPACE, 2 * SPACE, 3 * SPACE, 0)
         column = QtWidgets.QWidget()
         column.setMaximumWidth(CONTENT_WIDTH)
@@ -241,6 +243,7 @@ class SettingsWindow(QtWidgets.QMainWindow):
         self.basic = BasicView(model)
         self.basic.advancedRequested.connect(lambda: self.set_mode("advanced"))
         self.stack.addWidget(self.basic)
+        self.basic.scroll.verticalScrollBar().rangeChanged.connect(self._scroll_range_changed)
         layout.addWidget(self.stack, 1)
 
         layout.addWidget(self._divider())
@@ -343,6 +346,7 @@ class SettingsWindow(QtWidgets.QMainWindow):
         self.stack.setCurrentWidget(self.advanced if mode == "advanced" and self.advanced is not None
                                     else self.basic)
         self.switcher.setValue(mode)
+        self.align_notices()
         self.fit_minimum()
         if save:
             self.save_prefs()
@@ -364,6 +368,15 @@ class SettingsWindow(QtWidgets.QMainWindow):
             box.addStretch(1)
             return page
 
+    def _scroll_range_changed(self, _low: int, _high: int) -> None:
+        self.align_notices()
+
+    def align_notices(self) -> None:
+        """Give the notices the margins of the Basic page's content, which are narrower by the width of its scroll
+        bar whenever that is showing, so that the cards above and below the tabs line up."""
+        extent = self.basic.scrollbar_extent() if self.mode == "basic" else 0
+        self._notice_margins.setContentsMargins(3 * SPACE, 2 * SPACE, 3 * SPACE + extent, 0)
+
     def screen_limit(self) -> Optional[QtCore.QSize]:
         """The largest minimum size that still fits the screen, or None when there is no screen."""
         screen = QtWidgets.QApplication.primaryScreen()
@@ -383,6 +396,10 @@ class SettingsWindow(QtWidgets.QMainWindow):
         self.setMinimumSize(width, height)
         if self.width() < width or self.height() < height:
             self.resize(max(self.width(), width), max(self.height(), height))
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self.align_notices()
 
     def changeEvent(self, event: QtCore.QEvent) -> None:
         super().changeEvent(event)
@@ -406,12 +423,12 @@ class SettingsWindow(QtWidgets.QMainWindow):
             self.load_callout.label.setText(theme.safe_text(
                 "The settings file could not be used and was left untouched:\n" + "\n".join(lines)
                 + "\nFix it in the Raw config editor, or start from the defaults, which replaces the file "
-                "and keeps the unusable one next to it as a .broken copy.", keep_newlines=True))
+                "and keeps the unusable one next to it as a .broken copy when it can be read.", keep_newlines=True))
             self.load_callout.button.setVisible(bool(self.model.raw_file_text))
         notice = self.notice_text
         if getattr(self.model, "defaults_pending", False):
-            notice = ("Applying replaces the unusable settings file with the defaults. The old file is kept next "
-                      "to it as a .broken-<time> copy.")
+            notice = ("Applying replaces the unusable settings file with the defaults. When the old file can be "
+                      "read, it is kept next to it as a .broken-<time> copy.")
         self.notice_callout.label.setText(theme.safe_text(notice, keep_newlines=True))
         self.notice_callout.setVisible(bool(notice))
         self.restart_banner.setVisible(self.model.restart_needed())

@@ -265,6 +265,18 @@ class DialogTests(unittest.TestCase):
         self.assertTrue(any("competes for GPU time" in t for t in texts))
         self.assertTrue(any("1.0 GiB of 8.0 GiB" in t for t in texts))
 
+    def test_the_sentence_uses_the_kinds_and_agrees_in_number(self):
+        def sentence(*kinds):
+            targets = [{"kind": k, "name": f"n{i}", "image": "", "vram_mib": None, "label": ""}
+                       for i, k in enumerate(kinds)]
+            texts = [w.text() for w in prompt.build_dialog(payload(targets=targets)).findChildren(QtWidgets.QLabel)]
+            return " ".join(t for t in texts if t.startswith("GPU Game Guard paused"))
+        self.assertEqual(sentence("container"),
+                         "GPU Game Guard paused this launch because this container has access to the GPU.")
+        self.assertIn("because these services have access", sentence("service", "service"))
+        self.assertIn("because these containers or services have access", sentence("container", "service"))
+        self.assertNotIn("using the GPU", sentence("container", "service"))
+
     def test_unknown_memory_is_said_plainly(self):
         data = payload(targets=[{"kind": "container", "name": "a", "image": "", "vram_mib": None, "label": ""}])
         texts = [w.text() for w in prompt.build_dialog(data).findChildren(QtWidgets.QLabel)]
@@ -452,6 +464,65 @@ class WindowBehaviourTests(unittest.TestCase):
         self.assertEqual(dialog.choice, "stop")
         dialog.close()
 
+    def test_space_is_ignored_for_the_first_700_ms_on_every_focusable_control(self):
+        now = [10.0]
+        dialog = prompt.build_dialog(payload(), clock=lambda: now[0])
+        dialog.show()
+        controls = [*dialog.buttons.values(), dialog.remember_box]
+        for control in controls:
+            control.setFocus()
+            for kind in (QtCore.QEvent.KeyPress, QtCore.QEvent.KeyRelease):
+                QtWidgets.QApplication.sendEvent(
+                    control, QtGui.QKeyEvent(kind, QtCore.Qt.Key_Space, QtCore.Qt.NoModifier, " "))
+            self.assertEqual(dialog.choice, "cancel")
+            self.assertTrue(dialog.isVisible())
+        self.assertFalse(dialog.remember_box.isChecked())
+        now[0] = 10.8
+        dialog.remember_box.setFocus()
+        for kind in (QtCore.QEvent.KeyPress, QtCore.QEvent.KeyRelease):
+            QtWidgets.QApplication.sendEvent(
+                dialog.remember_box, QtGui.QKeyEvent(kind, QtCore.Qt.Key_Space, QtCore.Qt.NoModifier, " "))
+        self.assertTrue(dialog.remember_box.isChecked())
+        dialog.buttons["anyway"].setFocus()
+        for kind in (QtCore.QEvent.KeyPress, QtCore.QEvent.KeyRelease):
+            QtWidgets.QApplication.sendEvent(
+                dialog.buttons["anyway"], QtGui.QKeyEvent(kind, QtCore.Qt.Key_Space, QtCore.Qt.NoModifier, " "))
+        self.assertEqual(dialog.choice, "anyway")
+        dialog.close()
+
+    def test_mouse_clicks_work_during_the_guard(self):
+        dialog = prompt.build_dialog(payload(), clock=lambda: 0.0)
+        dialog.show()
+        QtTest = __import__("PyQt5.QtTest", fromlist=["QTest"])
+        QtTest.QTest.mouseClick(dialog.remember_box, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier,
+                                QtCore.QPoint(8, dialog.remember_box.height() // 2))
+        self.assertTrue(dialog.remember_box.isChecked())
+        QtTest.QTest.mouseClick(dialog.buttons["anyway"], QtCore.Qt.LeftButton)
+        self.assertEqual(dialog.choice, "anyway")
+        dialog.close()
+
+    def test_long_headline_does_not_clip_on_a_small_screen(self):
+        from gpu_game_guard.ui import theme
+        original = self.app.font()
+        try:
+            font = QtGui.QFont(original)
+            font.setPointSizeF(16)
+            self.app.setFont(font)
+            theme.apply_theme(self.app, dark=False)
+            data = payload(targets=many(6))
+            data["title"] = " ".join(["Adventure"] * 14)[:120]
+            dialog = prompt.build_dialog(data)
+            dialog.place_in(QtCore.QRect(0, 0, 1366, 728))
+            needed = dialog.layout().totalHeightForWidth(dialog.width())
+            headline = dialog.findChild(QtWidgets.QLabel, "Headline")
+            self.assertGreater(headline.heightForWidth(headline.width()), 3 * headline.fontMetrics().height())
+            self.assertGreaterEqual(dialog.height(), needed)
+            self.assertLessEqual(dialog.height(), 728)
+            self.assertGreaterEqual(headline.height(), headline.heightForWidth(headline.width()))
+        finally:
+            self.app.setFont(original)
+            theme.apply_theme(self.app, dark=False)
+
     def test_escape_works_immediately(self):
         dialog = prompt.build_dialog(payload(), clock=lambda: 0.0)
         dialog.show()
@@ -502,11 +573,11 @@ class PlatformTests(unittest.TestCase):
         self.assertEqual(prompt.platform_changes({}), {})
 
     def test_an_explicit_real_platform_is_kept(self):
-        for value in ("xcb", "wayland", "wayland;xcb", "eglfs"):
+        for value in ("xcb", "wayland", "wayland;xcb", "eglfs", "linuxfb"):
             self.assertEqual(prompt.platform_changes({"QT_QPA_PLATFORM": value, "WAYLAND_DISPLAY": "w"}), {})
 
     def test_inherited_headless_platforms_are_removed(self):
-        for value in ("offscreen", "minimal", "minimalegl", "vnc", "linuxfb", "Offscreen", "vnc:size=800x600"):
+        for value in ("offscreen", "minimal", "minimalegl", "vnc", "Offscreen", "vnc:size=800x600"):
             self.assertEqual(prompt.platform_changes({"QT_QPA_PLATFORM": value, "DISPLAY": ":0"}),
                              {"QT_QPA_PLATFORM": None}, value)
         self.assertEqual(prompt.platform_changes({"QT_QPA_PLATFORM": "offscreen", "WAYLAND_DISPLAY": "w"}),

@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import math
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -1123,6 +1124,277 @@ class FailedStartTests(GuardCase):
         env.trigger.launches = []
         env.advance(200)
         self.assertEqual(sorted(runtime.started), ["a", "b"])
+
+
+class BackoffTests(GuardCase):
+    RETRY = 60.0
+
+    def failing_env(self, **options):
+        options.setdefault("config", Config(dialog_retry_seconds=self.RETRY))
+        env = self.env(running=(), **options)
+        env.state.add([ref("b")], env.now - 3600)
+        env.docker.fail_start = ["b"]
+        return env
+
+    def attempts(self, env):
+        return len(env.docker.start_calls)
+
+    def test_the_wait_doubles_after_each_failure_up_to_the_give_up(self):
+        env = self.failing_env()
+        env.advance(1)
+        self.assertEqual(self.attempts(env), 1)
+        for count, delay in enumerate((60, 120, 240, 480), start=1):
+            env.advance(delay - 1)
+            self.assertEqual(self.attempts(env), count, delay)
+            env.advance(1)
+            self.assertEqual(self.attempts(env), count + 1, delay)
+
+    def test_the_dialog_and_the_notification_come_once_per_attempt(self):
+        env = self.failing_env()
+        env.advance(1)
+        for delay in (60, 120, 240):
+            env.advance(delay)
+        self.assertEqual(self.attempts(env), 4)
+        self.assertEqual(len(env.prompter.restart_asked), 4)
+        self.assertEqual(len(env.prompter.notifications), 4)
+
+    def test_five_failures_in_a_row_give_up_asking_once_and_retry_hourly(self):
+        env = self.failing_env()
+        out = [env.advance(1)]
+        for delay in (60, 120, 240, 480):
+            out.append(env.advance(delay))
+        self.assertEqual(self.attempts(env), 5)
+        giving_up = "giving up asking, refs kept in state; run `gpu-game-guard status`"
+        self.assertEqual([giving_up in text for text in out], [False] * 4 + [True])
+        asked, notified = len(env.prompter.restart_asked), len(env.prompter.notifications)
+        for hour in range(1, 4):
+            self.assertNotIn(giving_up, env.advance(3599))
+            self.assertEqual(self.attempts(env), 4 + hour)
+            self.assertNotIn(giving_up, env.advance(1))
+            self.assertEqual(self.attempts(env), 5 + hour)
+        self.assertEqual((len(env.prompter.restart_asked), len(env.prompter.notifications)), (asked, notified))
+        self.assertEqual(env.state.stopped, [ref("b")])
+        self.assertEqual(view(env).stopped, [ref("b")])
+        self.assertEqual(State(env.state.path).stopped, [ref("b")])
+
+    def test_a_later_success_clears_the_state_and_resets_the_counter(self):
+        env = self.failing_env()
+        env.advance(1)
+        for delay in (60, 120, 240, 480):
+            env.advance(delay)
+        env.docker.fail_start = []
+        env.advance(3600)
+        self.assertEqual((env.state.stopped, env.docker.started), ([], ["b"]))
+        env.state.add([ref("b")], env.now - 3600)
+        env.docker.fail_start = ["b"]
+        env.advance(1)
+        self.assertEqual(len(env.prompter.restart_asked), 6)  # asking resumed for the new stop
+        env.advance(self.RETRY)
+        self.assertEqual(self.attempts(env), 8)
+
+    def test_the_count_restarts_when_the_set_of_failing_refs_changes(self):
+        env = self.failing_env()
+        env.advance(1)
+        env.advance(60)
+        env.advance(120)
+        env.state.add([ref("c")], env.now)
+        env.docker.fail_start = ["b", "c"]
+        env.state.stopped_at = env.now - 3600
+        before = self.attempts(env)
+        env.advance(240)
+        self.assertEqual(self.attempts(env), before + 1)
+        env.advance(self.RETRY - 1)
+        self.assertEqual(self.attempts(env), before + 1)
+        env.advance(1)
+        self.assertEqual(self.attempts(env), before + 2)
+
+    def test_the_wait_is_capped_at_an_hour(self):
+        env = self.failing_env(config=Config(dialog_retry_seconds=2000.0, after_game="restart"))
+        env.advance(1)
+        env.advance(2000)
+        env.advance(3600)
+        self.assertEqual(self.attempts(env), 3)
+        env.advance(3599)
+        self.assertEqual(self.attempts(env), 3)
+        env.advance(1)
+        self.assertEqual(self.attempts(env), 4)
+
+
+class ValidForDuringCommandsTests(GuardCase):
+    def test_valid_for_is_long_for_the_whole_of_a_stop(self):
+        env = self.env()
+        seen = []
+        original = env.docker.stop
+
+        def stop(refs):
+            seen.append(view(env))
+            return original(refs)
+
+        env.docker.stop = stop
+        env.trigger.launches = [make_launch(10)]
+        env.advance(1)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0].valid_for, 900.0)
+        self.assertEqual(seen[0].state, "game-running")
+
+    def test_valid_for_is_long_for_the_whole_of_a_start(self):
+        env = self.env(running=(), config=Config(after_game="restart"))
+        env.state.add([ref("a")], env.now - 3600)
+        seen = []
+        original = env.docker.start
+
+        def start(refs):
+            seen.append(view(env))
+            return original(refs)
+
+        env.docker.start = start
+        env.advance(1)
+        self.assertEqual([item.valid_for for item in seen], [900.0])
+        self.assertEqual(env.docker.started, ["a"])
+
+    def test_it_returns_to_normal_afterwards(self):
+        env = self.env()
+        env.trigger.launches = [make_launch(10)]
+        env.advance(1)
+        env.trigger.launches = []
+        env.state.clear()
+        env.advance(10)
+        self.assertEqual(view(env).valid_for, 15.0)
+
+
+class HookTests(GuardCase):
+    def stopped_env(self, **options):
+        env = self.env(running=(), podman=(), **options)
+        env.state.add([ref("a"), ref("p", "podman")], env.now - 3600)
+        return env
+
+    def test_adopt_gets_the_stored_refs_of_each_provider_once_at_start(self):
+        env = self.stopped_env()
+        env.guard = env.make_guard()
+        self.assertEqual((env.docker.adopted, env.podman.adopted), ([["a"]], [["p"]]))
+        env.advance(1)
+        self.assertEqual((env.docker.adopted, env.podman.adopted), ([["a"]], [["p"]]))
+
+    def test_adopt_is_not_called_without_refs_and_a_failing_hook_is_survived(self):
+        env = self.env(running=())
+        env.guard = env.make_guard()
+        self.assertEqual(env.docker.adopted, [])
+        env.state.add([ref("a")], env.now)
+        env.docker.fail_hooks = True
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            env.guard = env.make_guard()
+        self.assertIn("adopt through docker failed", err.getvalue())
+
+    def test_a_provider_without_hooks_still_works(self):
+        class Bare:
+            name = "docker"
+
+            def installed(self):
+                return True
+
+            def running_gpu_targets(self):
+                return []
+
+            def start(self, refs):
+                return None
+
+        env = self.env(running=(), config=Config(after_game="leave"))
+        env.guard.runtimes = [Bare()]
+        env.state.add([ref("a")], env.now - 3600)
+        env.guard = env.make_guard()
+        env.guard.runtimes = [Bare()]
+        env.advance(1)
+        self.assertEqual(env.state.stopped, [])
+
+    def test_leave_releases_the_refs(self):
+        env = self.stopped_env(config=Config(after_game="leave"))
+        env.advance(1)
+        self.assertEqual((env.docker.released, env.podman.released, env.state.stopped), ([["a"]], [["p"]], []))
+        self.assertEqual((env.docker.started, env.podman.started), ([], []))
+
+    def test_no_releases_the_refs(self):
+        env = self.stopped_env(restart=False)
+        env.advance(1)
+        self.assertEqual((env.docker.released, env.podman.released, env.state.stopped), ([["a"]], [["p"]], []))
+        self.assertEqual(env.docker.started, [])
+
+    def test_the_no_game_timeout_with_leave_releases_the_refs(self):
+        env = self.env(running=("ollama",), config=Config(after_game="leave"))
+        env.state.add([ref("ollama")], env.now)
+        env.advance(env.config.no_game_timeout_seconds - 5)
+        self.assertEqual(env.docker.released, [])
+        env.advance(10)
+        self.assertEqual((env.docker.released, env.state.stopped), ([["ollama"]], []))
+
+    def test_starting_the_refs_does_not_release_them(self):
+        env = self.stopped_env()
+        env.advance(1)
+        self.assertEqual((env.docker.started, env.docker.released, env.podman.released), (["a"], [], []))
+
+    def test_a_failing_release_does_not_stop_the_guard(self):
+        env = self.stopped_env(config=Config(after_game="leave"))
+        env.docker.fail_hooks = True
+        out = env.advance(1)
+        self.assertIn("release through docker failed", out)
+        self.assertEqual(env.state.stopped, [])
+
+
+class UnreadableStateTests(GuardCase):
+    def test_a_corrupt_state_file_is_copied_and_reported_once(self):
+        env = self.env(running=())
+        env.state.path.write_text("{nope")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            env.state = State(env.state.path)
+            env.guard = env.make_guard()
+        copies = list(env.state.path.parent.glob("state.json.corrupt-*"))
+        self.assertEqual(len(copies), 1)
+        self.assertEqual(copies[0].read_text(), "{nope")
+        self.assertEqual(err.getvalue().count("could not read the list of stopped programs"), 1)
+        self.assertEqual(len(env.prompter.notifications), 1)
+        self.assertIn("a copy was kept", env.prompter.notifications[0][1])
+        events = [e for e in status.read_events(directory=env.status_dir) if e["kind"] == "failure"]
+        self.assertEqual(len(events), 1)
+        env.advance(1)
+        env.advance(1)
+        self.assertEqual(len(env.prompter.notifications), 1)
+
+    def test_a_healthy_state_reports_nothing(self):
+        env = self.env(running=())
+        self.assertEqual(env.prompter.notifications, [])
+
+
+class ShutdownTests(GuardCase):
+    def test_run_removes_the_status_file_when_it_is_interrupted(self):
+        env = self.env()
+        env.advance(1)
+        self.assertIsNotNone(view(env))
+        env.guard.step = lambda: (_ for _ in ()).throw(KeyboardInterrupt())
+        with mock.patch("gpu_game_guard.guard.time.sleep"), self.assertRaises(KeyboardInterrupt):
+            env.guard.run()
+        self.assertFalse((env.status_dir / "status.json").exists())
+
+    def test_a_terminating_signal_path_removes_it_too(self):
+        env = self.env()
+        env.advance(1)
+        env.guard.step = lambda: (_ for _ in ()).throw(SystemExit(0))
+        with self.assertRaises(SystemExit):
+            env.guard.run()
+        self.assertFalse((env.status_dir / "status.json").exists())
+
+    def test_the_guard_leaves_the_file_of_another_process(self):
+        env = self.env()
+        env.advance(1)
+        data = json.loads((env.status_dir / "status.json").read_text())
+        data["pid"] = os.getpid() + 1
+        (env.status_dir / "status.json").write_text(json.dumps(data))
+        env.guard.shutdown()
+        self.assertTrue((env.status_dir / "status.json").exists())
+
+    def test_the_status_records_the_process_start(self):
+        env = self.env()
+        env.advance(1)
+        written = view(env)
+        self.assertEqual(written.pid_start, status.process_start(os.getpid()))
 
 
 class StatusWriteRateTests(GuardCase):

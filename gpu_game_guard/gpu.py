@@ -61,22 +61,23 @@ def _command_key(args: Sequence[str]) -> str:
     return " ".join(argv[:2])
 
 
-def _clip(text: str) -> str:
-    return text if len(text) <= _MAX_LOGGED else text[:_MAX_LOGGED - 3] + "..."
+def clip(text: str, limit: int = _MAX_LOGGED) -> str:
+    return text if len(text) <= limit else text[:limit - 3] + "..."
 
 
-def _report_failure(command: str, message: str) -> None:
+def _report_failure(command: str, message: str, limit: int = _MAX_LOGGED) -> None:
     """Log a failure once; the same failure of the same command stays quiet until the command works again."""
     if _last_failure.get(command) != message:
         if command not in _last_failure and len(_last_failure) >= _MAX_FAILURE_KEYS:
             _last_failure.clear()
         _last_failure[command] = message
-        util.log(f"{_clip(command)}: {_clip(message)}")
+        util.log(f"{clip(command)}: {clip(message, limit)}")
 
 
-def log_once(key: str, message: str) -> None:
-    """Log `message` unless the last message logged under `key` was the same."""
-    _report_failure(key, message)
+def log_once(key: str, message: str, limit: int = _MAX_LOGGED) -> None:
+    """Log `message` unless the last message logged under `key` was the same. The line is cut to `limit`
+    characters; a caller that has already fitted its message passes a larger limit."""
+    _report_failure(key, message, limit)
 
 
 def clear_failure(key: str) -> None:
@@ -411,6 +412,32 @@ def vram_by_pid(proc: Path = PROC, run: Optional[Runner] = None) -> Optional[Dic
     result = PidMeasurement((pid, kib // 1024) for pid, kib in held_by_pid.items())
     result.authoritative = False
     return result
+
+
+def measured_pids(by_pid: Optional[Dict[int, int]]) -> Set[int]:
+    """Every pid a measurement lists, including those it listed without a memory figure."""
+    if by_pid is None:
+        return set()
+    return set(by_pid) | set(getattr(by_pid, "unknown", set()))
+
+
+def parse_stat(text: str) -> Optional[Tuple[str, int, str]]:
+    """(state, parent pid, start time) from the contents of /proc/<pid>/stat. The command name in the second
+    field may contain spaces and parentheses, so fields are counted from the last closing parenthesis."""
+    end = text.rfind(")")
+    fields = text[end + 2:].split() if end >= 0 else []
+    if len(fields) < 20:
+        return None
+    try:
+        return fields[0], int(fields[1]), fields[19]
+    except ValueError:
+        return None
+
+
+def root_pids(parents: Dict[int, int]) -> List[int]:
+    """The pids of a set of matching processes whose parent is not itself in the set, given pid -> parent pid.
+    A multi-process application counts once per root, however many helpers it runs."""
+    return sorted(pid for pid, parent in parents.items() if parent not in parents or parent == pid)
 
 
 def memory_for_pids(by_pid: Optional[Dict[int, int]], pids: Iterable[int]) -> Optional[int]:

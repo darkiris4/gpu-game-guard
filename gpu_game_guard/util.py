@@ -27,10 +27,11 @@ PRIVATE_DIR_MODE = 0o700
 
 
 def _new_file_mode(path: Path, private: bool = False) -> int:
-    """The mode of the file at `path` when it exists, otherwise 0o600 for a private file or 0o644 as masked by
-    the umask."""
+    """The mode of the file at `path` when it exists (0o600 when it is private and belongs to the current
+    user), otherwise 0o600 for a private file or 0o644 as masked by the umask."""
     try:
-        return stat.S_IMODE(path.stat().st_mode)
+        mode = stat.S_IMODE(path.stat().st_mode)
+        return PRIVATE_FILE_MODE if private and _owned(path) else mode
     except OSError:
         if private:
             return PRIVATE_FILE_MODE
@@ -39,21 +40,32 @@ def _new_file_mode(path: Path, private: bool = False) -> int:
         return 0o644 & ~umask
 
 
+def _owned(path: Path) -> bool:
+    """True when the current user owns `path`; always true on a platform without user ids."""
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None:
+        return True
+    try:
+        return path.stat().st_uid == geteuid()
+    except OSError:
+        return False
+
+
 def ensure_dir(path: Path, private: bool = False) -> None:
-    """Create `path` and its parents. A private directory that is created here gets mode 0o700; one that
-    exists keeps its mode."""
-    created = private and not path.exists()
+    """Create `path` and its parents. A private directory gets mode 0o700 when it is created here, and when
+    it exists already and belongs to the current user."""
+    tighten = private and (not path.exists() or _owned(path))
     path.mkdir(parents=True, exist_ok=True)
-    if created:
+    if tighten:
         try:
             os.chmod(path, PRIVATE_DIR_MODE)
         except OSError:
-            pass  # a directory whose mode cannot be set keeps the umask's mode
+            pass  # a directory whose mode cannot be set keeps its mode
 
 
 def atomic_write_text(path: Path, text: str, private: bool = False) -> None:
     """Write `text` so a reader never sees a half-written file. The temporary file is flushed to disk before it
-    replaces the target, keeps the target's permissions (0o600 for a new file when `private`) and never
+    replaces the target, keeps the target's permissions (a private file is 0o600, new or existing) and never
     outlives a failure."""
     path = Path(os.path.realpath(path))  # write through a symlinked file (for example a managed dotfile)
     ensure_dir(path.parent, private)

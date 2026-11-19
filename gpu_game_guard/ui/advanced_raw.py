@@ -13,6 +13,8 @@ from .qt import QtWidgets
 from .theme import SPACE, Callout, button, plain_tooltip, safe_text, styled_label
 
 DEFAULT_EXPORT_NAME = "gpu-game-guard-config.json"
+TOO_DEEP = "The text nests values too deeply"
+_UNPARSABLE = (RecursionError, OverflowError, MemoryError)  # raised by text that is too deep or too large to handle
 
 
 def parse_report(text: str) -> Tuple[Optional[dict], List[str], List[str]]:
@@ -20,12 +22,18 @@ def parse_report(text: str) -> Tuple[Optional[dict], List[str], List[str]]:
     version does not know (kept unchanged when saving). The object is None when the text is unusable."""
     try:
         data = json.loads(text)
-    except (ValueError, RecursionError, OverflowError) as exc:
+    except _UNPARSABLE:
+        return None, [TOO_DEEP], []
+    except ValueError as exc:
         return None, [f"Not valid JSON: {safe_text(exc)}"], []
     try:
         problems = config_module._problems(data, strict=False)
         warnings = [p for p in config_module.validate(data) if p not in problems] if not problems else []
-    except (RecursionError, OverflowError, ValueError, TypeError) as exc:
+    except _UNPARSABLE:
+        return None, [TOO_DEEP], []
+    except (ValueError, TypeError) as exc:
+        if "too deeply" in str(exc):
+            return None, [TOO_DEEP], []
         return None, [f"The configuration could not be checked: {safe_text(exc) or type(exc).__name__}"], []
     return (data if isinstance(data, dict) and not problems else None), problems, warnings
 
@@ -147,6 +155,10 @@ class RawTab(TabBase):
         except config_module.ConfigError as exc:
             self.model.set_raw_problems([exc.reason])
             self._say(f"- {exc.reason}", "danger")
+            return
+        except _UNPARSABLE:
+            self.model.set_raw_problems([TOO_DEEP])
+            self._say(f"- {TOO_DEEP}", "danger")
             return
         finally:
             self._applying = False

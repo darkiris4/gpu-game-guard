@@ -82,8 +82,14 @@ gpu_game_guard/
 | `/etc/polkit-1/rules.d/60-gpu-game-guard.rules` | `polkit allow` and `polkit revoke`, as root | the units a user may manage |
 
 `XDG_CONFIG_HOME` defaults to `~/.config` and `XDG_STATE_HOME` to `~/.local/state`. The JSON files are
-written atomically (a temporary file in the same directory, flushed, then renamed) and keep the existing
-file's permissions; a new file gets 0644 as masked by the umask, and a symlinked file is written through.
+written atomically (a temporary file in the same directory, flushed, then renamed); a symlinked file is
+written through. `config.json` keeps the existing file's permissions (a new one gets 0644 as masked by the
+umask). `state.json`, `status.json`, `events.jsonl` and `pause.json` are private: mode 0600 in a directory of
+mode 0700, both tightened when they exist already and belong to the current user (`util.atomic_write_text(...,
+private=True)`). Beside `config.json` the config code keeps `config.json.lock` (the save lock, 0600),
+`config.json.bak` (one rolling copy of the file a save replaces) and `config.json.broken-<time>` (the newest
+five copies of a file that could not be used); copies take the mode of their source. An unreadable `state.json`
+is copied to `state.json.corrupt-<time>` (0600, newest three kept).
 
 ## model.py
 
@@ -107,12 +113,21 @@ class Launch:          # one game launch seen by a trigger
 ```
 
 The protocols are `Trigger` (`scan`, `end`, `relaunch`), `Runtime` (`installed`, `available`,
-`running_gpu_targets`, `stop`, `start`) and `Prompter` (`available`, `launch`, `restart`, `notify`, the
+`running_gpu_targets`, `stop`, `start`, and the optional hooks below) and `Prompter` (`available`, `launch`, `restart`, `notify`, the
 `name` and `can_ask` attributes, and the optional `consume_remember`).
 
 A ref carries the required keys `kind`, `runtime` and `name`, and the optional keys `scope`, `unit`, `id`
 (strings), `cmdline` (a list of strings) and `cwd` (a string) that a provider needs to start the target
 again. Each provider acts only on refs whose `runtime` is its own.
+
+A `Runtime` may also define two optional hooks, which the guard finds with `getattr`; a provider without them
+works unchanged, and a failure in either is logged and ignored:
+
+- `adopt(refs)`, called once when the guard starts with the refs loaded from `state.json` that belong to the
+  provider (not called when there are none). It lets a provider rebuild what it keeps in memory: the command
+  provider marks its check-less targets as stopped.
+- `release(refs)`, called when the guard drops refs of the provider without starting them: `after_game`
+  `leave`, the answer **Leave stopped**, the no-game timeout with `leave`, and `gpu-game-guard state clear`.
 
 ## config.py
 
@@ -173,12 +188,19 @@ def config_path() -> Path                     # $XDG_CONFIG_HOME/gpu-game-guard/
 def validate(data: dict) -> List[str]         # human-readable problems, unknown keys included (with a
                                               # did-you-mean hint); an empty list means valid
 def load(path=None) -> Config                 # missing file -> defaults; invalid -> ConfigError
-def save(config, path=None) -> None           # atomic, pretty-printed, sorted keys
+def save(config, path=None) -> None           # atomic, pretty-printed, sorted keys; keeps <path>.bak or <path>.broken-<time>
+def update_file(mutate, path=None) -> Config  # read the file now, apply mutate, save, under a lock on <path>.lock
+def merge3(base, ours, theirs) -> Config      # three-way merge: the settings window's edits onto a changed file
 class ConfigWatcher:
     path: Path
     error: str                                # the problem with the file now on disk; empty when valid or absent
     def current(self) -> Config               # re-reads when the file's stamp (mtime, size, inode) changes
 ```
+
+`update_file` is how every writer (the settings window, `targets`, `presets add`, a remembered choice) saves,
+so a change made elsewhere in the meantime is not lost; it refuses a file that cannot be read and a result
+that is invalid. Without `fcntl`, or when the lock is not had within five seconds, it proceeds after a
+warning.
 
 `ConfigWatcher.current()` keeps the previous settings, and logs once per distinct error, when the file
 cannot be read or fails validation, and when the file briefly disappears after having existed.
@@ -195,20 +217,24 @@ Validation ranges (inclusive):
 | `heavy_vram_mib` | 0 to 10000000 |
 | a command target's `timeout_seconds` | 1 to 600 |
 
-A wrong type, a value outside its range or outside the allowed set makes the config invalid. `validate`
-(and so `config validate`) also reports unknown keys, in the top level, in game rules and in targets,
-with a did-you-mean hint; `load` accepts them and logs a warning. A game rule without `action` uses
+A wrong type, a value outside its range or outside the allowed set makes the config invalid, and so does
+nesting deeper than 100 levels (`ConfigError`: the file nests values too deeply; the check is iterative, so
+it cannot exhaust the stack). `validate` (and so `config validate`) also reports unknown keys, in the top
+level, in game rules and in targets, with a did-you-mean hint; `load` accepts them, logs a warning, and every
+`save` writes them back unchanged (`extra` on `Config`, `GameRule` and `TargetSpec`). A game rule without `action` uses
 `"ask"`; it does not inherit `on_launch`.
 
 Targets are validated per kind and reported by index and id:
 
 - Common keys: `id` (required, unique, matching `[a-z0-9][a-z0-9_-]{0,39}`), `kind` (required, one of
-  `service`, `command`, `process`), `label` (string, the id when empty), `enabled` (boolean, default true).
-- `service`: `unit` (required, ends in `.service`, no whitespace and no `/`), `scope` (`"system"` default
-  or `"user"`).
+  `service`, `command`, `process`), `label` (string, the id when empty; labels need not be unique),
+  `enabled` (boolean, default true).
+- `service`: `unit` (required, letters, digits and `:_.@-` ending in `.service`; no whitespace and no `/`),
+  `scope` (`"system"` default or `"user"`).
 - `command`: `stop` and `start` (required, non-empty lists of non-empty strings), `check` (optional
   non-empty list of strings), `timeout_seconds` (1 to 600, default 60).
-- `process`: `match` (required, non-empty string, no `/`), `restart` (boolean, default true).
+- `process`: `match` (required, 3 to 15 characters, at least 3 that are not `*?[]`, no `/`), `restart`
+  (boolean, default true).
 
 ## state.py
 
@@ -217,13 +243,16 @@ class State:
     def __init__(self, path=None): ...   # default $XDG_STATE_HOME/gpu-game-guard/state.json
     stopped: List[Ref]; stopped_at: float; game_seen: bool
     def add(self, refs, wall_time): ...  # union by (kind, runtime, name); sets stopped_at; game_seen=False
-    def save(self): ...                  # atomic; removes the file when nothing is stopped
+    def save(self): ...                  # atomic, mode 0600; removes the file when nothing is stopped
     def clear(self): ...
+    unreadable: bool; corrupt_copy: Optional[Path]   # the file existed but could not be used; where its copy went
 ```
 
 The loader is strict: an entry without string `kind`, `runtime` and `name` is dropped, and optional ref
 keys of the wrong type are dropped. It accepts the first format (`"stopped": ["name", ...]`) and turns each
-name into `{"kind": "container", "runtime": "docker", "name": name}`.
+name into `{"kind": "container", "runtime": "docker", "name": name}`. A file that cannot be used (not a JSON
+object, `stopped` not a list, invalid JSON) is ignored, `unreadable` is set, and a copy is kept first as
+`state.json.corrupt-<time>` (newest three); the guard reports it once (log, event `failure`, notification).
 
 ## status.py
 
@@ -233,7 +262,7 @@ guard is doing, read its recent events and pause it. All files are under `$XDG_S
 ```python
 @dataclass
 class Status:                      # what status.json holds
-    version: str; pid: int; updated: float
+    version: str; pid: int; pid_start: int; updated: float   # pid_start: clock ticks since boot, 0 when unknown
     state: str                     # "watching", "paused", "disabled", "asking", "game-running" or "restart-pending"
     paused: bool
     paused_until: Optional[float]  # wall time; None when not paused; float("inf") when paused with no end
@@ -242,9 +271,11 @@ class Status:                      # what status.json holds
     config_ok: bool; config_error: Optional[str]
     dialog: str; can_ask: bool     # the dialog backend and whether it can ask
     targets: int                   # configured targets
+    valid_for: float               # seconds after `updated` a reader may take the status as current (15, or 900)
 
 def write_status(status, directory=None)                 # atomic; a pause with no end is stored as null
-def read_status(directory=None, max_age=15.0)            # None when missing, unreadable or older than max_age
+def read_status(directory=None, max_age=15.0)            # None when missing, unreadable, stale, or from a process that is gone
+def remove_status(directory=None, pid=None)              # delete status.json; with pid, only a file that process wrote
 def append_event(kind, message, directory=None, **fields)   # one JSON line {"t", "kind", "message", ...}; the last 300 kept
 def read_events(limit=100, directory=None)               # newest last; lines that are not JSON objects are skipped
 def pause(seconds=None, directory=None)                  # None = until resumed; writes pause.json {"until": wall | null}
@@ -252,7 +283,12 @@ def resume(directory=None)                               # removes pause.json
 def paused(directory=None, now=None)                     # (is paused, until); an ended or unreadable pause is "not paused"
 ```
 
-A status older than 15 seconds means the service is not running. The event kinds the guard writes are
+A status counts as current for 15 seconds after `updated`, or for its own `valid_for` when that is longer
+(capped at an hour). The guard publishes `valid_for` 900 while a dialog is open, a restart is pending, or a
+stop or start is running, since a command can take minutes. A reader also compares the recorded pid and
+`pid_start` with `/proc`: a pid that no longer exists, or that now belongs to a process with another start
+time, means "not running" however recent the file is. The guard removes the file when `run` ends, through
+SIGTERM, SIGHUP or Ctrl-C (`cli.command_run` turns the first two into `SystemExit`). The event kinds the guard writes are
 `intercept`, `answer`, `stop`, `restart`, `leave`, `remember`, `failure` and `config`.
 
 ## guard.py
@@ -297,7 +333,7 @@ Behaviour:
     stopped. Works whether or not the prompter can ask.
 - Remembered choices: after `prompter.launch(...)`, and only when `config.remember_choices` is true, the
   guard calls `prompter.consume_remember()` if the prompter has it. For `stop` or `ignore` it saves a game
-  rule through `save(config.with_game(...), watcher.path)`. A failure is logged, never raised. An action
+  rule through `update_file(lambda current: current.with_game(...), watcher.path)`. A failure is logged, never raised. An action
   that is `stop` without a question does not remember anything.
 - Relaunch sets a bypass for that `game_id` for `bypass_seconds` so the relaunch is not intercepted again.
 - A target counts as stopped only if it is no longer listed by `running_gpu_targets()` after the stop.
@@ -310,7 +346,13 @@ Behaviour:
   - `ask` without `prompter.can_ask`: the recorded targets are started again and a notification says so.
   - `restart`: start them and notify.
   - `leave`: forget them without asking.
+- A start that fails leaves the failed refs in the state and retries after `dialog_retry_seconds` (R), then
+  2R, 4R and so on, capped at `max(1 hour, R)`. After five consecutive failures to start the same set of refs,
+  the guard logs that once and keeps retrying every `max(1 hour, R)` with no dialog, notification or event;
+  the refs stay recorded. A change in the set of stopped refs, or a success, starts the count again.
 - The state file persists across restarts. Targets are started through the runtime named in each ref.
+  At construction the guard calls each provider's `adopt` with its refs from the file; whenever it drops refs
+  without starting them it calls `release`.
   Refs already recorded as stopped are started again even if an ignore pattern matching them was added
   since.
 - A killed launch's lingering processes must not trigger a second prompt.
@@ -406,18 +448,31 @@ for `service` only when `systemctl` exists.
   runs the units in parallel. When a system service is refused ("Interactive authentication required",
   "Access denied", "Failed to stop") the log says to run `sudo gpu-game-guard polkit allow <unit>`; the
   failure is never raised. `Target.name` is the label; `extra` carries `unit`, `scope` and `id`.
-- `commands.py` `CommandRuntime`: a `command` target is running when its `check` exits 0, or always when it
-  has no `check`. `stop` and `start` run the argument lists with the target's timeout, no shell. A target
-  with no `check` is always listed as running, so after `stop` the guard cannot tell that it stopped, does
-  not record it and never runs its `start`. `extra` carries `id`.
+- `commands.py` `CommandRuntime`: a `command` target is running when its `check` exits 0. `stop` and `start`
+  run the argument lists with the target's timeout, no shell. A target with no `check` has nothing to ask, so
+  the runtime keeps a set of ids in memory: a `stop` that exits 0 adds the id (the target then counts as not
+  running) and `start` or `release` removes it. `adopt` restores the ids of check-less targets from the refs
+  in the state file when the guard starts; a ref whose target is no longer configured is treated as check-less.
+  `extra` carries `id`.
 - `processes.py` `ProcessRuntime`: a `process` target is running when the current user has a process whose
-  `comm` name matches `match` (an fnmatch glob, case-sensitive). A pattern made only of wildcards is
-  refused as too broad. A match that is protected (`discovery.is_protected`) or that is the guard itself or
+  `comm` name matches `match` (an fnmatch glob, case-sensitive). A pattern matching more than
+  `MAX_PROCESSES` (25, `discovery.MAX_ROOTS`) root processes, those whose parent is not itself a match
+  (`gpu.root_pids`), is refused as too broad; discovery applies the same limit. A match that is protected (`discovery.is_protected`) or that is the guard itself or
   one of its ancestors is left alone, with one log line. `stop` sends SIGTERM to each matched pid after
   re-verifying its start time, waits up to 5 seconds, and never sends SIGKILL; processes that stay are
-  logged. `extra` carries the `cmdline` and `cwd` of the oldest match so `start` can launch it again
-  detached (new session, no input or output) when `restart` is true. `start` does nothing when a matching
-  process is already running or no command line was recorded.
+  logged. `extra` carries the `cmdline` and `cwd` of the oldest match as seen at listing time, but `stop`
+  re-reads both from `/proc` just before signalling and writes them into the ref that is stored, so the
+  restart uses the command line at stop time. The first entry is made absolute (a path with a slash against the
+  process's cwd, a bare name on the `PATH` of its `environ`, then the guard's own); a process that rewrote its
+  title is restarted from its executable path, unless that is a bare interpreter (`python`, `perl`, `ruby`,
+  `node`, `bash`, `sh`, `java` with no argument that is not an option). When no command line can be told the ref
+  gets an empty `cmdline` and the reason is logged once, so `start` reports it as failed. `start` launches
+  the program detached (new session, no input or output) when `restart` is true, through
+  `systemd-run --user --scope --collect --unit=gpu-game-guard-<id>-<time>` when `systemd-run`, `systemctl` and a
+  running user manager are available, and otherwise directly, logging once that restarted programs share the
+  guard's lifetime. Every program is started first and then all are watched together for
+  `START_WATCH_SECONDS` (1.5) for an immediate non-zero exit, which counts as failed. `start` does nothing for
+  a target whose pattern already matches a running process.
 
 ## discovery.py, presets and polkit.py
 
@@ -515,7 +570,11 @@ def format_mib(mib) -> str
   through the module-level default `HEAVY_VRAM_MIB = 4096` that `cli.LiveConfig` overwrites from config). A
   target whose memory is unknown is shown as "GPU memory use unknown" and nothing is ever called idle.
   Units are GiB and MiB.
-- Every user-supplied string (names, images, game titles) is escaped for the chosen markup.
+- Every user-supplied string (names, images, game titles) is escaped for the chosen markup, after control
+  characters, bidirectional embedding, override and isolate characters, and the line and paragraph separators
+  are removed or turned into a space. The left-to-right, right-to-left and Arabic letter marks stay. A single
+  target is introduced as "this container" with "Stop it and start the game?"; several as "these containers or
+  services" (`subject_phrase`).
 
 ## triggers
 
@@ -549,7 +608,12 @@ PyQt5.
 (`ToggleSwitch`, `Card`, `Badge`, `Pill`, `Callout`, `SectionHeader`, `ElidedLabel`, `button`,
 `styled_label`), `app_icon(state)` (painted in code; states `ok`, `paused`, `attention`, `off`) and
 `render(widget, path)` for off-screen PNG screenshots. The look is rounded cards, one accent colour, and
-light or dark following the system palette.
+light or dark following the system palette. The combo box arrow and the check mark are small PNGs painted
+at start-up into `$XDG_RUNTIME_DIR/gpu-game-guard/theme-<key>/`; when that directory is unusable, into a
+private `<tmp>/gpu-game-guard-<uid>/` (`singleton.fallback_base`, mode 0700, owner checked). When neither works
+or the platform is headless the stylesheet still draws the check boxes, radio buttons and combo box with
+borders and backgrounds, only without the images. `safe_text` removes control and bidirectional characters
+from every shown string and turns line separators into spaces.
 
 ### prompt.py
 
@@ -558,7 +622,10 @@ light or dark following the system palette.
 (the zipapp or `python -m gpu_game_guard`), so a crash in Qt or the display server cannot take the watcher
 down. The payload goes in as JSON on standard input and the answer comes back as JSON on standard output;
 a crash, a timeout (10 minutes) or unusable output fails safe exactly like the other backends: `anyway` for
-a launch, None for a restart.
+a launch, None for a restart. Before Qt starts, the child process settles `QT_QPA_PLATFORM`
+(`platform_changes`): an inherited headless platform (`offscreen`, `minimal`, `minimalegl`, `vnc`) is removed,
+and with none set a session with `WAYLAND_DISPLAY` gets `wayland;xcb`, so a failed Wayland connection falls
+back to X11. Any other value is left alone.
 
 ```
 payload: {"kind": "launch" | "restart", "title": str,
@@ -572,7 +639,11 @@ answer:  {"choice": "stop" | "anyway" | "cancel", "remember": "stop" | "ignore" 
 title, a card per target (a kind badge, the name, image or unit, and memory: known, unknown or none
 measured), the graded impact sentence, the overall GPU use, an optional "Remember my choice for this game"
 checkbox (only when `remember_choices`), and the buttons Cancel, Launch anyway and Stop and launch.
-Closing the window means Cancel. The remembered action is `stop` only together with the stop button and
+Closing the window means Cancel. Return, Enter and Space are ignored for `ENTER_GUARD_MS` (700 ms) after the
+window appears so a key press meant for the game cannot answer it; mouse clicks are not. The buttons have
+mnemonics (Alt+S, Alt+A, Alt+C for the launch dialog, Alt+R, Alt+L, Alt+S for the restart dialog, Alt+R for
+the remember checkbox). Every name, image and title is passed through `theme.safe_text`, so it is shown as
+plain text. The remembered action is `stop` only together with the stop button and
 `ignore` only together with Launch anyway; `consume_remember()` returns it once. The restart dialog lists
 the stopped targets with Leave stopped, Ask me later and Restart; closing it means Ask me later.
 
@@ -598,9 +669,21 @@ tests never touch the real system.
   `set_game(id, name, action)` and `remove_game(id)`; each emits `changed`. Nothing reaches the file
   until `apply()`.
 - `problems` holds `config.validate` of the working copy. `apply()` validates, writes through
-  `config.save` and returns the list of problems (empty when saved); `revert()` goes back to the saved copy.
+  `config.update_file` and returns the list of problems (empty when saved); `revert()` goes back to the saved copy.
 - When the file could not be read, `load_error` is set, the working copy starts at the defaults, and
-  `apply()` refuses until `accept_defaults()` says the file may be replaced.
+  `apply()` refuses until `accept_defaults()` says the file may be replaced. Its text is offered in the Raw
+  config tab for repair (up to 2 MiB). Replacing it keeps the old file as `.broken-<time>` when it can be read;
+  the model says when no copy could be made.
+- `dirty` also counts text in the Raw editor that is not yet valid (`raw_problems`), and `apply()` lists those
+  problems and saves nothing until they are fixed. Valid Raw text goes into the working copy as it is typed, so
+  there is one Apply for every tab.
+- `apply()` saves through `config.update_file`. When the file changed since it was read, the working copy is
+  merged onto the new content with `config.merge3` and a notice says so; when it was deleted, the working copy
+  is written as it is and a notice says so; when it became unusable, nothing is written and the message says to
+  Revert or repair it in the Raw tab.
+- A scan (`candidates`) runs in a daemon thread whose result a GUI-thread timer collects; `scan_error` holds the
+  reason a scan found nothing (shown on the Basic page as "Could not check what is using the graphics card"),
+  and `shutdown()` returns at once and drops the result.
 - `candidates(refresh=False)` runs `discovery.discover` once and caches the result.
 - Live views of the service: `status()`, `events(limit)`, `recent_games()` (games with an `intercept`
   event, newest first), `pause(seconds)`, `resume()`, `paused()`.
@@ -618,7 +701,8 @@ pill and a Basic or Advanced switch), the page for the chosen mode, notices (the
 read; the service is not running, with the command to start it) and a footer with the problems of a failed
 save, the restart banner with a Restart service button, Revert and Apply (also Ctrl+S). The chosen mode
 and the window size are kept in `ui.json` next to the config file. Closing the window with unsaved changes
-asks whether to save. Advanced mode is built on first use; if its module cannot be loaded the window shows a
+asks whether to save. A lock under the runtime directory (`singleton.acquire("settings")`) keeps a second
+window from opening, whether started from the command line, the menu or the tray. Advanced mode is built on first use; if its module cannot be loaded the window shows a
 notice and Basic keeps working. The window always uses the default config path, not `--config`.
 
 ### basic.py
@@ -665,6 +749,7 @@ gpu-game-guard check                      diagnose and print: version, config pa
 gpu-game-guard config path | show | validate | init
 gpu-game-guard pause [--for 30m|2h|1d] | resume
 gpu-game-guard status [--json]
+gpu-game-guard state clear
 gpu-game-guard targets list | enable ID | disable ID | remove ID
 gpu-game-guard presets list | add ID
 gpu-game-guard discover
@@ -676,8 +761,13 @@ gpu-game-guard --version
 
 `config init` writes the defaults to the config path and refuses to overwrite; `config show` prints the
 effective config as JSON, and only JSON, on stdout; `config validate` also reports unknown keys. `status`
-reads `status.json` and exits 1 with a message when the service is not running. `targets` and `presets add`
-rewrite the config file through `config.save`. `settings`, `tray` and `prompt` import `ui` lazily; without
+reads `status.json` and exits 1 with a message when the service is not running (no recent status, or the
+recorded process is gone or replaced). `state clear` loads `state.json`; with nothing recorded it says so and
+exits 0. Otherwise it prints the names it drops, notes on stderr when the service is running (that service
+keeps its own copy until `systemctl --user restart gpu-game-guard`), calls the `release` hook of the providers
+that hold the recorded refs (a provider that cannot be built, or a hook that fails, is logged and never fatal),
+removes the file and exits 0. `run` turns SIGTERM and SIGHUP into a normal exit so that `Guard.run` can remove
+`status.json`. `targets` and `presets add` rewrite the config file through `config.update_file`. `settings`, `tray` and `prompt` import `ui` lazily; without
 PyQt5 they print "Install python3-pyqt5 (sudo apt install python3-pyqt5)" and exit 1. A duration is a
 number with `s`, `m`, `h` or `d`.
 
