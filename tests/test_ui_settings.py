@@ -391,6 +391,20 @@ class WindowTests(WindowBase):
         self.assertGreaterEqual(window.minimumWidth(), 780)
         self.assertGreaterEqual(window.minimumHeight(), 600)
 
+    def test_the_footer_shows_the_version_and_opens_the_about_dialog(self):
+        from unittest import mock
+
+        from gpu_game_guard import __version__
+
+        window = self.window()
+        self.assertEqual(window.version_label.text(), f"Version {__version__}")
+        self.assertEqual(window.about_button.text(), "About")
+        with mock.patch("gpu_game_guard.ui.about.show_about") as show:
+            window.about_button.click()
+        show.assert_called_once_with(window)
+        self.assertFalse(window.model.dirty)
+        self.assertFalse(window.apply_button.isEnabled())
+
     def test_pill_follows_the_service(self):
         window = self.window()
         self.assertEqual(window.pill.text(), "Not running")

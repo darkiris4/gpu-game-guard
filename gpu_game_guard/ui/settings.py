@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from .. import __version__
 from ..util import atomic_write_json, log
 from . import qt, singleton, theme
 from .basic import CONTENT_WIDTH, BasicView
@@ -323,6 +324,15 @@ class SettingsWindow(QtWidgets.QMainWindow):
         column.addWidget(self.restart_banner)
         row = QtWidgets.QHBoxLayout()
         row.setSpacing(SPACE)
+        self.version_label = theme.styled_label(f"Version {__version__}", "small", wrap=False)
+        self.version_label.setAccessibleName(f"Version {__version__}")
+        self.about_button = theme.button("About")
+        self.about_button.setProperty("flat", "true")
+        self.about_button.setAccessibleName("About GPU Game Guard")
+        self.about_button.clicked.connect(self.show_about)
+        row.addWidget(self.version_label)
+        row.addWidget(self.about_button)
+        row.addSpacing(SPACE)
         self.save_label = theme.styled_label("", "muted", wrap=False)
         row.addWidget(self.save_label, 1)
         self.revert_button = theme.button("Revert")
@@ -482,6 +492,11 @@ class SettingsWindow(QtWidgets.QMainWindow):
         else:
             self.show_problems([message], RESTART_FAILED)
         self.refresh()
+
+    def show_about(self) -> None:
+        from . import about
+
+        about.show_about(self)
 
     def show_raw(self) -> None:
         """Open the Raw config tab of Advanced mode."""

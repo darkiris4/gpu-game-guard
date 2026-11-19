@@ -8,6 +8,8 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- The version in the settings window's footer and an About dialog (version, licence, project address and a
+  Copy details button for bug reports), opened from the tray menu or the settings window.
 - Host targets next to containers: systemd services (system or user scope), commands (a stop command, a
   start command and an optional running check) and processes (matched by name, ended with SIGTERM, started
   again with the same command line). They are configured under `targets` and offered for stopping before a

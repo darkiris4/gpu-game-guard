@@ -109,12 +109,13 @@ class TrayTests(unittest.TestCase):
         c = self.make(status())
         self.assertEqual(c.menu_summary(), [
             ("Watching for games", False), ("Pause for 1 hour", True), ("Pause until resumed", True),
-            ("-", False), ("Open settings", True), ("Quit", True)])
+            ("-", False), ("Open settings", True), ("About GPU Game Guard", True),
+            ("Quit", True)])
         self.current = status(paused=True)
         c.refresh()
         self.assertEqual([t for t, _ in c.menu_summary()], [
             "Paused until resumed", "Pause for 1 hour", "Pause until resumed", "Resume", "-", "Open settings",
-            "Quit"])
+            "About GPU Game Guard", "Quit"])
         self.assertIs(self.fake.menu, c.menu)
 
     def test_menu_actions_call_the_callbacks(self):
@@ -126,6 +127,15 @@ class TrayTests(unittest.TestCase):
             c.settings_action.trigger()
         c.quit_action.trigger()
         self.assertEqual(self.calls, [("pause", 3600.0), ("pause", None), "resume", "settings", "quit"])
+
+    def test_the_about_entry_sits_before_quit_and_shows_the_dialog(self):
+        c = self.make(status())
+        entries = [t for t, _ in c.menu_summary()]
+        self.assertEqual(entries.index("About GPU Game Guard") + 1, entries.index("Quit"))
+        with mock.patch("gpu_game_guard.ui.about.show_about") as show:
+            c.about_action.trigger()
+        show.assert_called_once_with()
+        self.assertEqual(self.calls, [])
 
     def test_left_click_opens_the_settings(self):
         c = self.make(status())

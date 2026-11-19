@@ -48,6 +48,9 @@ the user service for every user, which starts at that user's next login; start i
 
 - The **tray icon** starts at your next login. It shows the guard's state, and its menu pauses and resumes
   the guard and opens the settings. It needs `python3-pyqt5` and a desktop with a system tray.
+- The tray menu's **About GPU Game Guard** entry and the **About** button in the settings window's footer
+  (next to the version number) open a dialog with the version, the licence and the project address. Its
+  **Copy details** button copies the versions and install kind to the clipboard for a bug report.
 - A **GPU Game Guard** entry appears in the application menu. It opens the
   settings window, as does `gpu-game-guard settings`.
 - `gpu-game-guard check` prints what the guard sees on this machine, and `gpu-game-guard status` shows what

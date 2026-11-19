@@ -116,11 +116,13 @@ class TrayController:
         self.resume_action = self.menu.addAction("Resume")
         self.menu.addSeparator()
         self.settings_action = self.menu.addAction("Open settings")
+        self.about_action = self.menu.addAction("About GPU Game Guard")
         self.quit_action = self.menu.addAction("Quit")
         self.pause_hour_action.triggered.connect(lambda: self.actions.pause(PAUSE_HOUR_SECONDS))
         self.pause_until_action.triggered.connect(lambda: self.actions.pause(None))
         self.resume_action.triggered.connect(lambda: self.actions.resume())
         self.settings_action.triggered.connect(lambda: self._open_settings())
+        self.about_action.triggered.connect(lambda: self._show_about())
         self.quit_action.triggered.connect(lambda: self.actions.quit())
         self.tray.setContextMenu(self.menu)
         self.tray.activated.connect(self._activated)
@@ -132,6 +134,12 @@ class TrayController:
         """Start the settings window unless another process already holds it."""
         if not settings_running():
             self.actions.open_settings()
+
+    def _show_about(self) -> None:
+        """Show the About dialog; the module is loaded on first use."""
+        from . import about
+
+        about.show_about()
 
     def _activated(self, reason: Any) -> None:
         if reason == qt.QtWidgets.QSystemTrayIcon.Trigger:
